@@ -13,26 +13,31 @@ Suite de validation de `src/trajectories.py` :
   5. Stabilité numérique du solveur quadratique à mise à l'échelle relative
      (coefficients 1e-16 et 1e+16, coefficient quadratique 0 < c2 / S < 1e-14
      sans réduction artificielle du degré tant que c2 / S ne sous-déborde pas
-     vers 0.0 en IEEE 754 binary64, racines proches 0.5 +- 1e-7, racines proches
-     des bornes, tangence avec tolérance d'arrondi documentée, exclusion des
+     en IEEE 754 binary64, racines proches 0.5 +- 1e-7, racines proches des
+     bornes, tangence avec tolérance d'arrondi documentée, exclusion des
      bornes {0, 1}).
   6. Conservation du risque intégré int_0^t Lambda(u) du = E à travers un changement
      de masque d'accessibilité :
        - fermeture d'un canal (3*mu -> 2*mu à tau_c = ln(2)/gamma),
        - ouverture retardée de deux canaux (0 -> 2*mu à tau_c = ln(2)/gamma).
   7. Validation croisée en loi entre `simulate_ogata_thinning` et
-     `simulate_exact_piecewise_lambda0` à lambda = 0 reposant conjointement sur :
-       (i)  un test de permutation Monte-Carlo à deux échantillons avec correction
-            de rang p = (1 + n_>=) / (1 + n_perm) sur n_perm = 9999 tirages
-            (résolution minimale 1e-4, seuil alpha = 0.01),
-       (ii) une procédure formelle d'équivalence pratique exigeant que la borne
-            supérieure de l'intervalle de confiance bootstrap à 95 %
-            (IC_95%^sup(D) = q_0.95(D^*)) soit strictement inférieure à la
-            marge d'équivalence delta_eq définie a priori,
+     `simulate_exact_piecewise_lambda0` à lambda = 0 reposant sur :
+       (i)   un test de permutation Monte-Carlo à deux échantillons avec correction
+             de rang p = (1 + n_>=) / (1 + n_perm) sur n_perm = 9999 tirages
+             (résolution minimale 1e-4, seuil alpha = 0.01) ; un résultat p > 0.01
+             indique la non-rejection de l'égalité des lois (absence de divergence
+             détectée) sans prouver à lui seul leur équivalence,
+       (ii)  une règle d'équivalence pratique exigeant que la borne supérieure
+             bootstrap percentile q_0.95(D^*), à couverture nominale de 95 %,
+             soit strictement inférieure à la marge d'équivalence delta_eq
+             définie a priori,
        (iii) des statistiques temporelles calculées individuellement par
-            trajectoire (T_1, T_dernier, étendue T_dernier - T_1, moyenne,
-            médiane et quantile 75 % des intervalles inter-sauts par trajectoire)
-            afin de préserver la dépendance interne à chaque réalisation.
+             trajectoire : observables globales (T_1, T_dernier, étendue
+             T_dernier - T_1, proportion de trajectoires à >= 2 événements) et
+             observables conditionnelles (moyenne, médiane et quantile 75 % des
+             intervalles inter-sauts conditionnellement à N_events >= 2).
+  8. Sélection du canal au cas limite u2 == 0.0 (side="right") vérifiée par
+     générateur contrôlé lorsque les premiers canaux ont un taux nul.
 """
 
 from __future__ import annotations
@@ -51,6 +56,23 @@ import fiber_bundle as fb  # noqa: E402
 import trajectories as traj  # noqa: E402
 
 
+class _ControlledZeroU2Generator:
+    """
+    Générateur déterministe minimaliste reproduisant l'interface `uniform(low, high)`
+    pour injecter exactement `u2 = 0.0` lors de la sélection du canal tout en
+    contrôlant les tirages d'attente temporelle `u1`.
+    """
+
+    def __init__(self, u1_sequence: Sequence[float], u2_value: float = 0.0) -> None:
+        self._u1_iter = iter(u1_sequence)
+        self._u2_value = float(u2_value)
+
+    def uniform(self, low: float = 0.0, high: float = 1.0) -> float:
+        if low == 0.0 and high == 1.0:
+            return float(next(self._u1_iter))
+        return self._u2_value
+
+
 def _mc_permutation_test_1d(
     u_samples: np.ndarray,
     v_samples: np.ndarray,
@@ -61,8 +83,6 @@ def _mc_permutation_test_1d(
     """
     Test de permutation Monte-Carlo à deux échantillons (tailles n_u, n_v quelconques)
     pour W_1 avec correction de rang p = (1 + n_>=) / (1 + n_perm).
-    Utilise l'identité exacte par sommes cumulées sur l'échantillon réuni trié
-    (valide même en présence d'ex-aequo puisque delta = 0 entre valeurs égales).
     """
     u = np.asarray(u_samples, dtype=np.float64).ravel()
     v = np.asarray(v_samples, dtype=np.float64).ravel()
@@ -82,7 +102,6 @@ def _mc_permutation_test_1d(
     done = 0
     while done < n_permutations:
         m = min(chunk_size, n_permutations - done)
-        # Tirage vectorisé de m permutations de {0, ..., n_tot - 1}
         noise = rng.random((m, n_tot))
         perms = np.argpartition(noise, kth=n_u - 1, axis=1)
         is_u = np.zeros((m, n_tot), dtype=np.bool_)
@@ -100,16 +119,15 @@ def _mc_permutation_test_1d(
     return w1_obs, p_value
 
 
-def _bootstrap_ucb95_1d(
+def _bootstrap_percentile_ucb95_1d(
     u_samples: np.ndarray,
     v_samples: np.ndarray,
     n_bootstrap: int = 2000,
     seed: int = 2026,
 ) -> float:
     """
-    Calcule la borne supérieure de l'intervalle de confiance bootstrap à 95 %
-    (IC_95%^sup(W_1) = quantile 0.95 des réplications bootstrap) par rééchantillonnage
-    indépendant des trajectoires de u_samples et v_samples.
+    Borne supérieure bootstrap percentile q_0.95(W_1^*) à couverture nominale
+    de 95 %, obtenue par rééchantillonnage indépendant au niveau des trajectoires.
     """
     u = np.asarray(u_samples, dtype=np.float64).ravel()
     v = np.asarray(v_samples, dtype=np.float64).ravel()
@@ -148,7 +166,7 @@ def _mc_permutation_sliced_w1(
 
     pooled = np.vstack([U, V])
     n_tot = pooled.shape[0]
-    proj = pooled @ dirs.T  # (n_tot, n_projections)
+    proj = pooled @ dirs.T
 
     orders = [np.argsort(proj[:, q], kind="mergesort") for q in range(n_projections)]
     deltas_list = [np.diff(proj[orders[q], q]) for q in range(n_projections)]
@@ -179,14 +197,14 @@ def _mc_permutation_sliced_w1(
     return sw1_obs, p_value
 
 
-def _bootstrap_ucb95_sliced_w1(
+def _bootstrap_percentile_ucb95_sliced_w1(
     U: np.ndarray,
     V: np.ndarray,
     n_projections: int = 32,
     n_bootstrap: int = 1000,
     seed: int = 2026,
 ) -> float:
-    """Borne supérieure IC_95%^sup(Sliced-W1) par bootstrap de trajectoires."""
+    """Borne supérieure bootstrap percentile q_0.95(Sliced-W1^*) (couverture nominale 95 %)."""
     n_u = U.shape[0]
     n_v = V.shape[0]
     rng = np.random.default_rng(seed)
@@ -205,14 +223,17 @@ def _mc_permutation_energy_blocked(
     V: np.ndarray,
     n_permutations: int = 9999,
     block_size: int = 64,
+    perm_batch_size: int = 250,
     seed: int = 2026,
 ) -> tuple[float, float]:
     """
     Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
-    correction de rang) pour la distance d'énergie D_E(U, V), exécuté par
-    tranches de lignes de taille `block_size` afin de maintenir une empreinte
-    mémoire strictement bornée en O(block_size * n_tot * d) sans allouer de
-    matrice complète n_tot x n_tot.
+    correction de rang) pour la distance d'énergie D_E(U, V).
+    Les permutations sont traitées par petits lots de taille `perm_batch_size`
+    et les distances euclidiennes par blocs de lignes de taille `block_size`,
+    avec accumulation matricielle vectorisée (DGEMM), bornant strictement
+    l'empreinte mémoire auxiliaire en O((perm_batch_size + block_size * d) * n_tot)
+    sans boucle Python individuelle sur les 9 999 permutations.
     """
     ed_obs = traj.energy_distance(U, V, block_size=block_size)
     n_u = U.shape[0]
@@ -220,37 +241,38 @@ def _mc_permutation_energy_blocked(
     pooled = np.vstack([U, V])
     n_tot = pooled.shape[0]
 
-    # Génération des masques d'appartenance au premier groupe pour les 9999 permutations
-    rng = np.random.default_rng(seed)
-    in_u = np.zeros((n_permutations, n_tot), dtype=np.bool_)
-    chunk_perm = 1000
-    for p0 in range(0, n_permutations, chunk_perm):
-        p1 = min(p0 + chunk_perm, n_permutations)
-        m = p1 - p0
-        noise = rng.random((m, n_tot))
-        perms = np.argpartition(noise, kth=n_u - 1, axis=1)
-        rows = np.arange(p0, p1)[:, None]
-        in_u[rows, perms[:, :n_u]] = True
-
     sum_uu = np.zeros(n_permutations, dtype=np.float64)
     sum_vv = np.zeros(n_permutations, dtype=np.float64)
     sum_uv = np.zeros(n_permutations, dtype=np.float64)
 
-    # Accumulation par tranche de lignes (empreinte O(block_size * n_tot * d))
-    for i0 in range(0, n_tot, block_size):
-        i1 = min(i0 + block_size, n_tot)
-        diff = pooled[i0:i1, None, :] - pooled[None, :, :]
-        dist_block = np.linalg.norm(diff, axis=-1)  # (i1 - i0, n_tot)
+    rng = np.random.default_rng(seed)
 
-        row_in_u = in_u[:, i0:i1]  # (n_perm, i1 - i0)
-        for p in range(n_permutations):
-            ru = row_in_u[p]
-            cu = in_u[p]
-            sub_u = dist_block[ru]
-            sub_v = dist_block[~ru]
-            sum_uu[p] += float(np.sum(sub_u[:, cu]))
-            sum_uv[p] += float(np.sum(sub_u[:, ~cu]))
-            sum_vv[p] += float(np.sum(sub_v[:, ~cu]))
+    for p0 in range(0, n_permutations, perm_batch_size):
+        p1 = min(p0 + perm_batch_size, n_permutations)
+        m = p1 - p0
+
+        noise = rng.random((m, n_tot))
+        perms = np.argpartition(noise, kth=n_u - 1, axis=1)
+        in_u_batch = np.zeros((m, n_tot), dtype=np.float64)
+        rows = np.arange(m)[:, None]
+        in_u_batch[rows, perms[:, :n_u]] = 1.0
+        col_in_u = in_u_batch.T  # (n_tot, m)
+
+        for i0 in range(0, n_tot, block_size):
+            i1 = min(i0 + block_size, n_tot)
+            diff = pooled[i0:i1, None, :] - pooled[None, :, :]
+            dist_block = np.linalg.norm(diff, axis=-1)  # (b_r, n_tot)
+
+            row_in_u = in_u_batch[:, i0:i1]  # (m, b_r)
+            row_in_v = 1.0 - row_in_u        # (m, b_r)
+
+            s_all = np.sum(dist_block, axis=1)  # (b_r,)
+            s_u = dist_block @ col_in_u         # (b_r, m)
+            s_v = s_all[:, None] - s_u          # (b_r, m)
+
+            sum_uu[p0:p1] += np.sum(row_in_u * s_u.T, axis=1)
+            sum_uv[p0:p1] += np.sum(row_in_u * s_v.T, axis=1)
+            sum_vv[p0:p1] += np.sum(row_in_v * s_v.T, axis=1)
 
     e_xy = sum_uv / float(n_u * n_v)
     e_xx = sum_uu / float(n_u * (n_u - 1))
@@ -262,14 +284,14 @@ def _mc_permutation_energy_blocked(
     return ed_obs, p_value
 
 
-def _bootstrap_ucb95_energy_blocked(
+def _bootstrap_percentile_ucb95_energy_blocked(
     U: np.ndarray,
     V: np.ndarray,
     n_bootstrap: int = 1000,
     block_size: int = 128,
     seed: int = 2026,
 ) -> float:
-    """Borne supérieure IC_95%^sup(D_E) par bootstrap de trajectoires par blocs."""
+    """Borne supérieure bootstrap percentile q_0.95(D_E^*) (couverture nominale 95 %)."""
     n_u = U.shape[0]
     n_v = V.shape[0]
     rng = np.random.default_rng(seed)
@@ -312,13 +334,13 @@ def _mc_permutation_cov_fro(
     return cov_obs, p_value
 
 
-def _bootstrap_ucb95_cov_fro(
+def _bootstrap_percentile_ucb95_cov_fro(
     U: np.ndarray,
     V: np.ndarray,
     n_bootstrap: int = 2000,
     seed: int = 2026,
 ) -> float:
-    """Borne supérieure IC_95%^sup(||Sigma_U - Sigma_V||_F) par bootstrap de trajectoires."""
+    """Borne supérieure bootstrap percentile q_0.95(||Sigma_U - Sigma_V||_F^*) (95 % nominal)."""
     n_u = U.shape[0]
     n_v = V.shape[0]
     rng = np.random.default_rng(seed)
@@ -527,8 +549,9 @@ class TestTrajectories(unittest.TestCase):
         """
         Vérifie `_stable_quadratic_real_roots` et `classify_threshold_crossings_z` :
         - invariance d'échelle de 1e-16 à 1e+16,
-        - conservation des racines intérieures lorsque c2 / S = 1e-15 (tant que
-          c2 / S ne sous-déborde pas vers 0.0 en IEEE 754 binary64),
+        - conservation des racines intérieures lorsque c2 / S = 1e-15 (sans
+          réduction artificielle du degré tant que c2 / S ne sous-déborde pas
+          en binary64),
         - deux racines très proches sans être identiques (z = 0.5 +- 1e-7),
         - racines proches des bornes (1e-11 et 1 - 1e-11),
         - exclusion explicite et documentée des bornes z in {0, 1}.
@@ -659,17 +682,23 @@ class TestTrajectories(unittest.TestCase):
     def test_07_cross_validation_equivalence_and_trajectory_temporal_laws(self) -> None:
         """
         Validation croisée en loi entre `simulate_ogata_thinning` et
-        `simulate_exact_piecewise_lambda0` à lambda = 0 combinant :
+        `simulate_exact_piecewise_lambda0` à lambda = 0 :
           1. Test de permutation Monte-Carlo à deux échantillons avec correction
              de rang p = (1 + n_>=) / (1 + n_perm) sur n_perm = 9999 tirages
-             (résolution minimale 1e-4, seuil alpha = 0.01).
-          2. Inférence formelle d'équivalence pratique exigeant que la borne
-             supérieure de l'intervalle de confiance bootstrap à 95 % vérifie :
-                 IC_95%^sup(D) < delta_eq.
-          3. Statistiques temporelles calculées individuellement par trajectoire
-             (T_1, T_dernier, étendue T_dernier - T_1, moyenne, médiane et
-             quantile 75 % des intervalles inter-sauts par trajectoire) afin de
-             préserver la structure de dépendance interne à chaque trajectoire.
+             (résolution minimale 1e-4, seuil alpha = 0.01). p > 0.01 indique
+             la non-rejection de l'égalité en loi (absence de divergence détectée),
+             sans constituer à lui seul une preuve d'équivalence.
+          2. L'argument d'équivalence pratique repose sur la borne supérieure
+             bootstrap percentile q_0.95(D^*), à couverture nominale de 95 %,
+             comparée à la marge d'équivalence delta_eq définie a priori :
+                 q_0.95(D^*) < delta_eq.
+          3. Statistiques temporelles définies individuellement par trajectoire :
+             - globales : T_1, T_dernier, étendue T_dernier - T_1, ainsi que la
+               proportion de trajectoires ayant au moins deux événements
+               I(N_events >= 2) ;
+             - conditionnelles : moyenne, médiane et quantile 75 % des
+               intervalles inter-sauts calculés sur la sous-population
+               conditionnelle des trajectoires vérifiant N_events >= 2.
         """
         nk = traj.NKLandscape(n=3, k=2, seed=19)
         X0 = np.array([1.0, -1.0, 1.0])
@@ -701,15 +730,17 @@ class TestTrajectories(unittest.TestCase):
         t_last_ex = np.empty(n_total, dtype=np.float64)
         t_span_og = np.empty(n_total, dtype=np.float64)
         t_span_ex = np.empty(n_total, dtype=np.float64)
+        has_ge2_og = np.zeros(n_total, dtype=np.float64)
+        has_ge2_ex = np.zeros(n_total, dtype=np.float64)
 
-        # Statistiques temporelles calculées par trajectoire (pour trajectoires à >= 2 sauts)
-        traj_inter_mean_og: list[float] = []
-        traj_inter_med_og: list[float] = []
-        traj_inter_q75_og: list[float] = []
+        # Résumés inter-sauts conditionnellement à la présence d'au moins 2 événements
+        cond_inter_mean_og: list[float] = []
+        cond_inter_med_og: list[float] = []
+        cond_inter_q75_og: list[float] = []
 
-        traj_inter_mean_ex: list[float] = []
-        traj_inter_med_ex: list[float] = []
-        traj_inter_q75_ex: list[float] = []
+        cond_inter_mean_ex: list[float] = []
+        cond_inter_med_ex: list[float] = []
+        cond_inter_q75_ex: list[float] = []
 
         idx = 0
         for seed in seeds:
@@ -738,10 +769,11 @@ class TestTrajectories(unittest.TestCase):
                     t_last_og[idx] = float(times_og[-1])
                     t_span_og[idx] = float(times_og[-1] - times_og[0])
                     if times_og.size >= 2:
+                        has_ge2_og[idx] = 1.0
                         dts_og = np.diff(times_og)
-                        traj_inter_mean_og.append(float(np.mean(dts_og)))
-                        traj_inter_med_og.append(float(np.median(dts_og)))
-                        traj_inter_q75_og.append(float(np.quantile(dts_og, 0.75)))
+                        cond_inter_mean_og.append(float(np.mean(dts_og)))
+                        cond_inter_med_og.append(float(np.median(dts_og)))
+                        cond_inter_q75_og.append(float(np.quantile(dts_og, 0.75)))
                 else:
                     t_first_og[idx] = t_max
                     t_last_og[idx] = 0.0
@@ -753,10 +785,11 @@ class TestTrajectories(unittest.TestCase):
                     t_last_ex[idx] = float(times_ex[-1])
                     t_span_ex[idx] = float(times_ex[-1] - times_ex[0])
                     if times_ex.size >= 2:
+                        has_ge2_ex[idx] = 1.0
                         dts_ex = np.diff(times_ex)
-                        traj_inter_mean_ex.append(float(np.mean(dts_ex)))
-                        traj_inter_med_ex.append(float(np.median(dts_ex)))
-                        traj_inter_q75_ex.append(float(np.quantile(dts_ex, 0.75)))
+                        cond_inter_mean_ex.append(float(np.mean(dts_ex)))
+                        cond_inter_med_ex.append(float(np.median(dts_ex)))
+                        cond_inter_q75_ex.append(float(np.quantile(dts_ex, 0.75)))
                 else:
                     t_first_ex[idx] = t_max
                     t_last_ex[idx] = 0.0
@@ -767,7 +800,7 @@ class TestTrajectories(unittest.TestCase):
         alpha_level = 0.01
         n_perm = 9999
 
-        # (a) Lois marginales : permutation Monte-Carlo (9999) + IC_95%^sup(W_1) < delta_eq
+        # (a) Lois marginales : permutation Monte-Carlo (9999) + q_0.95(W_1^*) < delta_eq
         marginal_specs = [
             ("J_12", joint_og[:, 0], joint_ex[:, 0], 0.035),
             ("J_13", joint_og[:, 1], joint_ex[:, 1], 0.035),
@@ -776,7 +809,7 @@ class TestTrajectories(unittest.TestCase):
         ]
         for name, u_vec, v_vec, delta_eq in marginal_specs:
             w1_obs, p_val = _mc_permutation_test_1d(u_vec, v_vec, n_permutations=n_perm)
-            ucb95 = _bootstrap_ucb95_1d(u_vec, v_vec, n_bootstrap=2000)
+            ucb95 = _bootstrap_percentile_ucb95_1d(u_vec, v_vec, n_bootstrap=2000)
             self.assertGreater(
                 p_val,
                 alpha_level,
@@ -786,8 +819,8 @@ class TestTrajectories(unittest.TestCase):
                 ucb95,
                 delta_eq,
                 msg=(
-                    f"Marginal '{name}': équivalence non établie "
-                    f"(IC_95%^sup={ucb95:.5f} >= delta_eq={delta_eq}, W1={w1_obs:.5f})"
+                    f"Marginal '{name}': borne bootstrap percentile q_0.95={ucb95:.5f} "
+                    f">= delta_eq={delta_eq} (W1={w1_obs:.5f})"
                 ),
             )
 
@@ -805,58 +838,63 @@ class TestTrajectories(unittest.TestCase):
         sw1_obs, sw1_p = _mc_permutation_sliced_w1(
             Z_og, Z_ex, n_projections=32, n_permutations=n_perm
         )
-        sw1_ucb95 = _bootstrap_ucb95_sliced_w1(Z_og, Z_ex, n_projections=32, n_bootstrap=1000)
+        sw1_ucb95 = _bootstrap_percentile_ucb95_sliced_w1(
+            Z_og, Z_ex, n_projections=32, n_bootstrap=1000
+        )
         self.assertGreater(sw1_p, alpha_level, msg=f"Sliced-W1 rejeté : {sw1_obs:.5f} (p={sw1_p:.5f})")
         self.assertLess(
             sw1_ucb95,
             0.11,
-            msg=f"Sliced-W1 équivalence non établie : IC_95%^sup={sw1_ucb95:.5f} >= 0.11",
+            msg=f"Sliced-W1 : borne bootstrap percentile q_0.95={sw1_ucb95:.5f} >= 0.11",
         )
 
         ed_obs, ed_p = _mc_permutation_energy_blocked(
-            Z_og, Z_ex, n_permutations=n_perm, block_size=64
+            Z_og, Z_ex, n_permutations=n_perm, block_size=64, perm_batch_size=250
         )
-        ed_ucb95 = _bootstrap_ucb95_energy_blocked(
+        ed_ucb95 = _bootstrap_percentile_ucb95_energy_blocked(
             Z_og, Z_ex, n_bootstrap=1000, block_size=128
         )
         self.assertGreater(ed_p, alpha_level, msg=f"EnergyDist rejetée : {ed_obs:.5f} (p={ed_p:.5f})")
         self.assertLess(
             ed_ucb95,
             0.12,
-            msg=f"EnergyDist équivalence non établie : IC_95%^sup={ed_ucb95:.5f} >= 0.12",
+            msg=f"EnergyDist : borne bootstrap percentile q_0.95={ed_ucb95:.5f} >= 0.12",
         )
 
         cov_obs, cov_p = _mc_permutation_cov_fro(Z_og, Z_ex, n_permutations=n_perm)
-        cov_ucb95 = _bootstrap_ucb95_cov_fro(Z_og, Z_ex, n_bootstrap=2000)
+        cov_ucb95 = _bootstrap_percentile_ucb95_cov_fro(Z_og, Z_ex, n_bootstrap=2000)
         self.assertGreater(cov_p, alpha_level, msg=f"Cov Fro rejetée : {cov_obs:.5f} (p={cov_p:.5f})")
         self.assertLess(
             cov_ucb95,
             0.45,
-            msg=f"Cov Fro équivalence non établie : IC_95%^sup={cov_ucb95:.5f} >= 0.45",
+            msg=f"Cov Fro : borne bootstrap percentile q_0.95={cov_ucb95:.5f} >= 0.45",
         )
 
-        # (c) Statistiques temporelles définies par trajectoire (permutation et bootstrap
-        #     opérant strictement au niveau des trajectoires)
+        # (c) Statistiques temporelles par trajectoire :
+        #     - observables inconditionnelles sur les n_total trajectoires
+        #       (incluant la proportion P(N_events >= 2)),
+        #     - résumés inter-sauts sur la population conditionnelle N_events >= 2.
         temporal_specs = [
             ("T_first_capped", t_first_og, t_first_ex, 0.035),
             ("T_last_capped", t_last_og, t_last_ex, 0.045),
             ("event_span", t_span_og, t_span_ex, 0.055),
+            ("prop_ge2_events", has_ge2_og, has_ge2_ex, 0.040),
             (
-                "traj_inter_mean",
-                np.asarray(traj_inter_mean_og, dtype=np.float64),
-                np.asarray(traj_inter_mean_ex, dtype=np.float64),
+                "cond_ge2_traj_inter_mean",
+                np.asarray(cond_inter_mean_og, dtype=np.float64),
+                np.asarray(cond_inter_mean_ex, dtype=np.float64),
                 0.045,
             ),
             (
-                "traj_inter_median",
-                np.asarray(traj_inter_med_og, dtype=np.float64),
-                np.asarray(traj_inter_med_ex, dtype=np.float64),
+                "cond_ge2_traj_inter_median",
+                np.asarray(cond_inter_med_og, dtype=np.float64),
+                np.asarray(cond_inter_med_ex, dtype=np.float64),
                 0.045,
             ),
             (
-                "traj_inter_q75",
-                np.asarray(traj_inter_q75_og, dtype=np.float64),
-                np.asarray(traj_inter_q75_ex, dtype=np.float64),
+                "cond_ge2_traj_inter_q75",
+                np.asarray(cond_inter_q75_og, dtype=np.float64),
+                np.asarray(cond_inter_q75_ex, dtype=np.float64),
                 0.045,
             ),
         ]
@@ -864,7 +902,7 @@ class TestTrajectories(unittest.TestCase):
             self.assertGreater(u_vec.size, 100)
             self.assertGreater(v_vec.size, 100)
             w1_t, p_t = _mc_permutation_test_1d(u_vec, v_vec, n_permutations=n_perm)
-            ucb95_t = _bootstrap_ucb95_1d(u_vec, v_vec, n_bootstrap=2000)
+            ucb95_t = _bootstrap_percentile_ucb95_1d(u_vec, v_vec, n_bootstrap=2000)
             self.assertGreater(
                 p_t,
                 alpha_level,
@@ -874,10 +912,78 @@ class TestTrajectories(unittest.TestCase):
                 ucb95_t,
                 delta_eq,
                 msg=(
-                    f"Temporal '{name}': équivalence non établie "
-                    f"(IC_95%^sup={ucb95_t:.5f} >= delta_eq={delta_eq}, W1={w1_t:.5f})"
+                    f"Temporal '{name}': borne bootstrap percentile q_0.95={ucb95_t:.5f} "
+                    f">= delta_eq={delta_eq} (W1={w1_t:.5f})"
                 ),
             )
+
+    def test_08_zero_draw_channel_selection_boundary(self) -> None:
+        """
+        Vérifie avec un générateur contrôlé retournant exactement `u2 = 0.0` que
+        `np.searchsorted(..., side="right")` sélectionne le premier canal de taux
+        strictement positif (ici k = 2) et ne sélectionne jamais un canal de taux
+        nul (k = 0 ou k = 1), tant dans `simulate_ogata_thinning` que dans
+        `simulate_exact_piecewise_lambda0` (pour gamma = 0 et gamma > 0).
+        """
+        # N = 3 : J_{01} = 0, J_{02} = 0, J_{12} = 0 => A_0 = 0, A_1 = 0, A_2 = 0.
+        # En posant J_{23} sur N=4 ou en rendant seul le nœud 2 accessible via
+        # J_{02} = 0.4, J_{12} = 0.4, J_{01} = 0.0 :
+        #   A_0 = 0.16, A_1 = 0.16, A_2 = 0.16 + 0.16 = 0.32.
+        # Avec theta_A = 0.25 : A_0 <= 0.25 (inactif), A_1 <= 0.25 (inactif), A_2 > 0.25 (actif).
+        # Ainsi rates = [0.0, 0.0, mu].
+        X0 = np.array([1.0, 1.0, 1.0])
+        J0 = fb.unpack_J((0.0, 0.4, 0.4), n=3)
+        mu = 1.5
+        theta_A = 0.25
+
+        # 1. Ogata thinning avec u2 == 0.0
+        gen_og = _ControlledZeroU2Generator(u1_sequence=[0.5, 1e-6], u2_value=0.0)
+        res_og = traj.simulate_ogata_thinning(
+            X0=X0,
+            J0=J0,
+            t_max=1.0,
+            mu=mu,
+            gamma=0.0,
+            beta=0.0,
+            lam=0.0,
+            eta=0.0,
+            theta_A=theta_A,
+            rng=gen_og,  # type: ignore[arg-type]
+        )
+        self.assertEqual(res_og.n_accepted, 1)
+        self.assertEqual(res_og.events[0].node, 2)
+
+        # 2. Solveur exact par morceaux (gamma == 0.0) avec u2 == 0.0
+        gen_ex0 = _ControlledZeroU2Generator(u1_sequence=[0.5, 1e-6], u2_value=0.0)
+        res_ex0 = traj.simulate_exact_piecewise_lambda0(
+            X0=X0,
+            J0=J0,
+            t_max=1.0,
+            mu=mu,
+            gamma=0.0,
+            beta=0.0,
+            eta=0.0,
+            theta_A=theta_A,
+            rng=gen_ex0,  # type: ignore[arg-type]
+        )
+        self.assertEqual(res_ex0.n_accepted, 1)
+        self.assertEqual(res_ex0.events[0].node, 2)
+
+        # 3. Solveur exact par morceaux (gamma > 0.0) avec u2 == 0.0
+        gen_ex_pos = _ControlledZeroU2Generator(u1_sequence=[0.9, 1e-6], u2_value=0.0)
+        res_ex_pos = traj.simulate_exact_piecewise_lambda0(
+            X0=X0,
+            J0=J0,
+            t_max=1.0,
+            mu=mu,
+            gamma=0.2,
+            beta=0.0,
+            eta=0.0,
+            theta_A=theta_A,
+            rng=gen_ex_pos,  # type: ignore[arg-type]
+        )
+        self.assertEqual(res_ex_pos.n_accepted, 1)
+        self.assertEqual(res_ex_pos.events[0].node, 2)
 
 
 if __name__ == "__main__":
