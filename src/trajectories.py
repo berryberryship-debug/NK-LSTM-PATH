@@ -5,13 +5,15 @@ Projet : NK-LSTM-PATH
 Simulateur de la dynamique jointe (mutations, transport post-flip, dissipation
 exponentielle) par amincissement exact d'Ogata (thinning) avec horloge majorante
 Lambda_max = N * mu, accompagné du solveur analytique exact par morceaux pour
-le régime sans rétroaction (lambda = 0) et de la distance de Wasserstein-1 (W_1).
+le régime sans rétroaction (lambda = 0) à horloge de risque intégré, ainsi que
+des métriques de comparaison en loi (Wasserstein-1 1D, Sliced Wasserstein-1 et
+distance d'énergie multivariée calculée par blocs).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence
 import numpy as np
 
 from fiber_bundle import (
@@ -49,6 +51,23 @@ class TrajectoryResult:
     method: str
 
 
+@dataclass(frozen=True)
+class ThresholdCrossingsZ:
+    """
+    Classification des racines z = exp(-gamma * tau) de A_k(J(tau)) = theta_A :
+      - interior_z : racines strictement intérieures z in (0, 1), correspondant
+        à des instants finis tau = -ln(z) / gamma > 0 qui partitionnent
+        l'intervalle entre deux mutations.
+      - boundary_z : racines situées aux bornes z = 1 (tau = 0, égalité initiale
+        au seuil) ou z = 0 (tau -> +inf, égalité asymptotique à l'ancre J^(0)).
+        Volontairement exclues de `interior_z` car elles ne créent pas de
+        sous-segment intérieur supplémentaire.
+    """
+
+    interior_z: np.ndarray
+    boundary_z: np.ndarray
+
+
 class NKLandscape:
     """
     Paysage adaptatif NK natif sur {-1, +1}^N (converti en {0, 1}^N).
@@ -71,7 +90,7 @@ class NKLandscape:
                 self.neighbors[i] = rng.choice(pool, size=self.k, replace=False)
 
         self.table = rng.uniform(0.0, 1.0, size=(self.n, 1 << (self.k + 1)))
-        self._powers = (1 << np.arange(self.k + 1, dtype=np.int64))
+        self._powers = 1 << np.arange(self.k + 1, dtype=np.int64)
 
     def __call__(self, X: np.ndarray) -> float:
         state = _validate_state(X)
@@ -114,7 +133,6 @@ def extended_fitness(
     f_nk = float(fnk_fn(state))
     if lam == 0.0:
         return f_nk
-    # Comme J est symétrique à diagonale nulle, sum_{i<j} J_ij s_i s_j = 0.5 * s^T J s
     coupling = 0.5 * float(state @ (mat @ state))
     return f_nk + float(lam) * coupling
 
@@ -145,7 +163,6 @@ def delta_fitness_k(
     if lam == 0.0:
         return df_nk
 
-    # J_{kk} == 0 => sum_{j != k} J_{kj} s_j == (J @ s)_k
     local_field = float(np.dot(mat[k], state))
     return df_nk - 2.0 * float(lam) * float(state[k]) * local_field
 
@@ -215,21 +232,66 @@ def dissipate_J(
 
     decay = float(np.exp(-float(gamma) * float(dt)))
     J_next = mat_anchor + (mat_curr - mat_anchor) * decay
-    # Garantie de symétrie numérique exacte
     J_next = 0.5 * (J_next + J_next.T)
     np.fill_diagonal(J_next, 0.0)
     return J_next
 
 
-def solve_threshold_crossings_z(
+def _stable_quadratic_real_roots(
+    c2: float,
+    c1: float,
+    c0: float,
+) -> List[float]:
+    """
+    Résout c2 * z^2 + c1 * z + c0 = 0 dans R en mettant les coefficients à
+    l'échelle S = max(|c2|, |c1|, |c0|) pour éviter tout débordement flottant,
+    sans réduction arbitraire du degré quadratique lorsque c2 != 0, et en
+    utilisant la factorisation de Viète :
+        q = -0.5 * (b + sign(b) * sqrt(Delta)),
+        z_1 = q / a,   z_2 = c / q.
+    """
+    scale = max(abs(c2), abs(c1), abs(c0))
+    if scale == 0.0 or not np.isfinite(scale):
+        return []
+
+    a = c2 / scale
+    b = c1 / scale
+    c = c0 / scale
+
+    if a == 0.0:
+        if b == 0.0:
+            return []
+        return [float(-c / b)]
+
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        disc_scale = max(b * b, abs(4.0 * a * c))
+        if disc >= -1e-15 * disc_scale:
+            return [float(-b / (2.0 * a))]
+        return []
+    if disc == 0.0:
+        return [float(-b / (2.0 * a))]
+
+    sqrt_disc = float(np.sqrt(disc))
+    sign_b = 1.0 if b >= 0.0 else -1.0
+    q = -0.5 * (b + sign_b * sqrt_disc)
+    if q == 0.0:
+        return [float(-b / (2.0 * a))]
+
+    z1 = float(q / a)
+    z2 = float(c / q)
+    return [z1, z2]
+
+
+def classify_threshold_crossings_z(
     J_curr: np.ndarray,
     J_anchor: np.ndarray,
     theta_A: float,
-    tol: float = 1e-12,
-) -> np.ndarray:
+    eps_boundary: float = 1e-15,
+    dedup_tol: float = 1e-14,
+) -> ThresholdCrossingsZ:
     """
-    Résout analytiquement, pour chaque nœud k in {0, ..., N-1}, l'équation
-    quadratique en z = exp(-gamma * tau) in (0, 1) :
+    Résout et classe pour chaque nœud k in {0, ..., N-1} les racines de :
         A_k(J^{(0)} + (J_curr - J^{(0)}) * z) - theta_A = 0
         <=> c_2 * z^2 + c_1 * z + c_0 = 0,
     avec :
@@ -238,9 +300,11 @@ def solve_threshold_crossings_z(
         c_0 = sum_{j != k} (J^{(0)}_{kj})^2 - theta_A,
         D = J_curr - J^{(0)}.
 
-    Gère explicitement les cas dégénérés (c_2 = 0), les racines doubles
-    (Delta = 0), les racines hors de (0, 1) et les égalités au seuil en z = 1.
-    Retourne les racines distinctes triées par ordre décroissant (z proche de 1 d'abord).
+    Distingue :
+      - `interior_z` : racines dans (eps_boundary, 1 - eps_boundary), définissant
+        les instants tau = -ln(z)/gamma in (0, +inf) de changement de masque.
+      - `boundary_z` : racines aux bornes |z| <= eps_boundary ou |z - 1| <= eps_boundary,
+        volontairement exclues des points de coupure intérieurs.
     """
     mat_curr = _validate_J(J_curr)
     mat_anchor = _validate_J(J_anchor)
@@ -249,8 +313,8 @@ def solve_threshold_crossings_z(
 
     diff = mat_curr - mat_anchor
     n = mat_curr.shape[0]
-    roots: List[float] = []
-    eps_coef = 1e-28
+    interior: List[float] = []
+    boundary: List[float] = []
 
     for k in range(n):
         d_row = diff[k]
@@ -260,38 +324,47 @@ def solve_threshold_crossings_z(
         c1 = 2.0 * float(np.dot(j0_row, d_row))
         c0 = float(np.dot(j0_row, j0_row)) - float(theta_A)
 
-        if c2 <= eps_coef:
-            if abs(c1) > eps_coef:
-                z = -c0 / c1
-                if tol < z < 1.0 - tol:
-                    roots.append(float(z))
-            continue
+        for z in _stable_quadratic_real_roots(c2, c1, c0):
+            if eps_boundary < z < 1.0 - eps_boundary:
+                interior.append(z)
+            elif abs(z) <= eps_boundary or abs(z - 1.0) <= eps_boundary:
+                boundary.append(float(np.clip(z, 0.0, 1.0)))
 
-        disc = c1 * c1 - 4.0 * c2 * c0
-        if disc < -eps_coef:
-            continue
-        if abs(disc) <= eps_coef:
-            z = -c1 / (2.0 * c2)
-            if tol < z < 1.0 - tol:
-                roots.append(float(z))
-            continue
+    def _dedup_desc(vals: List[float]) -> np.ndarray:
+        if not vals:
+            return np.empty(0, dtype=np.float64)
+        s = sorted(vals, reverse=True)
+        out = [s[0]]
+        for v in s[1:]:
+            if abs(v - out[-1]) > dedup_tol:
+                out.append(v)
+        return np.asarray(out, dtype=np.float64)
 
-        sqrt_disc = float(np.sqrt(disc))
-        z1 = (-c1 - sqrt_disc) / (2.0 * c2)
-        z2 = (-c1 + sqrt_disc) / (2.0 * c2)
-        for z in (z1, z2):
-            if tol < z < 1.0 - tol:
-                roots.append(float(z))
+    return ThresholdCrossingsZ(
+        interior_z=_dedup_desc(interior),
+        boundary_z=_dedup_desc(boundary),
+    )
 
-    if not roots:
-        return np.empty(0, dtype=np.float64)
 
-    roots_sorted = sorted(roots, reverse=True)
-    dedup: List[float] = [roots_sorted[0]]
-    for z in roots_sorted[1:]:
-        if abs(z - dedup[-1]) > tol:
-            dedup.append(z)
-    return np.asarray(dedup, dtype=np.float64)
+def solve_threshold_crossings_z(
+    J_curr: np.ndarray,
+    J_anchor: np.ndarray,
+    theta_A: float,
+    eps_boundary: float = 1e-15,
+    dedup_tol: float = 1e-14,
+) -> np.ndarray:
+    """
+    Retourne les racines strictement intérieures z in (0, 1) triées par ordre
+    décroissant (instants tau = -ln(z) / gamma croissants). Les racines aux
+    bornes z in {0, 1} sont volontairement exclues.
+    """
+    return classify_threshold_crossings_z(
+        J_curr=J_curr,
+        J_anchor=J_anchor,
+        theta_A=theta_A,
+        eps_boundary=eps_boundary,
+        dedup_tol=dedup_tol,
+    ).interior_z
 
 
 def simulate_ogata_thinning(
@@ -375,7 +448,7 @@ def simulate_ogata_thinning(
             )
 
         u2 = float(gen.uniform(0.0, lambda_max))
-        if u2 <= total_rate and total_rate > 0.0:
+        if u2 < total_rate and total_rate > 0.0:
             cum_rates = np.cumsum(rates)
             k = int(np.searchsorted(cum_rates, u2, side="left"))
             if k >= n:
@@ -411,9 +484,12 @@ def simulate_exact_piecewise_lambda0(
 ) -> TrajectoryResult:
     """
     Solveur de Gillespie exact par morceaux pour le régime sans rétroaction
-    (lambda = 0) : entre deux mutations, les poids de Boltzmann W_k(X) sont
-    constants et les instants de franchissement du seuil A_k(J(t)) = theta_A
-    sont calculés analytiquement via `solve_threshold_crossings_z`.
+    (lambda = 0) :
+      - Entre deux mutations, les poids de Boltzmann W_k(X) sont constants.
+      - Une unique horloge exponentielle E = -ln(u) ~ Exp(1) est tirée au
+        début de chaque intervalle inter-mutations ; le risque intégré
+        E_m = Lambda_m * Delta t_m est soustrait à chaque changement de masque
+        sans réinitialiser l'horloge.
     """
     if t_max < 0.0:
         raise ValueError("t_max doit être >= 0.")
@@ -479,7 +555,7 @@ def simulate_exact_piecewise_lambda0(
             events.append(JumpEvent(time=t, node=k, X=X.copy(), J=J.copy()))
             continue
 
-        # Résolution analytique des franchissements de seuil sur (0, remaining_t)
+        # Résolution analytique des franchissements strictement intérieurs sur (0, remaining_t)
         z_roots = solve_threshold_crossings_z(J, anchor, theta_A=theta_A)
         if z_roots.size > 0:
             taus_all = -np.log(z_roots) / float(gamma)
@@ -488,6 +564,12 @@ def simulate_exact_piecewise_lambda0(
             taus = np.empty(0, dtype=np.float64)
 
         boundaries = np.concatenate(([0.0], taus, [remaining_t]))
+
+        # Horloge exponentielle unique conservée à travers tous les sous-segments
+        u = float(gen.uniform(0.0, 1.0))
+        while u == 0.0:
+            u = float(gen.uniform(0.0, 1.0))
+        hazard_remaining = -float(np.log(u))
         jumped = False
 
         for m in range(boundaries.size - 1):
@@ -497,8 +579,6 @@ def simulate_exact_piecewise_lambda0(
             if seg_len <= 0.0:
                 continue
 
-            # Sur l'ouvert (tau_start, tau_end), aucun seuil n'est franchi :
-            # l'évaluation au point milieu donne le masque exact sur tout le sous-intervalle.
             tau_mid = 0.5 * (tau_start + tau_end)
             J_mid = dissipate_J(J, anchor, gamma=gamma, dt=tau_mid)
             active_mid = (accessibility_A(J_mid) > float(theta_A)).astype(np.float64)
@@ -508,15 +588,13 @@ def simulate_exact_piecewise_lambda0(
             if lam_m <= 0.0:
                 continue
 
-            u1 = float(gen.uniform(0.0, 1.0))
-            while u1 == 0.0:
-                u1 = float(gen.uniform(0.0, 1.0))
-            wait = -float(np.log(u1)) / lam_m
-
-            if wait < seg_len:
+            hazard_segment = lam_m * seg_len
+            if hazard_remaining < hazard_segment:
+                wait = hazard_remaining / lam_m
                 tau_hit = tau_start + wait
                 t += tau_hit
                 J = dissipate_J(J, anchor, gamma=gamma, dt=tau_hit)
+
                 u2 = float(gen.uniform(0.0, lam_m))
                 k = int(np.searchsorted(np.cumsum(rates_m), u2, side="left"))
                 if k >= n:
@@ -526,6 +604,8 @@ def simulate_exact_piecewise_lambda0(
                 jumped = True
                 break
 
+            hazard_remaining -= hazard_segment
+
         if not jumped:
             J = dissipate_J(J, anchor, gamma=gamma, dt=remaining_t)
             t = float(t_max)
@@ -533,4 +613,108 @@ def simulate_exact_piecewise_lambda0(
 
     return TrajectoryResult(
         t_max=float(t_max),
-        X_
+        X_final=X,
+        J_final=J,
+        events=events,
+        n_accepted=len(events),
+        n_candidates=len(events),
+        method="exact_piecewise_lambda0",
+    )
+
+
+def wasserstein_1d(u_samples: Sequence[float], v_samples: Sequence[float]) -> float:
+    """
+    Calcule la distance de Wasserstein-1 (W_1) exacte entre deux échantillons
+    empiriques unidimensionnels de tailles quelconques (n_u, n_v >= 1).
+    """
+    u = np.sort(np.asarray(u_samples, dtype=np.float64).ravel())
+    v = np.sort(np.asarray(v_samples, dtype=np.float64).ravel())
+    if u.size == 0 or v.size == 0:
+        raise ValueError("Les échantillons doivent être non vides.")
+    if u.size == v.size:
+        return float(np.mean(np.abs(u - v)))
+
+    all_values = np.concatenate([u, v])
+    all_values.sort()
+    deltas = np.diff(all_values)
+    if deltas.size == 0:
+        return 0.0
+
+    cdf_u = np.searchsorted(u, all_values[:-1], side="right") / float(u.size)
+    cdf_v = np.searchsorted(v, all_values[:-1], side="right") / float(v.size)
+    return float(np.sum(np.abs(cdf_u - cdf_v) * deltas))
+
+
+def sliced_wasserstein_1(
+    U: np.ndarray,
+    V: np.ndarray,
+    n_projections: int = 64,
+    seed: int = 0,
+) -> float:
+    """
+    Distance de Wasserstein-1 projetée (Sliced Wasserstein-1) entre deux
+    nuages multivariés U in R^{n x d} et V in R^{m x d}.
+    """
+    arr_u = np.asarray(U, dtype=np.float64)
+    arr_v = np.asarray(V, dtype=np.float64)
+    if arr_u.ndim != 2 or arr_v.ndim != 2 or arr_u.shape[1] != arr_v.shape[1]:
+        raise ValueError("U et V doivent être des matrices 2D de même dimension d.")
+    if arr_u.shape[0] == 0 or arr_v.shape[0] == 0:
+        raise ValueError("Les échantillons U et V doivent être non vides.")
+
+    d = arr_u.shape[1]
+    rng = np.random.default_rng(seed)
+    dirs = rng.normal(0.0, 1.0, size=(n_projections, d))
+    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+    dirs = dirs / np.maximum(norms, 1e-15)
+
+    proj_u = arr_u @ dirs.T
+    proj_v = arr_v @ dirs.T
+    total = 0.0
+    for p in range(n_projections):
+        total += wasserstein_1d(proj_u[:, p], proj_v[:, p])
+    return total / float(n_projections)
+
+
+def energy_distance(
+    U: np.ndarray,
+    V: np.ndarray,
+    block_size: int = 256,
+) -> float:
+    """
+    Distance d'énergie multivariée D_E(U, V) = sqrt(2 E||X - Y|| - E||X - X'|| - E||Y - Y'||),
+    calculée par blocs de taille `block_size` afin de borner l'empreinte mémoire
+    à O(block_size * max(n, m) * d).
+    """
+    arr_u = np.asarray(U, dtype=np.float64)
+    arr_v = np.asarray(V, dtype=np.float64)
+    if arr_u.ndim != 2 or arr_v.ndim != 2 or arr_u.shape[1] != arr_v.shape[1]:
+        raise ValueError("U et V doivent être des matrices 2D de même dimension d.")
+    if arr_u.shape[0] < 2 or arr_v.shape[0] < 2:
+        raise ValueError("Au moins 2 échantillons requis dans U et V.")
+    if block_size < 1:
+        raise ValueError("block_size doit être >= 1.")
+
+    def _mean_cross_blocked(A: np.ndarray, B: np.ndarray) -> float:
+        n_a, n_b = A.shape[0], B.shape[0]
+        total = 0.0
+        for start in range(0, n_a, block_size):
+            end = min(start + block_size, n_a)
+            diff = A[start:end, None, :] - B[None, :, :]
+            total += float(np.sum(np.linalg.norm(diff, axis=-1)))
+        return total / float(n_a * n_b)
+
+    def _mean_within_blocked(A: np.ndarray) -> float:
+        n_a = A.shape[0]
+        total = 0.0
+        for start in range(0, n_a, block_size):
+            end = min(start + block_size, n_a)
+            diff = A[start:end, None, :] - A[None, :, :]
+            total += float(np.sum(np.linalg.norm(diff, axis=-1)))
+        return total / float(n_a * (n_a - 1))
+
+    e_xy = _mean_cross_blocked(arr_u, arr_v)
+    e_xx = _mean_within_blocked(arr_u)
+    e_yy = _mean_within_blocked(arr_v)
+    val = max(0.0, 2.0 * e_xy - e_xx - e_yy)
+    return float(np.sqrt(val))
