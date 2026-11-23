@@ -13,13 +13,12 @@ Suite de validation de `src/trajectories.py` :
   5. Stabilité numérique du solveur quadratique à mise à l'échelle relative
      (coefficients 1e-16 et 1e+16, coefficient quadratique 0 < c2 / S < 1e-14
      sans réduction artificielle du degré tant que c2 / S ne sous-déborde pas
-     en IEEE 754 binary64, racines proches 0.5 +- 1e-7, racines proches des
-     bornes, tangence avec tolérance d'arrondi documentée, exclusion des
-     bornes {0, 1}).
+     en binary64, racines proches 0.5 +- 1e-7, racines proches des bornes,
+     tangence avec tolérance d'arrondi documentée, exclusion des bornes {0, 1}).
   6. Conservation du risque intégré int_0^t Lambda(u) du = E à travers un changement
      de masque d'accessibilité :
-       - fermeture d'un canal (3*mu -> 2*mu à tau_c = ln(2)/gamma),
-       - ouverture retardée de deux canaux (0 -> 2*mu à tau_c = ln(2)/gamma).
+       - fermeture d'un canal (3*mu -> 2*mu à tau_c = ln(2)/gamma avec theta_A = 0.25),
+       - ouverture retardée de deux canaux (0 -> 2*mu à tau_c = ln(2)/gamma avec theta_A = 0.25).
   7. Validation croisée en loi entre `simulate_ogata_thinning` et
      `simulate_exact_piecewise_lambda0` à lambda = 0 reposant sur :
        (i)   un test de permutation Monte-Carlo à deux échantillons avec correction
@@ -44,6 +43,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Sequence
 import unittest
 import numpy as np
 
@@ -228,12 +228,14 @@ def _mc_permutation_energy_blocked(
 ) -> tuple[float, float]:
     """
     Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
-    correction de rang) pour la distance d'énergie D_E(U, V).
-    Les permutations sont traitées par petits lots de taille `perm_batch_size`
-    et les distances euclidiennes par blocs de lignes de taille `block_size`,
-    avec accumulation matricielle vectorisée (DGEMM), bornant strictement
-    l'empreinte mémoire auxiliaire en O((perm_batch_size + block_size * d) * n_tot)
-    sans boucle Python individuelle sur les 9 999 permutations.
+    correction de rang p = (1 + n_>=) / (1 + n_perm)) pour la distance d'énergie
+    D_E(U, V).
+    Les blocs de lignes de taille B_r = `block_size` sont parcourus en boucle
+    externe afin de ne calculer chaque bloc de distances euclidiennes qu'une
+    seule fois, tandis que les lots de permutations de taille B_p = `perm_batch_size`
+    sont régénérés de manière déterministe via `SeedSequence.spawn`.
+    L'empreinte mémoire auxiliaire est bornée en :
+        O(B_p * n_tot + B_r * n_tot * d + B_p * B_r + n_permutations).
     """
     ed_obs = traj.energy_distance(U, V, block_size=block_size)
     n_u = U.shape[0]
@@ -245,30 +247,32 @@ def _mc_permutation_energy_blocked(
     sum_vv = np.zeros(n_permutations, dtype=np.float64)
     sum_uv = np.zeros(n_permutations, dtype=np.float64)
 
-    rng = np.random.default_rng(seed)
+    n_batches = (n_permutations + perm_batch_size - 1) // perm_batch_size
+    batch_seeds = np.random.SeedSequence(seed).spawn(n_batches)
 
-    for p0 in range(0, n_permutations, perm_batch_size):
-        p1 = min(p0 + perm_batch_size, n_permutations)
-        m = p1 - p0
+    for i0 in range(0, n_tot, block_size):
+        i1 = min(i0 + block_size, n_tot)
+        diff = pooled[i0:i1, None, :] - pooled[None, :, :]
+        dist_block = np.linalg.norm(diff, axis=-1)  # (B_r, n_tot)
+        s_all = np.sum(dist_block, axis=1)          # (B_r,)
 
-        noise = rng.random((m, n_tot))
-        perms = np.argpartition(noise, kth=n_u - 1, axis=1)
-        in_u_batch = np.zeros((m, n_tot), dtype=np.float64)
-        rows = np.arange(m)[:, None]
-        in_u_batch[rows, perms[:, :n_u]] = 1.0
-        col_in_u = in_u_batch.T  # (n_tot, m)
+        for batch_idx in range(n_batches):
+            p0 = batch_idx * perm_batch_size
+            p1 = min(p0 + perm_batch_size, n_permutations)
+            m = p1 - p0
 
-        for i0 in range(0, n_tot, block_size):
-            i1 = min(i0 + block_size, n_tot)
-            diff = pooled[i0:i1, None, :] - pooled[None, :, :]
-            dist_block = np.linalg.norm(diff, axis=-1)  # (b_r, n_tot)
+            rng_b = np.random.default_rng(batch_seeds[batch_idx])
+            noise = rng_b.random((m, n_tot))
+            perms = np.argpartition(noise, kth=n_u - 1, axis=1)
+            in_u_batch = np.zeros((m, n_tot), dtype=np.float64)
+            rows = np.arange(m)[:, None]
+            in_u_batch[rows, perms[:, :n_u]] = 1.0
 
-            row_in_u = in_u_batch[:, i0:i1]  # (m, b_r)
-            row_in_v = 1.0 - row_in_u        # (m, b_r)
+            row_in_u = in_u_batch[:, i0:i1]  # (m, B_r)
+            row_in_v = 1.0 - row_in_u        # (m, B_r)
 
-            s_all = np.sum(dist_block, axis=1)  # (b_r,)
-            s_u = dist_block @ col_in_u         # (b_r, m)
-            s_v = s_all[:, None] - s_u          # (b_r, m)
+            s_u = dist_block @ in_u_batch.T  # (B_r, m)
+            s_v = s_all[:, None] - s_u       # (B_r, m)
 
             sum_uu[p0:p1] += np.sum(row_in_u * s_u.T, axis=1)
             sum_uv[p0:p1] += np.sum(row_in_u * s_v.T, axis=1)
@@ -597,12 +601,16 @@ class TestTrajectories(unittest.TestCase):
         """
         Vérifie la conservation du risque intégré int_0^t Lambda(u) du = E à travers
         un changement de masque d'accessibilité :
-          - Cas 1 : fermeture d'un canal (3*mu -> 2*mu à tau_c = ln(2)/gamma),
-          - Cas 2 : ouverture retardée de deux canaux (0 -> 2*mu à tau_c = ln(2)/gamma).
+          - Cas 1 (fermeture d'un canal) : J(0) = (1, 1, 0), J^{(0)} = (0, 1, 0),
+            theta_A = 0.25. L'accessibilité du nœud médian vaut A_1(t) = e^{-2 gamma t},
+            d'où e^{-2 gamma tau_c} = 0.25 <=> tau_c = ln(2) / gamma, et une transition
+            de taux 3*mu -> 2*mu à tau_c.
+          - Cas 2 (ouverture retardée de deux canaux) : J(0) = (0, 0, 0),
+            J^{(0)} = (1, 0, 0), theta_A = 0.25 => transition 0 -> 2*mu à tau_c = ln(2)/gamma.
         """
         mu = 1.0
         gamma = 1.0
-        theta_A = 0.5
+        theta_A_close = 0.25
         tau_c = float(np.log(2.0) / gamma)
 
         X0 = np.array([1.0, 1.0, 1.0])
@@ -632,7 +640,7 @@ class TestTrajectories(unittest.TestCase):
                 gamma=gamma,
                 beta=0.0,
                 eta=0.0,
-                theta_A=theta_A,
+                theta_A=theta_A_close,
                 rng=rng_ex,
             )
             t1_ex[i] = res_ex.events[0].time if res_ex.events else np.inf
@@ -647,7 +655,7 @@ class TestTrajectories(unittest.TestCase):
                 beta=0.0,
                 lam=0.0,
                 eta=0.0,
-                theta_A=theta_A,
+                theta_A=theta_A_close,
                 rng=rng_og,
             )
             t1_og[i] = res_og.events[0].time if res_og.events else np.inf
@@ -689,16 +697,17 @@ class TestTrajectories(unittest.TestCase):
              la non-rejection de l'égalité en loi (absence de divergence détectée),
              sans constituer à lui seul une preuve d'équivalence.
           2. L'argument d'équivalence pratique repose sur la borne supérieure
-             bootstrap percentile q_0.95(D^*), à couverture nominale de 95 %,
+             bootstrap percentile q_0.95(D^*), à couverture nominale de 95 %
+             (dont la couverture finie exacte n'est pas indépendamment établie),
              comparée à la marge d'équivalence delta_eq définie a priori :
                  q_0.95(D^*) < delta_eq.
           3. Statistiques temporelles définies individuellement par trajectoire :
-             - globales : T_1, T_dernier, étendue T_dernier - T_1, ainsi que la
-               proportion de trajectoires ayant au moins deux événements
-               I(N_events >= 2) ;
-             - conditionnelles : moyenne, médiane et quantile 75 % des
-               intervalles inter-sauts calculés sur la sous-population
-               conditionnelle des trajectoires vérifiant N_events >= 2.
+             - prop_ge2_events compare la fréquence de sélection de la
+               population conditionnelle (N_events >= 2) ;
+             - cond_ge2_traj_inter_* comparent les résumés inter-sauts à
+               l'intérieur de cette sous-population conditionnelle. Ces résultats
+               sont complémentaires et ne suffisent pas à eux seuls à établir
+               l'égalité de la loi complète sur l'espace des trajectoires.
         """
         nk = traj.NKLandscape(n=3, k=2, seed=19)
         X0 = np.array([1.0, -1.0, 1.0])
@@ -733,7 +742,6 @@ class TestTrajectories(unittest.TestCase):
         has_ge2_og = np.zeros(n_total, dtype=np.float64)
         has_ge2_ex = np.zeros(n_total, dtype=np.float64)
 
-        # Résumés inter-sauts conditionnellement à la présence d'au moins 2 événements
         cond_inter_mean_og: list[float] = []
         cond_inter_med_og: list[float] = []
         cond_inter_q75_og: list[float] = []
@@ -870,10 +878,7 @@ class TestTrajectories(unittest.TestCase):
             msg=f"Cov Fro : borne bootstrap percentile q_0.95={cov_ucb95:.5f} >= 0.45",
         )
 
-        # (c) Statistiques temporelles par trajectoire :
-        #     - observables inconditionnelles sur les n_total trajectoires
-        #       (incluant la proportion P(N_events >= 2)),
-        #     - résumés inter-sauts sur la population conditionnelle N_events >= 2.
+        # (c) Statistiques temporelles par trajectoire
         temporal_specs = [
             ("T_first_capped", t_first_og, t_first_ex, 0.035),
             ("T_last_capped", t_last_og, t_last_ex, 0.045),
@@ -925,18 +930,11 @@ class TestTrajectories(unittest.TestCase):
         nul (k = 0 ou k = 1), tant dans `simulate_ogata_thinning` que dans
         `simulate_exact_piecewise_lambda0` (pour gamma = 0 et gamma > 0).
         """
-        # N = 3 : J_{01} = 0, J_{02} = 0, J_{12} = 0 => A_0 = 0, A_1 = 0, A_2 = 0.
-        # En posant J_{23} sur N=4 ou en rendant seul le nœud 2 accessible via
-        # J_{02} = 0.4, J_{12} = 0.4, J_{01} = 0.0 :
-        #   A_0 = 0.16, A_1 = 0.16, A_2 = 0.16 + 0.16 = 0.32.
-        # Avec theta_A = 0.25 : A_0 <= 0.25 (inactif), A_1 <= 0.25 (inactif), A_2 > 0.25 (actif).
-        # Ainsi rates = [0.0, 0.0, mu].
         X0 = np.array([1.0, 1.0, 1.0])
         J0 = fb.unpack_J((0.0, 0.4, 0.4), n=3)
         mu = 1.5
         theta_A = 0.25
 
-        # 1. Ogata thinning avec u2 == 0.0
         gen_og = _ControlledZeroU2Generator(u1_sequence=[0.5, 1e-6], u2_value=0.0)
         res_og = traj.simulate_ogata_thinning(
             X0=X0,
@@ -953,7 +951,6 @@ class TestTrajectories(unittest.TestCase):
         self.assertEqual(res_og.n_accepted, 1)
         self.assertEqual(res_og.events[0].node, 2)
 
-        # 2. Solveur exact par morceaux (gamma == 0.0) avec u2 == 0.0
         gen_ex0 = _ControlledZeroU2Generator(u1_sequence=[0.5, 1e-6], u2_value=0.0)
         res_ex0 = traj.simulate_exact_piecewise_lambda0(
             X0=X0,
@@ -969,7 +966,6 @@ class TestTrajectories(unittest.TestCase):
         self.assertEqual(res_ex0.n_accepted, 1)
         self.assertEqual(res_ex0.events[0].node, 2)
 
-        # 3. Solveur exact par morceaux (gamma > 0.0) avec u2 == 0.0
         gen_ex_pos = _ControlledZeroU2Generator(u1_sequence=[0.9, 1e-6], u2_value=0.0)
         res_ex_pos = traj.simulate_exact_piecewise_lambda0(
             X0=X0,
