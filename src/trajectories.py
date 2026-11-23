@@ -246,9 +246,10 @@ def _stable_quadratic_real_roots(
     Résout numériquement c2 * z^2 + c1 * z + c0 = 0 dans R :
       1. Normalisation par l'échelle S = max(|c2|, |c1|, |c0|) afin de prévenir
          tout débordement flottant. Aucun seuil artificiel de degré n'est
-         appliqué : la réduction linéaire n'intervient que si a = c2 / S vaut
-         exactement 0.0 (ce qui inclut le sous-débordement IEEE 754 binary64
-         lorsque |c2| / S < 2^{-1074}).
+         appliqué : la normalisation peut arrondir un coefficient quadratique
+         non nul à zéro lorsque sa valeur absolue est suffisamment petite pour
+         être sous-débordée en binary64. La condition `a == 0.0` ne garantit donc
+         pas que le coefficient initial `c2` était algébriquement nul.
       2. Tolérance numérique d'arrondi sur le discriminant : lorsque disc < 0
          mais disc >= -4 * eps_mach * max(b^2, |4 a c|), le polynôme est traité
          comme tangent (racine double -b / (2a)) afin d'absorber les erreurs
@@ -449,7 +450,8 @@ def simulate_ogata_thinning(
         rates = transition_rates(
             X, J, mu=mu, beta=beta, lam=lam, theta_A=theta_A, fnk_fn=fnk_fn
         )
-        total_rate = float(np.sum(rates))
+        cum_rates = np.cumsum(rates)
+        total_rate = float(cum_rates[-1])
         if total_rate > lambda_max * (1.0 + 1e-12):
             raise AssertionError(
                 f"Violation de la borne majorante : Lambda={total_rate} > N*mu={lambda_max}."
@@ -457,8 +459,7 @@ def simulate_ogata_thinning(
 
         u2 = float(gen.uniform(0.0, lambda_max))
         if u2 < total_rate and total_rate > 0.0:
-            cum_rates = np.cumsum(rates)
-            k = int(np.searchsorted(cum_rates, u2, side="left"))
+            k = int(np.searchsorted(cum_rates, u2, side="right"))
             if k >= n:
                 k = n - 1
             X, J = mutate_postflip(X, J, k=k, eta=eta, psi_fn=psi_fn)
@@ -543,7 +544,8 @@ def simulate_exact_piecewise_lambda0(
         if gamma == 0.0:
             active = (accessibility_A(J) > float(theta_A)).astype(np.float64)
             rates = float(mu) * active * boltz
-            total_rate = float(np.sum(rates))
+            cum_rates = np.cumsum(rates)
+            total_rate = float(cum_rates[-1])
             if total_rate <= 0.0:
                 t = float(t_max)
                 break
@@ -556,7 +558,7 @@ def simulate_exact_piecewise_lambda0(
                 break
             t += dt
             u2 = float(gen.uniform(0.0, total_rate))
-            k = int(np.searchsorted(np.cumsum(rates), u2, side="left"))
+            k = int(np.searchsorted(cum_rates, u2, side="right"))
             if k >= n:
                 k = n - 1
             X, J = mutate_postflip(X, J, k=k, eta=eta, psi_fn=psi_fn)
@@ -591,7 +593,8 @@ def simulate_exact_piecewise_lambda0(
             J_mid = dissipate_J(J, anchor, gamma=gamma, dt=tau_mid)
             active_mid = (accessibility_A(J_mid) > float(theta_A)).astype(np.float64)
             rates_m = float(mu) * active_mid * boltz
-            lam_m = float(np.sum(rates_m))
+            cum_rates_m = np.cumsum(rates_m)
+            lam_m = float(cum_rates_m[-1])
 
             if lam_m <= 0.0:
                 continue
@@ -604,7 +607,7 @@ def simulate_exact_piecewise_lambda0(
                 J = dissipate_J(J, anchor, gamma=gamma, dt=tau_hit)
 
                 u2 = float(gen.uniform(0.0, lam_m))
-                k = int(np.searchsorted(np.cumsum(rates_m), u2, side="left"))
+                k = int(np.searchsorted(cum_rates_m, u2, side="right"))
                 if k >= n:
                     k = n - 1
                 X, J = mutate_postflip(X, J, k=k, eta=eta, psi_fn=psi_fn)
