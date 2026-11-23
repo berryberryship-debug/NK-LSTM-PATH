@@ -230,12 +230,13 @@ def _mc_permutation_energy_blocked(
     Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
     correction de rang p = (1 + n_>=) / (1 + n_perm)) pour la distance d'énergie
     D_E(U, V).
-    Les blocs de lignes de taille B_r = `block_size` sont parcourus en boucle
-    externe afin de ne calculer chaque bloc de distances euclidiennes qu'une
-    seule fois, tandis que les lots de permutations de taille B_p = `perm_batch_size`
-    sont régénérés de manière déterministe via `SeedSequence.spawn`.
+    Les masques d'appartenance booléens `in_u` de dimension (n_permutations, n_tot)
+    sont générés une seule fois par tranches de taille B_p = `perm_batch_size`,
+    puis réutilisés lors de l'unique parcours des blocs de distances euclidiennes
+    de taille B_r = `block_size`.
     L'empreinte mémoire auxiliaire est bornée en :
-        O(B_p * n_tot + B_r * n_tot * d + B_p * B_r + n_permutations).
+        O(n_permutations * n_tot [bool] + B_p * n_tot [float64]
+          + B_r * n_tot * d + B_p * B_r + n_permutations).
     """
     ed_obs = traj.energy_distance(U, V, block_size=block_size)
     n_u = U.shape[0]
@@ -243,36 +244,36 @@ def _mc_permutation_energy_blocked(
     pooled = np.vstack([U, V])
     n_tot = pooled.shape[0]
 
+    # Génération unique des masques d'appartenance booléens par tranches
+    in_u = np.zeros((n_permutations, n_tot), dtype=np.bool_)
+    rng = np.random.default_rng(seed)
+    for p0 in range(0, n_permutations, perm_batch_size):
+        p1 = min(p0 + perm_batch_size, n_permutations)
+        m = p1 - p0
+        noise = rng.random((m, n_tot))
+        perms = np.argpartition(noise, kth=n_u - 1, axis=1)
+        rows = np.arange(m)[:, None]
+        in_u[p0:p1][rows, perms[:, :n_u]] = True
+
     sum_uu = np.zeros(n_permutations, dtype=np.float64)
     sum_vv = np.zeros(n_permutations, dtype=np.float64)
     sum_uv = np.zeros(n_permutations, dtype=np.float64)
 
-    n_batches = (n_permutations + perm_batch_size - 1) // perm_batch_size
-    batch_seeds = np.random.SeedSequence(seed).spawn(n_batches)
-
+    # Parcours unique des blocs de lignes de distances euclidiennes
     for i0 in range(0, n_tot, block_size):
         i1 = min(i0 + block_size, n_tot)
         diff = pooled[i0:i1, None, :] - pooled[None, :, :]
         dist_block = np.linalg.norm(diff, axis=-1)  # (B_r, n_tot)
         s_all = np.sum(dist_block, axis=1)          # (B_r,)
 
-        for batch_idx in range(n_batches):
-            p0 = batch_idx * perm_batch_size
+        for p0 in range(0, n_permutations, perm_batch_size):
             p1 = min(p0 + perm_batch_size, n_permutations)
-            m = p1 - p0
+            in_u_batch = in_u[p0:p1].astype(np.float64)  # (B_p, n_tot)
+            row_in_u = in_u_batch[:, i0:i1]              # (B_p, B_r)
+            row_in_v = 1.0 - row_in_u                    # (B_p, B_r)
 
-            rng_b = np.random.default_rng(batch_seeds[batch_idx])
-            noise = rng_b.random((m, n_tot))
-            perms = np.argpartition(noise, kth=n_u - 1, axis=1)
-            in_u_batch = np.zeros((m, n_tot), dtype=np.float64)
-            rows = np.arange(m)[:, None]
-            in_u_batch[rows, perms[:, :n_u]] = 1.0
-
-            row_in_u = in_u_batch[:, i0:i1]  # (m, B_r)
-            row_in_v = 1.0 - row_in_u        # (m, B_r)
-
-            s_u = dist_block @ in_u_batch.T  # (B_r, m)
-            s_v = s_all[:, None] - s_u       # (B_r, m)
+            s_u = dist_block @ in_u_batch.T              # (B_r, B_p)
+            s_v = s_all[:, None] - s_u                   # (B_r, B_p)
 
             sum_uu[p0:p1] += np.sum(row_in_u * s_u.T, axis=1)
             sum_uv[p0:p1] += np.sum(row_in_u * s_v.T, axis=1)
