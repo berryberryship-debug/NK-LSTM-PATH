@@ -1,5 +1,3 @@
----
-
 NK-LSTM-PATH
 
 Reconstruction de l'information historique et géométrie endogène dans les paysages adaptatifs de Kauffman
