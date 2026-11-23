@@ -1,272 +1,177 @@
+---
+
 NK-LSTM-PATH
 
-Reconstruction de l'information historique dans les paysages adaptatifs de Kauffman
+Reconstruction de l'information historique et géométrie endogène dans les paysages adaptatifs de Kauffman
 
-Modélisation multi-échelle des paysages NK, des trajectoires adaptatives et des représentations temporelles par réseaux LSTM.
+Modélisation multi-échelle des paysages NK, des trajectoires adaptatives, des structures de fibrés discrets et des représentations temporelles par réseaux LSTM.
 
 Auteur : Xioranne Lessard
 Projet : Axiomes Base Labs
-Version : 0.1 — Protocole expérimental initial
+Version : 0.2 — Formalisation géométrique et protocole expérimental révisé
 Statut : Recherche exploratoire — hypothèses à tester.
 
 ---
 
 1. Présentation
 
-NK-LSTM-PATH est un projet de recherche computationnelle visant à étudier la structure informationnelle des trajectoires évolutives dans les paysages NK développés par Stuart Kauffman.
+NK-LSTM-PATH est un projet de recherche computationnelle visant à étudier la structure informationnelle des trajectoires évolutives dans les paysages adaptatifs développés par Stuart Kauffman.
 
-Le modèle NK décrit des systèmes combinatoires dans lesquels la contribution de chaque composant dépend de son propre état et de ses interactions avec d'autres composants.
+Le modèle NK classique décrit un paysage statique où la contribution de chaque composant dépend de son état et de ses interactions avec K autres composants. Dans ce cadre standard, la dynamique de transition est markovienne : l'état présent détermine entièrement les possibilités futures.
 
-La complexité du paysage dépend notamment de deux paramètres :
+Notre recherche introduit une rupture conceptuelle : la géométrie endogène des possibilités. Nous modélisons l'évolution non plus comme un déplacement sur une surface fixe, mais comme le transport d'une structure d'interactions (la fibre) qui modifie sa propre topologie au fur et à mesure de la trajectoire.
 
-- N : nombre de composants du système.
-- K : nombre d'interactions entre chaque composant et les autres composants.
-
-L'augmentation de K modifie la structure du paysage de fitness et peut produire une fragmentation accrue des optima locaux.
-
-Notre recherche introduit une autre dimension : la mémoire historique des trajectoires.
-
-Nous cherchons à déterminer si l'évolution d'une configuration contient une information prédictive qui ne peut être reconstruite à partir de son seul état instantané.
+Le projet cherche à déterminer si le chemin parcouru contient une information prédictive irréductible, et si cette mémoire historique se manifeste de manière purement métrique (transitoire) ou topologique (persistante via la modification des transitions accessibles).
 
 2. Question fondamentale
 
 Une configuration présente suffit-elle à caractériser les possibilités de son évolution future ?
 
-Nous formulons l'hypothèse que l'histoire d'une trajectoire peut contenir une information supplémentaire sur la dynamique du système.
+Nous distinguons deux formes de mémoire issues de l'histoire d'une trajectoire H_t :
 
-Soit :
+1. La mémoire métrique : la distance entre deux états de la fibre adaptative J issue de deux chemins différents s'estompe sous l'effet de la dissipation.
+2. La mémoire topologique : l'écart entre les fibres, même infime, modifie de façon persistante le franchissement des seuils d'accessibilité \mathcal{T}(X,J).
 
-[
-x_t = \text{configuration présente}
-]
+Nous cherchons à mesurer séparément :
 
-[
-F(x_t) = \text{fitness présente}
-]
+D_J(t) = \| J_A(t) - J_B(t) \|_F \quad \text{et} \quad D_{\mathcal{T}}(t) = |\mathcal{T}(X,J_A(t)) \triangle \mathcal{T}(X,J_B(t))| 
 
-[
-H_t=(x_0,x_1,\ldots,x_t)
-]
-
-où (H_t) représente l'histoire de la trajectoire.
-
-Nous cherchons à examiner :
-
-[
-I(H_t;F_{t+1}\mid x_t,F_t)
-]
-
-Cette quantité représente l'information mutuelle conditionnelle entre l'histoire et la fitness future, compte tenu de l'état et de la fitness présents.
-
-Une valeur positive indiquerait une information historique prédictive supplémentaire dans le protocole considéré.
-
-Elle ne démontrerait pas, à elle seule, l'existence d'un invariant universel.
+La persistance de D_{\mathcal{T}}(t) alors que D_J(t) \to 0 constituerait la preuve d'une irréductibilité topologique du processus.
 
 3. Architecture conceptuelle
 
-Le projet repose sur quatre niveaux expérimentaux.
+Le projet repose sur un formalisme à deux niveaux (Base et Fibre) et quatre composantes dynamiques.
 
-A — Génération du paysage NK
+A — Base combinatoire (Paysage natif)
+L'hypercube des configurations X \in \{0, 1\}^N. La fitness native F_{\mathrm{NK}}(X) est générée par le paysage NK.
 
-Construction de paysages combinatoires contrôlés.
+B — Fibre adaptative et Connexion discrète
+Au-dessus de chaque configuration, une fibre J \in \mathrm{Sym}_N(\mathbb{R}) représente la structure d'interactions adaptatives. 
+Le passage d'un état à un autre (mutation d'un bit k) s'accompagne d'un transport le long d'une connexion discrète U_k :
 
-[
-F:X\rightarrow\mathbb{R}
-]
+J \mapsto J + \eta \Psi(X^k, k, J) 
 
-Chaque configuration possède une valeur de fitness calculée à partir des contributions locales et de leurs interactions.
+La non-commutativité des transports ([U_k, U_m] \neq 0) définit une courbure discrète (holonomie) sur les faces de l'hypercube.
 
-B — Génération des trajectoires
+C — Dynamique jointe et Sélection
+L'évolution est régie par un générateur de Markov couplé :
 
-Exploration des paysages par mutations élémentaires.
+\mathcal{L} = \mathcal{L}_{\mathrm{mut}} + \mathcal{L}_{\mathrm{transp}} + \mathcal{L}_{\mathrm{diss}} 
 
-[
-x_0\rightarrow x_1\rightarrow\cdots\rightarrow x_t
-]
+La sélection stochastique (Boltzmann) dépend d'une fitness étendue F(X,J) qui couple le paysage natif et l'état de la fibre. L'accessibilité d'une mutation est conditionnée par la perméabilité de la fibre : A_k(J) = \sum_{j \neq k} J_{kj}^2 > \theta_A.
 
-Plusieurs trajectoires seront générées à partir de configurations initiales communes afin d'étudier les divergences, convergences et accessibilités.
-
-C — Reconstruction temporelle par LSTM
-
-Utilisation de réseaux Long Short-Term Memory pour apprendre les dépendances temporelles présentes dans les séquences.
-
-[
-h_t=\operatorname{LSTM}(z_t,h_{t-1})
-]
-
-où :
-
-- (z_t) représente les observations disponibles à l'instant t ;
-- (h_t) représente l'état latent mémoriel ;
-- (h_{t-1}) représente la mémoire précédente.
-
-L'objectif est d'étudier quelles propriétés historiques sont encodées dans les représentations latentes.
-
-D — Recherche d'invariants
-
-Comparaison des représentations et des propriétés dynamiques entre différents paysages et différentes valeurs de K.
-
-Nous chercherons notamment :
-
-- des structures récurrentes entre trajectoires ;
-- des relations entre accessibilité et fitness ;
-- des propriétés latentes reproductibles ;
-- des régularités indépendantes de la réalisation particulière du paysage.
+D — Reconstruction temporelle par LSTM
+Les réseaux Long Short-Term Memory sont utilisés comme observateurs. Ils doivent inférer l'état latent de la fibre J_t (non observable directement) à partir de la seule séquence des états X_t. L'objectif est de tester si l'apprentissage séquentiel capture la mémoire topologique.
 
 4. Modèles expérimentaux comparés
 
-Quatre architectures seront confrontées.
+Pour isoler les effets, nous confrontons les architectures d'apprentissage et les contrôles dynamiques.
 
-Modèle| Entrées| Fonction
-M1| État présent| Référence instantanée
-M2| État + fitness| Référence enrichie
-M3| Fenêtre historique| Mémoire explicite non récurrente
-M4| Séquence historique| Réseau LSTM
+Pour les LSTM :
 
-Cette comparaison permettra de distinguer l'apport de l'information historique de celui de la seule architecture récurrente.
+· M1 : État présent (Référence instantanée).
+· M2 : État + fitness (Référence enrichie).
+· M3 : Fenêtre historique (Mémoire explicite non récurrente).
+· M4 : Séquence historique (Réseau LSTM).
 
-Les modèles devront utiliser des informations d'entrée comparables et respecter les mêmes partitions expérimentales.
+Pour la dynamique (Design factoriel 2 \times 2) :
+
+ Rétroaction sélective (\partial_J W \neq 0) Sans rétroaction (\partial_J W = 0)
+Courbure réelle ([U_k, U_m] \neq 0) Modèle complet Courbure pure
+Transport intégrable ([U_k, U_m] = 0) Feedback pur Ligne de base
 
 5. Protocole initial
 
-Paramètres envisagés pour la première expérience :
+L'audit algébrique commence sur les petites dimensions avant de monter en échelle. Les paramètres sans dimension sont le taux de mutation normalisé \nu = \mu N \bar{W} / \lambda_0 et le rapport spectral r = \eta\mu / \lambda_0.
 
-Paramètre| Valeur
-N| 20
-K| 0, 2, 4, 8
-Paysages d'entraînement| 1 000
-Paysages de validation| 200
-Paysages de test| 200
-Longueur maximale d'une trajectoire| 100
-Mutation élémentaire| Un bit
+Paramètre Valeur
+N (composants) 3 (audit), 8, 20
+K (interactions) 2, 4, 8
+Transitions Seuil dur A_k(J) > \theta_A
+Métrique de distribution Distance de Wasserstein-1 (W_1)
 
-Ces valeurs constituent une configuration initiale proposée. Elles ne représentent pas des résultats obtenus.
-
-Les paysages de test seront indépendants des paysages d'entraînement.
-
-Les graines aléatoires seront enregistrées afin de garantir la reproductibilité.
+Les seuils d'accessibilité \theta_A seront testés en version fixe (calibrée sur J^0) et en version dynamique (médiane de A_k) pour éviter le fine-tuning.
 
 6. Hypothèses de recherche
 
-H1 — Information historique
+H1 — Non-commutativité et courbure
+Le transport symétrique de la fibre brise la parité du paysage et produit une courbure non nulle sur les faces, dont les seuils d'instabilité locale dépendent de la classe de configuration (spectres à r_c \in \{1, 2, 4\}).
 
-L'histoire d'une trajectoire peut contenir une information prédictive supplémentaire par rapport à l'état instantané.
-
-H2 — Dépendance à la complexité épistatique
-
-La quantité d'information historique utile pourrait varier en fonction de K.
+H2 — Mémoire topologique vs métrique
+Il existe un régime de paramètres où D_J(t) \to 0 (relaxation) mais où D_{\mathcal{T}}(t) persiste, créant une mémoire discrète de l'histoire dépendante du seuil \theta_A.
 
 H3 — Organisation latente
-
-Les représentations internes du LSTM pourraient révéler des propriétés communes entre différentes trajectoires.
+Le LSTM (M4) parvient à reconstruire la variable latente J_t et à prédire les ruptures d'accessibilité \mathcal{T}, surpassant M1-M3 uniquement dans le régime de courbure active.
 
 H4 — Invariance transversale
-
-Certaines propriétés structurelles pourraient être conservées entre des paysages distincts, malgré leurs différences combinatoires.
-
-Ces quatre hypothèses seront évaluées séparément.
+Les propriétés spectrales de l'opérateur de relaxation (matrice M_{\mathrm{gelé}}) et les transitions de phase associées sont invariantes entre différentes réalisations du paysage natif F_{\mathrm{NK}}.
 
 7. Contrôles et falsification
 
-La validité expérimentale repose sur des contrôles explicites.
+La validité expérimentale repose sur des contrôles de falsification explicites :
 
-1. Mélange de l'ordre temporel des séquences.
-2. Réinitialisation de la mémoire récurrente.
-3. Comparaison avec un modèle non récurrent.
-4. Contrôle des fuites d'information entre entraînement et test.
-5. Comparaison entre paysages connus et inconnus.
-6. Vérification de la stabilité des résultats sur plusieurs graines.
-7. Analyse des performances selon K.
+1. Contrôle de transport intégrable : Remplacement de la règle de transport par une règle commutative (\Psi_{kj} = c s_k s_j). Toute différence observée avec le modèle réel est attribuable à la courbure.
+2. Mélange de l'ordre temporel : Test de permutation des séquences.
+3. Contrôle de parité : Le transport brise la parité s \to -s. Le modèle doit être testé sous les deux classes pour vérifier l'asymétrie des spectres.
+4. Contrôle de seuil : Remplacement du seuil dur par une fonction sigmoïde lissée a_k^{(\delta)} pour vérifier la robustesse.
+5. Contrôle des fuites : Isolation stricte des paysages de test (entraînement supervisé sans accès à J_t).
 
-Contrôle fondamental :
+8. Rapport conceptuel avec la géométrie et Feynman
 
-Dans un paysage NK statique, avec une dynamique de transition markovienne entièrement déterminée par l'état présent, l'histoire ne devrait pas apporter d'information prédictive supplémentaire lorsque l'état est parfaitement observé.
+L'intégrale de chemin de Feynman stipule que l'amplitude d'un processus est la somme des contributions de tous les chemins possibles. Dans notre formalisme, la fonction de transition dépend de l'holonomie (la courbure accumulée) du chemin :
 
-Ce cas constitue un contrôle négatif essentiel.
+\mathcal{A} = \sum_{\text{chemins}} e^{-S(\text{chemin})} 
 
-Un gain du LSTM devra donc être interprété en fonction des informations effectivement disponibles, de la politique de transition et de l'observabilité du paysage.
+L'action S dépend de la topologie du réseau et de l'historique des transports. Nous ne postulons aucune équivalence avec la mécanique quantique. Le rapprochement est structurel : le passé n'est pas seulement une suite d'états, c'est un transport de structure.
 
-8. Rapport conceptuel avec Feynman
+9. Organisation du dépôt (Mise à jour v0.2)
 
-L'intégrale de chemin de Feynman constitue une référence conceptuelle pour interroger la relation entre état, trajectoire et résultat.
-
-[
-\mathcal A=\sum_{\text{paths}}e^{iS/\hbar}
-]
-
-Dans le formalisme quantique, les chemins contribuent à une amplitude complexe et peuvent interférer.
-
-Dans NK-LSTM-PATH, les trajectoires sont des séquences combinatoires classiques.
-
-Nous ne postulons aucune équivalence entre les deux formalismes.
-
-Le rapprochement porte uniquement sur une question structurelle :
-
-Quelle information appartient au chemin lui-même, au-delà de la description de ses états ?
-
-9. Organisation du dépôt
-
+```text
 NK-LSTM-PATH/
 │
 ├── README.md
 ├── config.py
-├── nk_landscape.py
-├── trajectories.py
-├── datasets.py
+├── nk_landscape.py       # Paysage natif F_NK
+├── fiber_bundle.py       # (Nouveau) Matrices J, règle Psi, calcul des commutateurs
+├── trajectories.py       # Dynamique jointe (mutations + transport)
+├── datasets.py           # Génération des trajectoires et des contrôles
 │
 ├── models/
 │   ├── baseline_state.py
 │   ├── baseline_history.py
-│   └── lstm_model.py
+│   └── lstm_model.py     # Modèle d'inférence de J_t
 │
 ├── experiments/
-│   ├── experiment_01.py
-│   └── controls.py
+│   ├── experiment_01_nk.py     # Ligne de base NK statique
+│   ├── experiment_02_audit.py  # (Nouveau) Jalon 2b : spectres et courbure
+│   └── controls.py             # Contrôles (intégrable, lissé, etc.)
 │
-├── metrics.py
+├── metrics.py            # Wasserstein, Distance Topologique (D_J vs D_T)
 ├── run_experiment.py
 │
 └── tests/
     ├── test_nk.py
-    ├── test_trajectories.py
+    ├── test_fiber_geometry.py  # Validation des spectres et de l'anholonomie
     └── test_leakage.py
+```
 
 10. Critères de validation
 
-Le projet ne considérera pas une amélioration prédictive comme une découverte structurelle suffisante.
+Une découverte structurelle ne peut être revendiquée que si :
 
-Une propriété candidate devra :
-
-- être mesurable ;
-- être reproductible ;
-- résister aux contrôles ;
-- généraliser à des paysages indépendants ;
-- être distinguable d'un simple artefact d'apprentissage ;
-- posséder des critères explicites de réfutation.
-
-La stabilisation d'une représentation latente ne constitue pas, en elle-même, la démonstration d'un invariant du système.
+· La courbure géométrique est mesurable sur la fibre.
+· La mémoire topologique D_{\mathcal{T}}(t) survit à la relaxation métrique D_J(t).
+· L'effet disparaît dans le modèle de contrôle à transport intégrable.
+· Le LSTM démontre une capacité de prédiction statistiquement significative de \mathcal{T} par rapport aux baselines M1-M3.
+· Les résultats sont stables sur au moins trois jeux de graines aléatoires et plusieurs valeurs de \theta_A.
 
 11. Finalité scientifique
 
-NK-LSTM-PATH cherche à explorer une question située à l'intersection de la théorie des systèmes complexes, de l'évolution, de l'apprentissage séquentiel et de la géométrie des espaces de possibilités.
-
 Le déplacement recherché est le suivant :
 
-[
-\text{Configuration}
-\rightarrow
-\text{Trajectoire}
-\rightarrow
-\text{Mémoire}
-\rightarrow
-\text{Structure latente}
-\rightarrow
-\text{Invariant potentiel}
-]
+\text{Configuration} \rightarrow \text{Trajectoire} \rightarrow \text{Transport} \rightarrow \text{Courbure} \rightarrow \text{Mémoire topologique} 
 
-L'objectif n'est pas seulement de prédire le prochain état.
-
-Il est de déterminer si la structure historique des transformations permet de révéler une organisation du paysage qui demeure invisible dans une description strictement instantanée.
+L'objectif n'est pas seulement de prédire le prochain état. Il est de déterminer si la structure historique des transformations (la géométrie de l'espace des possibles) demeure invisible dans une description strictement instantanée, et si l'apprentissage profond peut révéler cette géométrie cachée.
 
 ---
 
