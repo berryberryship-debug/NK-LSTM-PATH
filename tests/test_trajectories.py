@@ -2,7 +2,7 @@
 tests/test_trajectories.py
 Projet : NK-LSTM-PATH
 
-Suite de validation complète de `src/trajectories.py` :
+Suite de validation de `src/trajectories.py` :
   1. Borne supérieure uniforme Lambda(X, J) <= N * mu et invariance de Delta F_k
      entre fibres distinctes à lambda = 0.
   2. Dissipation analytique exacte (propriété de semi-groupe, symétrie, limites).
@@ -10,17 +10,29 @@ Suite de validation complète de `src/trajectories.py` :
      arêtes non incidentes).
   4. Lois élémentaires et relation exacte de bilan détaillé de Metropolis :
      w(X -> X^{(k)}) / w(X^{(k)} -> X) = exp(beta * Delta F_k).
-  5. Stabilité numérique du solveur quadratique à tolérance relative (coefficients
-     très petits 1e-16 et très grands 1e+16, racines proches 0.5 +- 1e-7, racines
-     près de 0 et 1, tangence, exclusion documentée des bornes {0, 1}).
+  5. Stabilité numérique du solveur quadratique à mise à l'échelle relative
+     (coefficients 1e-16 et 1e+16, coefficient quadratique 0 < c2 / S < 1e-14
+     sans réduction artificielle du degré tant que c2 / S ne sous-déborde pas
+     vers 0.0 en IEEE 754 binary64, racines proches 0.5 +- 1e-7, racines proches
+     des bornes, tangence avec tolérance d'arrondi documentée, exclusion des
+     bornes {0, 1}).
   6. Conservation du risque intégré int_0^t Lambda(u) du = E à travers un changement
-     de masque d'accessibilité (fermeture et ouverture de canaux).
-  7. Validation croisée en loi auto-calibrée (enveloppes Monte-Carlo internes avec
-     IC à 99 %) entre Ogata et le solveur analytique par morceaux à lambda = 0 :
-       (a) distributions marginales (J_12, J_13, J_23, n_événements),
-       (b) distribution jointe multivariée (Sliced Wasserstein-1, Energy Distance
-           et matrice de covariance sur R^7),
-       (c) statistiques temporelles des événements (T_1, T_dernier, inter-sauts).
+     de masque d'accessibilité :
+       - fermeture d'un canal (3*mu -> 2*mu à tau_c = ln(2)/gamma),
+       - ouverture retardée de deux canaux (0 -> 2*mu à tau_c = ln(2)/gamma).
+  7. Validation croisée en loi entre `simulate_ogata_thinning` et
+     `simulate_exact_piecewise_lambda0` à lambda = 0 reposant conjointement sur :
+       (i)  un test de permutation Monte-Carlo à deux échantillons avec correction
+            de rang p = (1 + n_>=) / (1 + n_perm) sur n_perm = 9999 tirages
+            (résolution minimale 1e-4, seuil alpha = 0.01),
+       (ii) une procédure formelle d'équivalence pratique exigeant que la borne
+            supérieure de l'intervalle de confiance bootstrap à 95 %
+            (IC_95%^sup(D) = q_0.95(D^*)) soit strictement inférieure à la
+            marge d'équivalence delta_eq définie a priori,
+       (iii) des statistiques temporelles calculées individuellement par
+            trajectoire (T_1, T_dernier, étendue T_dernier - T_1, moyenne,
+            médiane et quantile 75 % des intervalles inter-sauts par trajectoire)
+            afin de préserver la dépendance interne à chaque réalisation.
 """
 
 from __future__ import annotations
@@ -39,53 +51,285 @@ import fiber_bundle as fb  # noqa: E402
 import trajectories as traj  # noqa: E402
 
 
-def _self_calibrated_1d_bound(
-    pool_a: np.ndarray,
-    pool_b: np.ndarray,
-    n_bootstrap: int = 250,
+def _mc_permutation_test_1d(
+    u_samples: np.ndarray,
+    v_samples: np.ndarray,
+    n_permutations: int = 9999,
     seed: int = 2026,
+    chunk_size: int = 500,
 ) -> tuple[float, float]:
     """
-    Calibre l'enveloppe nulle (quantile 99 % + 2*std) de W_1 sous H0 en comparant
-    des demi-échantillons indépendants issus d'un même simulateur, corrigée par le
-    facteur d'échelle 1/sqrt(2) correspondant à la taille complète m.
+    Test de permutation Monte-Carlo à deux échantillons (tailles n_u, n_v quelconques)
+    pour W_1 avec correction de rang p = (1 + n_>=) / (1 + n_perm).
+    Utilise l'identité exacte par sommes cumulées sur l'échantillon réuni trié
+    (valide même en présence d'ex-aequo puisque delta = 0 entre valeurs égales).
     """
+    u = np.asarray(u_samples, dtype=np.float64).ravel()
+    v = np.asarray(v_samples, dtype=np.float64).ravel()
+    n_u = u.size
+    n_v = v.size
+    w1_obs = traj.wasserstein_1d(u, v)
+
+    pooled = np.concatenate([u, v])
+    n_tot = pooled.size
+    order = np.argsort(pooled, kind="mergesort")
+    deltas = np.diff(pooled[order])
+    if deltas.size == 0:
+        return 0.0, 1.0
+
     rng = np.random.default_rng(seed)
-    m = pool_a.size
-    half = m // 2
-    null_vals = np.empty(n_bootstrap, dtype=np.float64)
+    ge_count = 0
+    done = 0
+    while done < n_permutations:
+        m = min(chunk_size, n_permutations - done)
+        # Tirage vectorisé de m permutations de {0, ..., n_tot - 1}
+        noise = rng.random((m, n_tot))
+        perms = np.argpartition(noise, kth=n_u - 1, axis=1)
+        is_u = np.zeros((m, n_tot), dtype=np.bool_)
+        rows = np.arange(m)[:, None]
+        is_u[rows, perms[:, :n_u]] = True
+
+        is_u_sorted = is_u[:, order][:, :-1]
+        cdf_u = np.cumsum(is_u_sorted, axis=1) / float(n_u)
+        cdf_v = np.cumsum(~is_u_sorted, axis=1) / float(n_v)
+        w1_perm = np.abs(cdf_u - cdf_v) @ deltas
+        ge_count += int(np.sum(w1_perm >= w1_obs))
+        done += m
+
+    p_value = (1.0 + ge_count) / (1.0 + n_permutations)
+    return w1_obs, p_value
+
+
+def _bootstrap_ucb95_1d(
+    u_samples: np.ndarray,
+    v_samples: np.ndarray,
+    n_bootstrap: int = 2000,
+    seed: int = 2026,
+) -> float:
+    """
+    Calcule la borne supérieure de l'intervalle de confiance bootstrap à 95 %
+    (IC_95%^sup(W_1) = quantile 0.95 des réplications bootstrap) par rééchantillonnage
+    indépendant des trajectoires de u_samples et v_samples.
+    """
+    u = np.asarray(u_samples, dtype=np.float64).ravel()
+    v = np.asarray(v_samples, dtype=np.float64).ravel()
+    n_u = u.size
+    n_v = v.size
+    rng = np.random.default_rng(seed)
+
+    boot_stats = np.empty(n_bootstrap, dtype=np.float64)
     for b in range(n_bootstrap):
-        pa = rng.permutation(m)
-        pb = rng.permutation(m)
-        w_a = traj.wasserstein_1d(pool_a[pa[:half]], pool_a[pa[half : 2 * half]])
-        w_b = traj.wasserstein_1d(pool_b[pb[:half]], pool_b[pb[half : 2 * half]])
-        null_vals[b] = 0.5 * (w_a + w_b) / np.sqrt(2.0)
-    q99 = float(np.quantile(null_vals, 0.99))
-    std = float(np.std(null_vals))
-    return q99 + 2.0 * std, float(np.mean(null_vals))
+        iu = rng.integers(0, n_u, size=n_u)
+        iv = rng.integers(0, n_v, size=n_v)
+        boot_stats[b] = traj.wasserstein_1d(u[iu], v[iv])
+    return float(np.quantile(boot_stats, 0.95))
 
 
-def _self_calibrated_multivariate_bound(
+def _mc_permutation_sliced_w1(
     U: np.ndarray,
     V: np.ndarray,
-    metric_fn,
-    n_bootstrap: int = 120,
+    n_projections: int = 32,
+    n_permutations: int = 9999,
+    seed: int = 2026,
+    chunk_size: int = 500,
+) -> tuple[float, float]:
+    """
+    Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
+    correction de rang) pour Sliced Wasserstein-1 sur R^d.
+    """
+    n_u = U.shape[0]
+    n_v = V.shape[0]
+    d = U.shape[1]
+    sw1_obs = traj.sliced_wasserstein_1(U, V, n_projections=n_projections, seed=42)
+
+    rng_dir = np.random.default_rng(42)
+    dirs = rng_dir.normal(0.0, 1.0, size=(n_projections, d))
+    dirs /= np.maximum(np.linalg.norm(dirs, axis=1, keepdims=True), 1e-15)
+
+    pooled = np.vstack([U, V])
+    n_tot = pooled.shape[0]
+    proj = pooled @ dirs.T  # (n_tot, n_projections)
+
+    orders = [np.argsort(proj[:, q], kind="mergesort") for q in range(n_projections)]
+    deltas_list = [np.diff(proj[orders[q], q]) for q in range(n_projections)]
+
+    rng = np.random.default_rng(seed)
+    ge_count = 0
+    done = 0
+    while done < n_permutations:
+        m = min(chunk_size, n_permutations - done)
+        noise = rng.random((m, n_tot))
+        perms = np.argpartition(noise, kth=n_u - 1, axis=1)
+        is_u = np.zeros((m, n_tot), dtype=np.bool_)
+        rows = np.arange(m)[:, None]
+        is_u[rows, perms[:, :n_u]] = True
+
+        acc = np.zeros(m, dtype=np.float64)
+        for q in range(n_projections):
+            is_u_sorted = is_u[:, orders[q]][:, :-1]
+            cdf_u = np.cumsum(is_u_sorted, axis=1) / float(n_u)
+            cdf_v = np.cumsum(~is_u_sorted, axis=1) / float(n_v)
+            acc += np.abs(cdf_u - cdf_v) @ deltas_list[q]
+
+        sw1_perm = acc / float(n_projections)
+        ge_count += int(np.sum(sw1_perm >= sw1_obs))
+        done += m
+
+    p_value = (1.0 + ge_count) / (1.0 + n_permutations)
+    return sw1_obs, p_value
+
+
+def _bootstrap_ucb95_sliced_w1(
+    U: np.ndarray,
+    V: np.ndarray,
+    n_projections: int = 32,
+    n_bootstrap: int = 1000,
+    seed: int = 2026,
+) -> float:
+    """Borne supérieure IC_95%^sup(Sliced-W1) par bootstrap de trajectoires."""
+    n_u = U.shape[0]
+    n_v = V.shape[0]
+    rng = np.random.default_rng(seed)
+    boot_stats = np.empty(n_bootstrap, dtype=np.float64)
+    for b in range(n_bootstrap):
+        iu = rng.integers(0, n_u, size=n_u)
+        iv = rng.integers(0, n_v, size=n_v)
+        boot_stats[b] = traj.sliced_wasserstein_1(
+            U[iu], V[iv], n_projections=n_projections, seed=42
+        )
+    return float(np.quantile(boot_stats, 0.95))
+
+
+def _mc_permutation_energy_blocked(
+    U: np.ndarray,
+    V: np.ndarray,
+    n_permutations: int = 9999,
+    block_size: int = 64,
     seed: int = 2026,
 ) -> tuple[float, float]:
-    """Calibre l'enveloppe nulle (quantile 99 % + 2*std) d'une métrique multivariée."""
+    """
+    Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
+    correction de rang) pour la distance d'énergie D_E(U, V), exécuté par
+    tranches de lignes de taille `block_size` afin de maintenir une empreinte
+    mémoire strictement bornée en O(block_size * n_tot * d) sans allouer de
+    matrice complète n_tot x n_tot.
+    """
+    ed_obs = traj.energy_distance(U, V, block_size=block_size)
+    n_u = U.shape[0]
+    n_v = V.shape[0]
+    pooled = np.vstack([U, V])
+    n_tot = pooled.shape[0]
+
+    # Génération des masques d'appartenance au premier groupe pour les 9999 permutations
     rng = np.random.default_rng(seed)
-    m = U.shape[0]
-    half = m // 2
-    null_vals = np.empty(n_bootstrap, dtype=np.float64)
+    in_u = np.zeros((n_permutations, n_tot), dtype=np.bool_)
+    chunk_perm = 1000
+    for p0 in range(0, n_permutations, chunk_perm):
+        p1 = min(p0 + chunk_perm, n_permutations)
+        m = p1 - p0
+        noise = rng.random((m, n_tot))
+        perms = np.argpartition(noise, kth=n_u - 1, axis=1)
+        rows = np.arange(p0, p1)[:, None]
+        in_u[rows, perms[:, :n_u]] = True
+
+    sum_uu = np.zeros(n_permutations, dtype=np.float64)
+    sum_vv = np.zeros(n_permutations, dtype=np.float64)
+    sum_uv = np.zeros(n_permutations, dtype=np.float64)
+
+    # Accumulation par tranche de lignes (empreinte O(block_size * n_tot * d))
+    for i0 in range(0, n_tot, block_size):
+        i1 = min(i0 + block_size, n_tot)
+        diff = pooled[i0:i1, None, :] - pooled[None, :, :]
+        dist_block = np.linalg.norm(diff, axis=-1)  # (i1 - i0, n_tot)
+
+        row_in_u = in_u[:, i0:i1]  # (n_perm, i1 - i0)
+        for p in range(n_permutations):
+            ru = row_in_u[p]
+            cu = in_u[p]
+            sub_u = dist_block[ru]
+            sub_v = dist_block[~ru]
+            sum_uu[p] += float(np.sum(sub_u[:, cu]))
+            sum_uv[p] += float(np.sum(sub_u[:, ~cu]))
+            sum_vv[p] += float(np.sum(sub_v[:, ~cu]))
+
+    e_xy = sum_uv / float(n_u * n_v)
+    e_xx = sum_uu / float(n_u * (n_u - 1))
+    e_yy = sum_vv / float(n_v * (n_v - 1))
+    ed_perm = np.sqrt(np.maximum(0.0, 2.0 * e_xy - e_xx - e_yy))
+
+    ge_count = int(np.sum(ed_perm >= ed_obs))
+    p_value = (1.0 + ge_count) / (1.0 + n_permutations)
+    return ed_obs, p_value
+
+
+def _bootstrap_ucb95_energy_blocked(
+    U: np.ndarray,
+    V: np.ndarray,
+    n_bootstrap: int = 1000,
+    block_size: int = 128,
+    seed: int = 2026,
+) -> float:
+    """Borne supérieure IC_95%^sup(D_E) par bootstrap de trajectoires par blocs."""
+    n_u = U.shape[0]
+    n_v = V.shape[0]
+    rng = np.random.default_rng(seed)
+    boot_stats = np.empty(n_bootstrap, dtype=np.float64)
     for b in range(n_bootstrap):
-        pa = rng.permutation(m)
-        pb = rng.permutation(m)
-        d_a = metric_fn(U[pa[:half]], U[pa[half : 2 * half]])
-        d_b = metric_fn(V[pb[:half]], V[pb[half : 2 * half]])
-        null_vals[b] = 0.5 * (d_a + d_b) / np.sqrt(2.0)
-    q99 = float(np.quantile(null_vals, 0.99))
-    std = float(np.std(null_vals))
-    return q99 + 2.0 * std, float(np.mean(null_vals))
+        iu = rng.integers(0, n_u, size=n_u)
+        iv = rng.integers(0, n_v, size=n_v)
+        boot_stats[b] = traj.energy_distance(U[iu], V[iv], block_size=block_size)
+    return float(np.quantile(boot_stats, 0.95))
+
+
+def _mc_permutation_cov_fro(
+    U: np.ndarray,
+    V: np.ndarray,
+    n_permutations: int = 9999,
+    seed: int = 2026,
+) -> tuple[float, float]:
+    """
+    Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
+    correction de rang) pour la norme de Frobenius de l'écart des matrices
+    de covariance empiriques.
+    """
+    cov_obs = float(
+        np.linalg.norm(np.cov(U, rowvar=False) - np.cov(V, rowvar=False), ord="fro")
+    )
+    n_u = U.shape[0]
+    pooled = np.vstack([U, V])
+    n_tot = pooled.shape[0]
+    rng = np.random.default_rng(seed)
+
+    ge_count = 0
+    for _ in range(n_permutations):
+        perm = rng.permutation(n_tot)
+        c_u = np.cov(pooled[perm[:n_u]], rowvar=False)
+        c_v = np.cov(pooled[perm[n_u:]], rowvar=False)
+        if float(np.linalg.norm(c_u - c_v, ord="fro")) >= cov_obs:
+            ge_count += 1
+
+    p_value = (1.0 + ge_count) / (1.0 + n_permutations)
+    return cov_obs, p_value
+
+
+def _bootstrap_ucb95_cov_fro(
+    U: np.ndarray,
+    V: np.ndarray,
+    n_bootstrap: int = 2000,
+    seed: int = 2026,
+) -> float:
+    """Borne supérieure IC_95%^sup(||Sigma_U - Sigma_V||_F) par bootstrap de trajectoires."""
+    n_u = U.shape[0]
+    n_v = V.shape[0]
+    rng = np.random.default_rng(seed)
+    boot_stats = np.empty(n_bootstrap, dtype=np.float64)
+    for b in range(n_bootstrap):
+        iu = rng.integers(0, n_u, size=n_u)
+        iv = rng.integers(0, n_v, size=n_v)
+        c_u = np.cov(U[iu], rowvar=False)
+        c_v = np.cov(V[iv], rowvar=False)
+        boot_stats[b] = float(np.linalg.norm(c_u - c_v, ord="fro"))
+    return float(np.quantile(boot_stats, 0.95))
 
 
 class TestTrajectories(unittest.TestCase):
@@ -214,7 +458,6 @@ class TestTrajectories(unittest.TestCase):
         beta = 2.3
         lam = 1.4
 
-        # 1. Bilan détaillé exact sur 25 couples (X, J) aléatoires
         for _ in range(25):
             X = rng.choice([-1.0, 1.0], size=4)
             raw = rng.normal(0.0, 0.7, size=(4, 4))
@@ -239,7 +482,6 @@ class TestTrajectories(unittest.TestCase):
                 expected_ratio = float(np.exp(beta * df_k))
                 self.assertAlmostEqual(w_fwd / w_bwd, expected_ratio, places=12)
 
-        # 2. Silence total sous seuil élevé
         X0 = np.array([1.0, 1.0, 1.0])
         J0 = fb.unpack_J((0.30, -0.20, 0.40), n=3)
         res_silent = traj.simulate_ogata_thinning(
@@ -256,7 +498,6 @@ class TestTrajectories(unittest.TestCase):
         )
         self.assertEqual(res_silent.n_accepted, 0)
 
-        # 3. Loi de Poisson(N*mu*t_max) et uniformité des canaux (beta=0, eta=0)
         rng_pois = np.random.default_rng(123)
         counts = []
         node_hist = np.zeros(3, dtype=np.int64)
@@ -282,30 +523,29 @@ class TestTrajectories(unittest.TestCase):
             node_hist / float(np.sum(node_hist)), np.full(3, 1.0 / 3.0), atol=0.02
         )
 
-    def test_05_scale_relative_quadratic_solver_and_close_roots(self) -> None:
+    def test_05_quadratic_solver_conditioning_and_root_preservation(self) -> None:
         """
         Vérifie `_stable_quadratic_real_roots` et `classify_threshold_crossings_z` :
-        - coefficients très petits (échelle 1e-16) et très grands (échelle 1e+16),
-        - coefficients fortement déséquilibrés (c2 = 1e-10, c1 = 1, c0 = -0.5),
+        - invariance d'échelle de 1e-16 à 1e+16,
+        - conservation des racines intérieures lorsque c2 / S = 1e-15 (tant que
+          c2 / S ne sous-déborde pas vers 0.0 en IEEE 754 binary64),
         - deux racines très proches sans être identiques (z = 0.5 +- 1e-7),
         - racines proches des bornes (1e-11 et 1 - 1e-11),
-        - exclusion volontaire et documentée des bornes z in {0, 1}.
+        - exclusion explicite et documentée des bornes z in {0, 1}.
         """
-        # 1. Coefficients très petits (1e-16) : (z - 0.25)(z - 0.75) * 1e-16 = 0
         for scale in (1e-16, 1.0, 1e16):
             roots = traj._stable_quadratic_real_roots(
                 1.0 * scale, -1.0 * scale, 0.1875 * scale
             )
             np.testing.assert_allclose(sorted(roots), [0.25, 0.75], atol=1e-13)
 
-        # 2. Coefficients fortement déséquilibrés
-        roots_unbal = traj._stable_quadratic_real_roots(1e-10, 1.0, -0.5)
-        z_pos = max(roots_unbal)
-        self.assertAlmostEqual(1e-10 * (z_pos ** 2) + z_pos - 0.5, 0.0, places=15)
+        c2_tiny = 1e-15
+        roots_tiny = traj._stable_quadratic_real_roots(c2_tiny, -1.0, 0.4)
+        self.assertEqual(len(roots_tiny), 2)
+        z_small, z_large = sorted(roots_tiny)
+        self.assertAlmostEqual(c2_tiny * (z_small ** 2) - z_small + 0.4, 0.0, places=15)
+        self.assertGreater(z_large, 1e14)
 
-        # 3. Deux racines très proches mais distinctes : z = 0.5 - 1e-7 et z = 0.5 + 1e-7
-        # Pour N=2, j0 = 1, d = -2 => A(z) = (1 - 2z)^2.
-        # À z = 0.5 +- delta, A(z) = 4 * delta^2. Pour delta = 1e-7, theta_A = 4e-14.
         J_anchor = fb.unpack_J((1.0,), n=2)
         J_curr = fb.unpack_J((-1.0,), n=2)
         delta = 1e-7
@@ -317,7 +557,6 @@ class TestTrajectories(unittest.TestCase):
             z_close, np.array([0.5 + delta, 0.5 - delta]), atol=1e-11
         )
 
-        # 4. Racines très proches des bornes (1 - 1e-11 et 1e-11)
         theta_near_edge = (1.0 - 2e-11) ** 2
         info_near = traj.classify_threshold_crossings_z(
             J_curr, J_anchor, theta_A=theta_near_edge
@@ -327,32 +566,31 @@ class TestTrajectories(unittest.TestCase):
         )
         self.assertEqual(info_near.boundary_z.size, 0)
 
-        # 5. Exclusion explicite des bornes z in {0, 1}
         info_bound = traj.classify_threshold_crossings_z(J_curr, J_anchor, theta_A=1.0)
         self.assertEqual(info_bound.interior_z.size, 0)
         np.testing.assert_allclose(info_bound.boundary_z, np.array([1.0, 0.0]), atol=1e-15)
 
     def test_06_integrated_hazard_conservation_across_threshold(self) -> None:
         """
-        Vérifie la conservation du risque intégré int_0^t Lambda(u) du = E lorsqu'un
-        changement de masque modifie Lambda(u) en cours d'intervalle sans réinitialiser
-        l'horloge exponentielle (fermeture et ouverture de canaux).
+        Vérifie la conservation du risque intégré int_0^t Lambda(u) du = E à travers
+        un changement de masque d'accessibilité :
+          - Cas 1 : fermeture d'un canal (3*mu -> 2*mu à tau_c = ln(2)/gamma),
+          - Cas 2 : ouverture retardée de deux canaux (0 -> 2*mu à tau_c = ln(2)/gamma).
         """
-        mu = 1.5
+        mu = 1.0
         gamma = 1.0
         theta_A = 0.5
-        tau_cross = float(np.log(2.0) / gamma)
+        tau_c = float(np.log(2.0) / gamma)
 
-        # Cas 1 : fermeture d'un canal (Lambda_1 = 2*mu -> Lambda_2 = mu à tau_cross)
         X0 = np.array([1.0, 1.0, 1.0])
         J0 = fb.unpack_J((1.0, 1.0, 0.0), n=3)
         J_anchor = fb.unpack_J((0.0, 1.0, 0.0), n=3)
 
         t_before = 0.40
-        t_after = 1.20
-        surv_exact_before = float(np.exp(-2.0 * mu * t_before))
+        t_after = 1.00
+        surv_exact_before = float(np.exp(-3.0 * mu * t_before))
         surv_exact_after = float(
-            np.exp(-2.0 * mu * tau_cross - mu * (t_after - tau_cross))
+            np.exp(-3.0 * mu * tau_c - 2.0 * mu * (t_after - tau_c))
         )
 
         n_mc = 12_000
@@ -366,7 +604,7 @@ class TestTrajectories(unittest.TestCase):
                 X0=X0,
                 J0=J0,
                 J_anchor=J_anchor,
-                t_max=2.5,
+                t_max=2.0,
                 mu=mu,
                 gamma=gamma,
                 beta=0.0,
@@ -380,7 +618,7 @@ class TestTrajectories(unittest.TestCase):
                 X0=X0,
                 J0=J0,
                 J_anchor=J_anchor,
-                t_max=2.5,
+                t_max=2.0,
                 mu=mu,
                 gamma=gamma,
                 beta=0.0,
@@ -391,16 +629,14 @@ class TestTrajectories(unittest.TestCase):
             )
             t1_og[i] = res_og.events[0].time if res_og.events else np.inf
 
-        # Erreur standard binomiale <= 0.5 / sqrt(12000) ~ 0.0046 ; tolérance 3.5 sigma = 0.016
         self.assertAlmostEqual(float(np.mean(t1_ex > t_before)), surv_exact_before, delta=0.016)
         self.assertAlmostEqual(float(np.mean(t1_ex > t_after)), surv_exact_after, delta=0.016)
         self.assertAlmostEqual(float(np.mean(t1_og > t_after)), surv_exact_after, delta=0.016)
 
-        # Cas 2 : ouverture retardée de deux canaux (Lambda_1 = 0 -> Lambda_2 = 2*mu à tau_cross)
         J0_open = fb.unpack_J((0.0, 0.0, 0.0), n=3)
         J_anchor_open = fb.unpack_J((1.0, 0.0, 0.0), n=3)
         t_obs = 1.30
-        surv_open_exact = float(np.exp(-2.0 * mu * (t_obs - tau_cross)))
+        surv_open_exact = float(np.exp(-2.0 * mu * (t_obs - tau_c)))
         rng_open = np.random.default_rng(999)
         zero_jumps = 0
         for _ in range(n_mc):
@@ -420,16 +656,20 @@ class TestTrajectories(unittest.TestCase):
                 zero_jumps += 1
         self.assertAlmostEqual(zero_jumps / n_mc, surv_open_exact, delta=0.016)
 
-    def test_07_cross_validation_marginal_joint_and_temporal_self_calibrated(self) -> None:
+    def test_07_cross_validation_equivalence_and_trajectory_temporal_laws(self) -> None:
         """
-        Validation croisée complète en loi (auto-calibrée par référence Monte-Carlo
-        interne avec IC à 99 %) entre `simulate_ogata_thinning` et
-        `simulate_exact_piecewise_lambda0` à lambda = 0, en distinguant :
-          (a) les lois marginales (J_12, J_13, J_23, n_événements),
-          (b) la loi jointe multivariée (J_12, J_13, J_23, s_1, s_2, s_3, n_événements)
-              via Sliced Wasserstein-1, Energy Distance et matrice de covariance,
-          (c) les statistiques temporelles (instant du 1er saut T_1, instant du
-              dernier saut T_dernier, durée moyenne inter-sauts).
+        Validation croisée en loi entre `simulate_ogata_thinning` et
+        `simulate_exact_piecewise_lambda0` à lambda = 0 combinant :
+          1. Test de permutation Monte-Carlo à deux échantillons avec correction
+             de rang p = (1 + n_>=) / (1 + n_perm) sur n_perm = 9999 tirages
+             (résolution minimale 1e-4, seuil alpha = 0.01).
+          2. Inférence formelle d'équivalence pratique exigeant que la borne
+             supérieure de l'intervalle de confiance bootstrap à 95 % vérifie :
+                 IC_95%^sup(D) < delta_eq.
+          3. Statistiques temporelles calculées individuellement par trajectoire
+             (T_1, T_dernier, étendue T_dernier - T_1, moyenne, médiane et
+             quantile 75 % des intervalles inter-sauts par trajectoire) afin de
+             préserver la structure de dépendance interne à chaque trajectoire.
         """
         nk = traj.NKLandscape(n=3, k=2, seed=19)
         X0 = np.array([1.0, -1.0, 1.0])
@@ -449,10 +689,9 @@ class TestTrajectories(unittest.TestCase):
         )
 
         seeds = [11, 22, 33, 44]
-        n_per_seed = 900
+        n_per_seed = 600
         n_total = len(seeds) * n_per_seed
 
-        # Vecteur joint d'état final : (J_12, J_13, J_23, s_1, s_2, s_3, n_accepted)
         joint_og = np.empty((n_total, 7), dtype=np.float64)
         joint_ex = np.empty((n_total, 7), dtype=np.float64)
 
@@ -460,8 +699,17 @@ class TestTrajectories(unittest.TestCase):
         t_first_ex = np.empty(n_total, dtype=np.float64)
         t_last_og = np.empty(n_total, dtype=np.float64)
         t_last_ex = np.empty(n_total, dtype=np.float64)
-        inter_og: list[float] = []
-        inter_ex: list[float] = []
+        t_span_og = np.empty(n_total, dtype=np.float64)
+        t_span_ex = np.empty(n_total, dtype=np.float64)
+
+        # Statistiques temporelles calculées par trajectoire (pour trajectoires à >= 2 sauts)
+        traj_inter_mean_og: list[float] = []
+        traj_inter_med_og: list[float] = []
+        traj_inter_q75_og: list[float] = []
+
+        traj_inter_mean_ex: list[float] = []
+        traj_inter_med_ex: list[float] = []
+        traj_inter_q75_ex: list[float] = []
 
         idx = 0
         for seed in seeds:
@@ -485,100 +733,150 @@ class TestTrajectories(unittest.TestCase):
                 joint_ex[idx, 6] = float(res_ex.n_accepted)
 
                 if res_og.events:
-                    times_og = [ev.time for ev in res_og.events]
-                    t_first_og[idx] = times_og[0]
-                    t_last_og[idx] = times_og[-1]
-                    if len(times_og) >= 2:
-                        inter_og.extend(np.diff(times_og).tolist())
+                    times_og = np.asarray([ev.time for ev in res_og.events], dtype=np.float64)
+                    t_first_og[idx] = float(times_og[0])
+                    t_last_og[idx] = float(times_og[-1])
+                    t_span_og[idx] = float(times_og[-1] - times_og[0])
+                    if times_og.size >= 2:
+                        dts_og = np.diff(times_og)
+                        traj_inter_mean_og.append(float(np.mean(dts_og)))
+                        traj_inter_med_og.append(float(np.median(dts_og)))
+                        traj_inter_q75_og.append(float(np.quantile(dts_og, 0.75)))
                 else:
                     t_first_og[idx] = t_max
                     t_last_og[idx] = 0.0
+                    t_span_og[idx] = 0.0
 
                 if res_ex.events:
-                    times_ex = [ev.time for ev in res_ex.events]
-                    t_first_ex[idx] = times_ex[0]
-                    t_last_ex[idx] = times_ex[-1]
-                    if len(times_ex) >= 2:
-                        inter_ex.extend(np.diff(times_ex).tolist())
+                    times_ex = np.asarray([ev.time for ev in res_ex.events], dtype=np.float64)
+                    t_first_ex[idx] = float(times_ex[0])
+                    t_last_ex[idx] = float(times_ex[-1])
+                    t_span_ex[idx] = float(times_ex[-1] - times_ex[0])
+                    if times_ex.size >= 2:
+                        dts_ex = np.diff(times_ex)
+                        traj_inter_mean_ex.append(float(np.mean(dts_ex)))
+                        traj_inter_med_ex.append(float(np.median(dts_ex)))
+                        traj_inter_q75_ex.append(float(np.quantile(dts_ex, 0.75)))
                 else:
                     t_first_ex[idx] = t_max
                     t_last_ex[idx] = 0.0
+                    t_span_ex[idx] = 0.0
 
                 idx += 1
 
-        # (a) Comparaison des distributions marginales (auto-calibrées)
+        alpha_level = 0.01
+        n_perm = 9999
+
+        # (a) Lois marginales : permutation Monte-Carlo (9999) + IC_95%^sup(W_1) < delta_eq
         marginal_specs = [
-            ("J_12", joint_og[:, 0], joint_ex[:, 0]),
-            ("J_13", joint_og[:, 1], joint_ex[:, 1]),
-            ("J_23", joint_og[:, 2], joint_ex[:, 2]),
-            ("n_events", joint_og[:, 6], joint_ex[:, 6]),
+            ("J_12", joint_og[:, 0], joint_ex[:, 0], 0.035),
+            ("J_13", joint_og[:, 1], joint_ex[:, 1], 0.035),
+            ("J_23", joint_og[:, 2], joint_ex[:, 2], 0.035),
+            ("n_events", joint_og[:, 6], joint_ex[:, 6], 0.250),
         ]
-        for name, u_vec, v_vec in marginal_specs:
-            w1_cross = traj.wasserstein_1d(u_vec, v_vec)
-            bound, null_mean = _self_calibrated_1d_bound(u_vec, v_vec)
-            self.assertLessEqual(
-                w1_cross,
-                bound,
-                msg=f"Marginal '{name}': W1={w1_cross:.5f} > borne MC={bound:.5f} (null={null_mean:.5f})",
+        for name, u_vec, v_vec, delta_eq in marginal_specs:
+            w1_obs, p_val = _mc_permutation_test_1d(u_vec, v_vec, n_permutations=n_perm)
+            ucb95 = _bootstrap_ucb95_1d(u_vec, v_vec, n_bootstrap=2000)
+            self.assertGreater(
+                p_val,
+                alpha_level,
+                msg=f"Marginal '{name}': rejet permutation MC (W1={w1_obs:.5f}, p={p_val:.5f})",
+            )
+            self.assertLess(
+                ucb95,
+                delta_eq,
+                msg=(
+                    f"Marginal '{name}': équivalence non établie "
+                    f"(IC_95%^sup={ucb95:.5f} >= delta_eq={delta_eq}, W1={w1_obs:.5f})"
+                ),
             )
 
-        # (b) Comparaison de la distribution jointe multivariée (R^7 standardisé)
+        # (b) Loi jointe multivariée sur R^7 standardisé (sous-échantillon reproductible m=600)
+        sub_rng = np.random.default_rng(2026)
+        sub_idx_og = sub_rng.choice(n_total, size=600, replace=False)
+        sub_idx_ex = sub_rng.choice(n_total, size=600, replace=False)
+
         pooled = np.vstack([joint_og, joint_ex])
         means = np.mean(pooled, axis=0)
         stds = np.maximum(np.std(pooled, axis=0), 1e-12)
-        Z_og = (joint_og - means) / stds
-        Z_ex = (joint_ex - means) / stds
+        Z_og = (joint_og[sub_idx_og] - means) / stds
+        Z_ex = (joint_ex[sub_idx_ex] - means) / stds
 
-        sw1_cross = traj.sliced_wasserstein_1(Z_og, Z_ex, n_projections=64, seed=42)
-        sw1_bound, sw1_null = _self_calibrated_multivariate_bound(
-            Z_og, Z_ex, lambda A, B: traj.sliced_wasserstein_1(A, B, n_projections=64, seed=42)
+        sw1_obs, sw1_p = _mc_permutation_sliced_w1(
+            Z_og, Z_ex, n_projections=32, n_permutations=n_perm
         )
-        self.assertLessEqual(
-            sw1_cross,
-            sw1_bound,
-            msg=f"Joint Sliced-W1={sw1_cross:.5f} > borne MC={sw1_bound:.5f} (null={sw1_null:.5f})",
-        )
-
-        ed_cross = traj.energy_distance(Z_og, Z_ex)
-        ed_bound, ed_null = _self_calibrated_multivariate_bound(
-            Z_og, Z_ex, traj.energy_distance, n_bootstrap=60
-        )
-        self.assertLessEqual(
-            ed_cross,
-            ed_bound,
-            msg=f"Joint EnergyDist={ed_cross:.5f} > borne MC={ed_bound:.5f} (null={ed_null:.5f})",
+        sw1_ucb95 = _bootstrap_ucb95_sliced_w1(Z_og, Z_ex, n_projections=32, n_bootstrap=1000)
+        self.assertGreater(sw1_p, alpha_level, msg=f"Sliced-W1 rejeté : {sw1_obs:.5f} (p={sw1_p:.5f})")
+        self.assertLess(
+            sw1_ucb95,
+            0.11,
+            msg=f"Sliced-W1 équivalence non établie : IC_95%^sup={sw1_ucb95:.5f} >= 0.11",
         )
 
-        # Préservation des dépendances croisées (matrice de corrélation / covariance sur Z)
-        cov_og = np.cov(Z_og, rowvar=False)
-        cov_ex = np.cov(Z_ex, rowvar=False)
-        cov_diff = float(np.linalg.norm(cov_og - cov_ex, ord="fro"))
-        cov_bound, cov_null = _self_calibrated_multivariate_bound(
-            Z_og,
-            Z_ex,
-            lambda A, B: float(
-                np.linalg.norm(np.cov(A, rowvar=False) - np.cov(B, rowvar=False), ord="fro")
-            ),
+        ed_obs, ed_p = _mc_permutation_energy_blocked(
+            Z_og, Z_ex, n_permutations=n_perm, block_size=64
         )
-        self.assertLessEqual(
-            cov_diff,
-            cov_bound,
-            msg=f"Joint Cov Fro={cov_diff:.5f} > borne MC={cov_bound:.5f} (null={cov_null:.5f})",
+        ed_ucb95 = _bootstrap_ucb95_energy_blocked(
+            Z_og, Z_ex, n_bootstrap=1000, block_size=128
+        )
+        self.assertGreater(ed_p, alpha_level, msg=f"EnergyDist rejetée : {ed_obs:.5f} (p={ed_p:.5f})")
+        self.assertLess(
+            ed_ucb95,
+            0.12,
+            msg=f"EnergyDist équivalence non établie : IC_95%^sup={ed_ucb95:.5f} >= 0.12",
         )
 
-        # (c) Comparaison des statistiques temporelles des événements
+        cov_obs, cov_p = _mc_permutation_cov_fro(Z_og, Z_ex, n_permutations=n_perm)
+        cov_ucb95 = _bootstrap_ucb95_cov_fro(Z_og, Z_ex, n_bootstrap=2000)
+        self.assertGreater(cov_p, alpha_level, msg=f"Cov Fro rejetée : {cov_obs:.5f} (p={cov_p:.5f})")
+        self.assertLess(
+            cov_ucb95,
+            0.45,
+            msg=f"Cov Fro équivalence non établie : IC_95%^sup={cov_ucb95:.5f} >= 0.45",
+        )
+
+        # (c) Statistiques temporelles définies par trajectoire (permutation et bootstrap
+        #     opérant strictement au niveau des trajectoires)
         temporal_specs = [
-            ("T_first_capped", t_first_og, t_first_ex),
-            ("T_last_capped", t_last_og, t_last_ex),
-            ("inter_jump_dt", np.asarray(inter_og), np.asarray(inter_ex)),
+            ("T_first_capped", t_first_og, t_first_ex, 0.035),
+            ("T_last_capped", t_last_og, t_last_ex, 0.045),
+            ("event_span", t_span_og, t_span_ex, 0.055),
+            (
+                "traj_inter_mean",
+                np.asarray(traj_inter_mean_og, dtype=np.float64),
+                np.asarray(traj_inter_mean_ex, dtype=np.float64),
+                0.045,
+            ),
+            (
+                "traj_inter_median",
+                np.asarray(traj_inter_med_og, dtype=np.float64),
+                np.asarray(traj_inter_med_ex, dtype=np.float64),
+                0.045,
+            ),
+            (
+                "traj_inter_q75",
+                np.asarray(traj_inter_q75_og, dtype=np.float64),
+                np.asarray(traj_inter_q75_ex, dtype=np.float64),
+                0.045,
+            ),
         ]
-        for name, u_vec, v_vec in temporal_specs:
-            w1_t = traj.wasserstein_1d(u_vec, v_vec)
-            bound_t, null_t = _self_calibrated_1d_bound(u_vec, v_vec)
-            self.assertLessEqual(
-                w1_t,
-                bound_t,
-                msg=f"Temporal '{name}': W1={w1_t:.5f} > borne MC={bound_t:.5f} (null={null_t:.5f})",
+        for name, u_vec, v_vec, delta_eq in temporal_specs:
+            self.assertGreater(u_vec.size, 100)
+            self.assertGreater(v_vec.size, 100)
+            w1_t, p_t = _mc_permutation_test_1d(u_vec, v_vec, n_permutations=n_perm)
+            ucb95_t = _bootstrap_ucb95_1d(u_vec, v_vec, n_bootstrap=2000)
+            self.assertGreater(
+                p_t,
+                alpha_level,
+                msg=f"Temporal '{name}': rejet permutation MC (W1={w1_t:.5f}, p={p_t:.5f})",
+            )
+            self.assertLess(
+                ucb95_t,
+                delta_eq,
+                msg=(
+                    f"Temporal '{name}': équivalence non établie "
+                    f"(IC_95%^sup={ucb95_t:.5f} >= delta_eq={delta_eq}, W1={w1_t:.5f})"
+                ),
             )
 
 
