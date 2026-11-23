@@ -230,14 +230,28 @@ def _mc_permutation_energy_blocked(
     Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
     correction de rang p = (1 + n_>=) / (1 + n_perm)) pour la distance d'énergie
     D_E(U, V).
-    Les masques d'appartenance booléens `in_u` de dimension (n_permutations, n_tot)
-    sont générés une seule fois par tranches de taille B_p = `perm_batch_size`,
-    puis réutilisés lors de l'unique parcours des blocs de distances euclidiennes
-    de taille B_r = `block_size`.
-    L'empreinte mémoire auxiliaire est bornée en :
-        O(n_permutations * n_tot [bool] + B_p * n_tot [float64]
-          + B_r * n_tot * d + B_p * B_r + n_permutations).
+    Les masques d'appartenance booléens `in_u` de dimension (n_perm, n_tot)
+    sont générés une seule fois par tranches de taille B_p = `perm_batch_size`
+    (avec libération explicite des temporaires `noise`, `perms`, `rows`,
+    `batch_mask`), puis réutilisés lors de l'unique parcours des blocs de
+    distances euclidiennes de taille B_r = `block_size`.
+
+    Borne mémoire auxiliaire asymptotique (en nombre d'éléments) :
+        O(n_perm * n_tot + B_p * n_tot + B_r * n_tot * d + B_r * n_tot + B_p * B_r + n_perm)
+    où :
+      - n_perm * n_tot (bool) : masque global `in_u` ;
+      - B_p * n_tot (float64 / intp) : temporaires simultanés `noise` (float64) et
+        `perms` (intp) au pic de génération, puis tampon `in_u_batch` (float64) ;
+      - B_r * n_tot * d (float64) : tenseur `diff` ;
+      - B_r * n_tot (float64) : bloc de distances `dist_block` et sommes `s_all` ;
+      - B_p * B_r (float64) : produits matriciels et vues `row_in_u`, `s_u`, `s_v` ;
+      - n_perm (float64) : accumulateurs `sum_uu`, `sum_uv`, `sum_vv` et `ed_perm`.
     """
+    if n_permutations < 1:
+        raise ValueError("n_permutations doit être >= 1.")
+    if block_size < 1 or perm_batch_size < 1:
+        raise ValueError("block_size et perm_batch_size doivent être >= 1.")
+
     ed_obs = traj.energy_distance(U, V, block_size=block_size)
     n_u = U.shape[0]
     n_v = V.shape[0]
@@ -253,7 +267,9 @@ def _mc_permutation_energy_blocked(
         noise = rng.random((m, n_tot))
         perms = np.argpartition(noise, kth=n_u - 1, axis=1)
         rows = np.arange(m)[:, None]
-        in_u[p0:p1][rows, perms[:, :n_u]] = True
+        batch_mask = in_u[p0:p1]
+        batch_mask[rows, perms[:, :n_u]] = True
+    del noise, perms, rows, batch_mask
 
     sum_uu = np.zeros(n_permutations, dtype=np.float64)
     sum_vv = np.zeros(n_permutations, dtype=np.float64)
