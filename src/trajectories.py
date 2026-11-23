@@ -243,12 +243,19 @@ def _stable_quadratic_real_roots(
     c0: float,
 ) -> List[float]:
     """
-    Résout c2 * z^2 + c1 * z + c0 = 0 dans R en mettant les coefficients à
-    l'échelle S = max(|c2|, |c1|, |c0|) pour éviter tout débordement flottant,
-    sans réduction arbitraire du degré quadratique lorsque c2 != 0, et en
-    utilisant la factorisation de Viète :
-        q = -0.5 * (b + sign(b) * sqrt(Delta)),
-        z_1 = q / a,   z_2 = c / q.
+    Résout numériquement c2 * z^2 + c1 * z + c0 = 0 dans R :
+      1. Normalisation par l'échelle S = max(|c2|, |c1|, |c0|) afin de prévenir
+         tout débordement flottant. Aucun seuil artificiel de degré n'est
+         appliqué : la réduction linéaire n'intervient que si a = c2 / S vaut
+         exactement 0.0 (ce qui inclut le sous-débordement IEEE 754 binary64
+         lorsque |c2| / S < 2^{-1074}).
+      2. Tolérance numérique d'arrondi sur le discriminant : lorsque disc < 0
+         mais disc >= -4 * eps_mach * max(b^2, |4 a c|), le polynôme est traité
+         comme tangent (racine double -b / (2a)) afin d'absorber les erreurs
+         d'arrondi flottant ; il s'agit d'une tolérance numérique et non d'une
+         résolution algébrique exacte.
+      3. Factorisation de Viète q = -0.5 * (b + sign(b) * sqrt(disc)),
+         z_1 = q / a, z_2 = c / q, évitant l'annulation catastrophique.
     """
     scale = max(abs(c2), abs(c1), abs(c0))
     if scale == 0.0 or not np.isfinite(scale):
@@ -266,7 +273,8 @@ def _stable_quadratic_real_roots(
     disc = b * b - 4.0 * a * c
     if disc < 0.0:
         disc_scale = max(b * b, abs(4.0 * a * c))
-        if disc >= -1e-15 * disc_scale:
+        tangency_tol = 4.0 * float(np.finfo(np.float64).eps) * disc_scale
+        if disc >= -tangency_tol:
             return [float(-b / (2.0 * a))]
         return []
     if disc == 0.0:
@@ -648,7 +656,7 @@ def wasserstein_1d(u_samples: Sequence[float], v_samples: Sequence[float]) -> fl
 def sliced_wasserstein_1(
     U: np.ndarray,
     V: np.ndarray,
-    n_projections: int = 64,
+    n_projections: int = 32,
     seed: int = 0,
 ) -> float:
     """
@@ -679,12 +687,12 @@ def sliced_wasserstein_1(
 def energy_distance(
     U: np.ndarray,
     V: np.ndarray,
-    block_size: int = 256,
+    block_size: int = 128,
 ) -> float:
     """
     Distance d'énergie multivariée D_E(U, V) = sqrt(2 E||X - Y|| - E||X - X'|| - E||Y - Y'||),
-    calculée par blocs de taille `block_size` afin de borner l'empreinte mémoire
-    à O(block_size * max(n, m) * d).
+    calculée par blocs de taille `block_size` afin de borner strictement
+    l'empreinte mémoire à O(block_size * max(n, m) * d).
     """
     arr_u = np.asarray(U, dtype=np.float64)
     arr_v = np.asarray(V, dtype=np.float64)
