@@ -1277,3 +1277,32 @@ Le programme de recherche progresse donc par validations successives :
 \]
 
 L'objectif est de déterminer précisément quelles informations historiques sont conservées dans la structure adaptative, dans quelles conditions elles influencent les possibilités futures et jusqu'à quel point elles peuvent être reconstruites à partir des trajectoires observées.
+
+## ---
+
+Note de mise à jour — 25 novembre 2026
+
+La validation logicielle du noyau computationnel a été complétée sur la version organisée du dépôt GitHub.
+
+Les fichiers suivants ont été récupérés depuis le dépôt et compilés sans erreur :
+
+- "src/trajectories.py"
+- "src/fiber_bundle.py"
+- "src/nk_landscape.py"
+- "test/test_trajectories.py"
+
+La suite complète de validation a ensuite été exécutée avec succès :
+
+[
+\boxed{8/8\ \text{tests réussis}}
+]
+
+Durée totale : 533,787 secondes.
+
+Les huit tests couvrent notamment les bornes des taux de transition, la dissipation analytique, le transport post-flip, les propriétés de Metropolis, la stabilité du solveur quadratique, la conservation du risque intégré, la comparaison des simulateurs d'Ogata et exact par morceaux à (\lambda=0), ainsi que la sélection du canal à la frontière (u_2=0).
+
+Une comparaison avec les anciens fichiers locaux a également confirmé que les modules "fiber_bundle.py" et "nk_landscape.py" sont identiques après normalisation. Les différences relevées dans "trajectories.py" et "test_trajectories.py" concernent uniquement la fin de fichier et l'adaptation des chemins d'importation à la nouvelle organisation du dépôt.
+
+Portée de cette validation : elle confirme le bon fonctionnement des modules et des propriétés couvertes par les huit tests dans l'environnement d'exécution utilisé. Elle ne constitue pas une validation de l'ensemble des expériences périphériques, de la persistance temporelle de la mémoire métrique ou de l'accessibilité, ni des performances de reconstruction LSTM.
+
+Le programme expérimental décrit dans le présent README demeure donc ouvert sur ces questions.
