@@ -1,731 +1,1340 @@
+
 """
-src/trajectories.py
+trajectories.py
 Projet : NK-LSTM-PATH
 
-Simulateur de la dynamique jointe (mutations, transport post-flip, dissipation
-exponentielle) par amincissement exact d'Ogata (thinning) avec horloge majorante
-Lambda_max = N * mu, accompagné du solveur analytique exact par morceaux pour
-le régime sans rétroaction (lambda = 0) à horloge de risque intégré, ainsi que
-des métriques de comparaison en loi (Wasserstein-1 1D, Sliced Wasserstein-1 et
-distance d'énergie multivariée calculée par blocs).
+Trajectoires adaptatives sur l'espace d'états couplé :
+
+    X in {-1, +1}^N
+    J in Sym_0(N)
+
+Le paysage NK fournit la composante combinatoire de la fitness.
+La matrice J porte les couplages géométriques évolutifs.
+
+Chaîne dynamique :
+
+    (X, J)
+       -> mutation de X
+       -> transport local post-flip de J
+       -> accessibilité A(J)
+       -> taux de transition w(X, J)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence
+from math import exp, log, sqrt
+from typing import Callable, Sequence
+
 import numpy as np
 
 from fiber_bundle import (
-    PsiFn,
     _validate_J,
     _validate_state,
     accessibility_A,
     mutate_postflip,
-    psi_sym,
 )
 
-FitnessNKFn = Callable[[np.ndarray], float]
+
+FitnessFn = Callable[[np.ndarray], float]
 
 
-@dataclass(frozen=True)
-class JumpEvent:
-    """Enregistrement d'une mutation acceptée et du transport post-flip associé."""
+# ============================================================
+# 0. VALIDATION DES PARAMÈTRES ET DES FITNESS
+# ============================================================
 
-    time: float
-    node: int
-    X: np.ndarray
-    J: np.ndarray
+def _finite_scalar(name: str, value: float) -> float:
+    """Convertit un scalaire en float et refuse NaN/inf."""
 
+    value = float(value)
 
-@dataclass(frozen=True)
-class TrajectoryResult:
-    """Résultat complet d'une trajectoire simulée sur [0, t_max]."""
+    if not np.isfinite(value):
+        raise ValueError(
+            f"{name} doit être un réel fini."
+        )
 
-    t_max: float
-    X_final: np.ndarray
-    J_final: np.ndarray
-    events: List[JumpEvent]
-    n_accepted: int
-    n_candidates: int
-    method: str
+    return value
 
 
-@dataclass(frozen=True)
-class ThresholdCrossingsZ:
-    """
-    Classification des racines z = exp(-gamma * tau) de A_k(J(tau)) = theta_A :
-      - interior_z : racines strictement intérieures z in (0, 1), correspondant
-        à des instants finis tau = -ln(z) / gamma > 0 qui partitionnent
-        l'intervalle entre deux mutations.
-      - boundary_z : racines situées aux bornes z = 1 (tau = 0, égalité initiale
-        au seuil) ou z = 0 (tau -> +inf, égalité asymptotique à l'ancre J^(0)).
-        Volontairement exclues de `interior_z` car elles ne créent pas de
-        sous-segment intérieur supplémentaire.
-    """
+def _evaluate_fitness(
+    fnk_fn: FitnessFn,
+    X: np.ndarray,
+) -> float:
+    """Évalue une fitness NK et vérifie que le résultat est fini."""
 
-    interior_z: np.ndarray
-    boundary_z: np.ndarray
+    return _finite_scalar(
+        "La fitness",
+        fnk_fn(X),
+    )
 
+
+def _validate_pair(
+    X: np.ndarray,
+    J: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Valide conjointement X et J."""
+
+    Xv = _validate_state(X)
+    Jv = _validate_J(J)
+
+    if Jv.shape != (Xv.size, Xv.size):
+        raise ValueError(
+            f"Dimensions incompatibles : X a {Xv.size} sites, "
+            f"J a la forme {Jv.shape}."
+        )
+
+    return Xv, Jv
+
+
+# ============================================================
+# 1. PAYSAGE NK CANONIQUE DE KAUFFMAN
+# ============================================================
 
 class NKLandscape:
     """
-    Paysage adaptatif NK natif sur {-1, +1}^N (converti en {0, 1}^N).
-    Pour chaque composant i, la contribution dépend de s_i et de K voisins.
+    Paysage NK canonique.
+
+    Chaque site i possède une contribution locale f_i dépendant :
+    - de son propre état ;
+    - de K autres sites.
     """
 
-    def __init__(self, n: int, k: int, seed: int = 0) -> None:
-        if n < 2:
+    def __init__(
+        self,
+        N: int,
+        K: int,
+        seed: int | None = None,
+    ) -> None:
+
+        if N < 2:
             raise ValueError("N doit être >= 2.")
-        if not (0 <= k < n):
-            raise ValueError(f"K={k} doit vérifier 0 <= K < N={n}.")
-        self.n = int(n)
-        self.k = int(k)
+
+        if not (0 <= K < N):
+            raise ValueError(
+                "K doit satisfaire 0 <= K < N."
+            )
+
+        self.N = int(N)
+        self.K = int(K)
+
         rng = np.random.default_rng(seed)
 
-        self.neighbors = np.zeros((self.n, self.k), dtype=np.int64)
-        for i in range(self.n):
-            pool = [j for j in range(self.n) if j != i]
-            if self.k > 0:
-                self.neighbors[i] = rng.choice(pool, size=self.k, replace=False)
+        self.neighbors: list[np.ndarray] = []
+        self.tables: list[np.ndarray] = []
 
-        self.table = rng.uniform(0.0, 1.0, size=(self.n, 1 << (self.k + 1)))
-        self._powers = 1 << np.arange(self.k + 1, dtype=np.int64)
+        table_size = 2 ** (self.K + 1)
 
-    def __call__(self, X: np.ndarray) -> float:
-        state = _validate_state(X)
-        if state.size != self.n:
-            raise ValueError(f"Dimension attendue N={self.n}, reçu {state.size}.")
-        bits = (state > 0.0).astype(np.int64)
-        total = 0.0
-        for i in range(self.n):
-            if self.k == 0:
-                idx = int(bits[i])
+        for i in range(self.N):
+
+            candidates = np.array(
+                [j for j in range(self.N) if j != i],
+                dtype=int,
+            )
+
+            if self.K > 0:
+                neigh = rng.choice(
+                    candidates,
+                    size=self.K,
+                    replace=False,
+                )
             else:
-                local_bits = np.empty(self.k + 1, dtype=np.int64)
-                local_bits[0] = bits[i]
-                local_bits[1:] = bits[self.neighbors[i]]
-                idx = int(np.dot(local_bits, self._powers))
-            total += float(self.table[i, idx])
-        return total / float(self.n)
+                neigh = np.empty(0, dtype=int)
 
+            self.neighbors.append(
+                np.asarray(neigh, dtype=int)
+            )
+
+            self.tables.append(
+                rng.random(table_size)
+            )
+
+    def local_contribution(
+        self,
+        X: np.ndarray,
+        i: int,
+    ) -> float:
+
+        X = _validate_state(X)
+
+        if X.size != self.N:
+            raise ValueError(
+                f"Taille de X incompatible : {X.size} != {self.N}."
+            )
+
+        if not (0 <= i < self.N):
+            raise IndexError(
+                f"Indice i hors limites : {i}."
+            )
+
+        indices = np.concatenate(
+            ([i], self.neighbors[i])
+        )
+
+        bits = (
+            (X[indices] + 1.0) / 2.0
+        ).astype(np.int8)
+
+        index = 0
+
+        for bit in bits:
+            index = (index << 1) | int(bit)
+
+        return float(
+            self.tables[i][index]
+        )
+
+    def fitness(
+        self,
+        X: np.ndarray,
+    ) -> float:
+
+        X = _validate_state(X)
+
+        if X.size != self.N:
+            raise ValueError(
+                f"Taille de X incompatible : {X.size} != {self.N}."
+            )
+
+        total = sum(
+            self.local_contribution(X, i)
+            for i in range(self.N)
+        )
+
+        return float(total / self.N)
+
+    __call__ = fitness
+
+
+# ============================================================
+# 2. FITNESS NK NULLE
+# ============================================================
 
 def zero_fnk(X: np.ndarray) -> float:
-    """Paysage natif nul F_NK(X) = 0 (contrôle neutre)."""
+    """Fitness NK nulle, utile pour isoler le terme de couplage."""
+
     _validate_state(X)
+
     return 0.0
 
+
+# ============================================================
+# 3. FITNESS ÉTENDUE F(X, J)
+# ============================================================
 
 def extended_fitness(
     X: np.ndarray,
     J: np.ndarray,
     lam: float,
-    fnk_fn: FitnessNKFn = zero_fnk,
+    fnk_fn: FitnessFn,
 ) -> float:
-    """
+    r"""
     Fitness étendue :
-        F(X, J) = F_NK(X) + lambda * sum_{i < j} J_{ij} s_i s_j.
-    """
-    state = _validate_state(X)
-    mat = _validate_J(J)
-    if state.size != mat.shape[0]:
-        raise ValueError("Dimensions incompatibles entre X et J.")
-    f_nk = float(fnk_fn(state))
-    if lam == 0.0:
-        return f_nk
-    coupling = 0.5 * float(state @ (mat @ state))
-    return f_nk + float(lam) * coupling
 
+        F(X, J) = F_NK(X) + (lambda/2) X^T J X
+    """
+
+    X, J = _validate_pair(X, J)
+
+    lam = _finite_scalar("lam", lam)
+
+    f_nk = _evaluate_fitness(
+        fnk_fn,
+        X,
+    )
+
+    coupling = 0.5 * float(
+        X @ J @ X
+    )
+
+    return float(
+        f_nk + lam * coupling
+    )
+
+
+# ============================================================
+# 4. VARIATION DE FITNESS POUR UN FLIP
+# ============================================================
 
 def delta_fitness_k(
     X: np.ndarray,
     J: np.ndarray,
     k: int,
     lam: float,
-    fnk_fn: FitnessNKFn = zero_fnk,
+    fnk_fn: FitnessFn,
 ) -> float:
+    r"""
+    Variation de fitness lors du flip du site k,
+    J étant maintenu fixe :
+
+        Delta F_k =
+            Delta F_NK - 2 * lambda * X_k * sum_j(J_kj X_j)
     """
-    Variation exacte de fitness lors du basculement du nœud k (s_k -> -s_k),
-    évaluée à fibre J fixée avant le transport :
-        Delta F_k = F_NK(X^{(k)}) - F_NK(X) - 2 * lambda * s_k * sum_{j != k} J_{kj} s_j.
-    """
-    state = _validate_state(X)
-    mat = _validate_J(J)
-    n = state.size
-    if mat.shape[0] != n:
-        raise ValueError("Dimensions incompatibles entre X et J.")
-    if not (0 <= k < n):
-        raise IndexError(f"Indice de nœud k={k} hors limites pour N={n}.")
 
-    X_flipped = state.copy()
-    X_flipped[k] = -X_flipped[k]
-    df_nk = float(fnk_fn(X_flipped)) - float(fnk_fn(state))
-    if lam == 0.0:
-        return df_nk
+    X, J = _validate_pair(X, J)
 
-    local_field = float(np.dot(mat[k], state))
-    return df_nk - 2.0 * float(lam) * float(state[k]) * local_field
+    N = X.size
 
+    if not (0 <= k < N):
+        raise IndexError(
+            f"Indice k hors limites : {k}."
+        )
+
+    lam = _finite_scalar("lam", lam)
+
+    X_next = X.copy()
+    X_next[k] *= -1.0
+
+    delta_nk = (
+        _evaluate_fitness(fnk_fn, X_next)
+        - _evaluate_fitness(fnk_fn, X)
+    )
+
+    local_field = float(
+        np.dot(J[k], X)
+    )
+
+    delta_J = (
+        -2.0 * lam * float(X[k]) * local_field
+    )
+
+    return float(
+        delta_nk + delta_J
+    )
+
+
+# ============================================================
+# 5. TAUX DE TRANSITION
+# ============================================================
 
 def transition_rates(
     X: np.ndarray,
     J: np.ndarray,
     mu: float,
     beta: float,
-    lam: float,
     theta_A: float,
-    fnk_fn: FitnessNKFn = zero_fnk,
+    lam: float,
+    fnk_fn: FitnessFn,
 ) -> np.ndarray:
+    r"""
+    Calcule les taux :
+
+        w_k(X, J) =
+            mu * 1_{A_k(J) > theta_A}
+            * min(1, exp(beta * Delta F_k))
     """
-    Calcule le vecteur des taux de mutation w_k(X, J) pour k = 0, ..., N-1 :
-        w_k(X, J) = mu * a_k(J) * min(1, exp(beta * Delta F_k(X, J))),
-    où a_k(J) = 1[A_k(J) > theta_A]. Vérifie 0 <= w_k <= mu.
-    """
+
+    X, J = _validate_pair(X, J)
+
+    mu = _finite_scalar("mu", mu)
+    beta = _finite_scalar("beta", beta)
+    theta_A = _finite_scalar("theta_A", theta_A)
+    lam = _finite_scalar("lam", lam)
+
     if mu < 0.0:
-        raise ValueError("Le taux de base mu doit être >= 0.")
-    if beta < 0.0:
-        raise ValueError("La sensibilité sélective beta doit être >= 0.")
+        raise ValueError("mu doit être >= 0.")
 
-    state = _validate_state(X)
-    mat = _validate_J(J)
-    n = state.size
-    if mat.shape[0] != n:
-        raise ValueError("Dimensions incompatibles entre X et J.")
+    rates = np.zeros(
+        X.size,
+        dtype=float,
+    )
 
-    rates = np.zeros(n, dtype=np.float64)
     if mu == 0.0:
         return rates
 
-    active = accessibility_A(mat) > float(theta_A)
-    for k in range(n):
+    A = accessibility_A(J)
+    active = A > theta_A
+
+    for k in range(X.size):
+
         if not active[k]:
             continue
-        df_k = delta_fitness_k(state, mat, k=k, lam=lam, fnk_fn=fnk_fn)
-        exponent = float(beta) * df_k
-        boltzmann = 1.0 if exponent >= 0.0 else float(np.exp(exponent))
-        rates[k] = float(mu) * boltzmann
+
+        delta = delta_fitness_k(
+            X=X,
+            J=J,
+            k=k,
+            lam=lam,
+            fnk_fn=fnk_fn,
+        )
+
+        exponent = beta * delta
+
+        boltzmann = (
+            1.0
+            if exponent >= 0.0
+            else float(np.exp(exponent))
+        )
+
+        rates[k] = mu * boltzmann
+
     return rates
 
 
-def dissipate_J(
-    J_curr: np.ndarray,
-    J_anchor: np.ndarray,
-    gamma: float,
-    dt: float,
-) -> np.ndarray:
-    """
-    Évolution analytique exacte par dissipation linéaire sur une durée dt >= 0 :
-        J(t_0 + dt) = J^{(0)} + (J(t_0) - J^{(0)}) * exp(-gamma * dt).
-    """
-    if gamma < 0.0:
-        raise ValueError("Le taux de dissipation gamma doit être >= 0.")
-    if dt < 0.0:
-        raise ValueError("L'incrément temporel dt doit être >= 0.")
+# ============================================================
+# 6. DISSIPATION EXPONENTIELLE DE J
+# ============================================================
 
-    mat_curr = _validate_J(J_curr)
-    mat_anchor = _validate_J(J_anchor)
-    if mat_curr.shape != mat_anchor.shape:
-        raise ValueError("Dimensions incompatibles entre J_curr et J_anchor.")
+def dissipate_J(
+    J: np.ndarray,
+    J_anchor: np.ndarray,
+    dt: float,
+    gamma: float,
+) -> np.ndarray:
+    r"""
+    Dissipation exponentielle vers la matrice d'ancrage :
+
+        J(t + dt) =
+            J_anchor + (J(t) - J_anchor) * exp(-gamma * dt)
+    """
+
+    J = _validate_J(J)
+    J_anchor = _validate_J(J_anchor)
+
+    if J.shape != J_anchor.shape:
+        raise ValueError(
+            "J et J_anchor doivent avoir la même forme."
+        )
+
+    dt = _finite_scalar("dt", dt)
+    gamma = _finite_scalar("gamma", gamma)
+
+    if dt < 0.0:
+        raise ValueError("dt doit être >= 0.")
+
+    if gamma < 0.0:
+        raise ValueError("gamma doit être >= 0.")
 
     if dt == 0.0 or gamma == 0.0:
-        return mat_curr.copy()
+        return J.copy()
 
-    decay = float(np.exp(-float(gamma) * float(dt)))
-    J_next = mat_anchor + (mat_curr - mat_anchor) * decay
-    J_next = 0.5 * (J_next + J_next.T)
-    np.fill_diagonal(J_next, 0.0)
-    return J_next
+    decay = float(
+        np.exp(-gamma * dt)
+    )
 
+    J_next = (
+        J_anchor + (J - J_anchor) * decay
+    )
+
+    return _validate_J(J_next)
+
+
+# ============================================================
+# 7. RACINES RÉELLES D'UN POLYNÔME QUADRATIQUE
+# ============================================================
 
 def _stable_quadratic_real_roots(
-    c2: float,
-    c1: float,
-    c0: float,
-) -> List[float]:
-    """
-    Résout numériquement c2 * z^2 + c1 * z + c0 = 0 dans R :
-      1. Normalisation par l'échelle S = max(|c2|, |c1|, |c0|) afin de prévenir
-         tout débordement flottant. Aucun seuil artificiel de degré n'est
-         appliqué : la normalisation peut arrondir un coefficient quadratique
-         non nul à zéro lorsque sa valeur absolue est suffisamment petite pour
-         être sous-débordée en binary64. La condition `a == 0.0` ne garantit donc
-         pas que le coefficient initial `c2` était algébriquement nul.
-      2. Tolérance numérique d'arrondi sur le discriminant : lorsque disc < 0
-         mais disc >= -4 * eps_mach * max(b^2, |4 a c|), le polynôme est traité
-         comme tangent (racine double -b / (2a)) afin d'absorber les erreurs
-         d'arrondi flottant ; il s'agit d'une tolérance numérique et non d'une
-         résolution algébrique exacte.
-      3. Factorisation de Viète q = -0.5 * (b + sign(b) * sqrt(disc)),
-         z_1 = q / a, z_2 = c / q, évitant l'annulation catastrophique.
-    """
-    scale = max(abs(c2), abs(c1), abs(c0))
-    if scale == 0.0 or not np.isfinite(scale):
-        return []
+    a: float,
+    b: float,
+    c: float,
+    atol: float = 1e-14,
+) -> list[float]:
+    """Résout a*z^2 + b*z + c = 0 de façon stable."""
 
-    a = c2 / scale
-    b = c1 / scale
-    c = c0 / scale
+    a = _finite_scalar("a", a)
+    b = _finite_scalar("b", b)
+    c = _finite_scalar("c", c)
+    atol = _finite_scalar("atol", atol)
 
-    if a == 0.0:
-        if b == 0.0:
+    if atol < 0.0:
+        raise ValueError("atol doit être >= 0.")
+
+    if abs(a) <= atol:
+
+        if abs(b) <= atol:
             return []
-        return [float(-c / b)]
 
-    disc = b * b - 4.0 * a * c
-    if disc < 0.0:
-        disc_scale = max(b * b, abs(4.0 * a * c))
-        tangency_tol = 4.0 * float(np.finfo(np.float64).eps) * disc_scale
-        if disc >= -tangency_tol:
-            return [float(-b / (2.0 * a))]
-        return []
-    if disc == 0.0:
-        return [float(-b / (2.0 * a))]
+        return [-c / b]
 
-    sqrt_disc = float(np.sqrt(disc))
-    sign_b = 1.0 if b >= 0.0 else -1.0
-    q = -0.5 * (b + sign_b * sqrt_disc)
-    if q == 0.0:
-        return [float(-b / (2.0 * a))]
+    discriminant = b * b - 4.0 * a * c
 
-    z1 = float(q / a)
-    z2 = float(c / q)
-    return [z1, z2]
+    scale = (
+        abs(b * b)
+        + abs(4.0 * a * c)
+        + 1.0
+    )
 
+    if discriminant < 0.0:
+
+        if abs(discriminant) <= atol * scale:
+            discriminant = 0.0
+        else:
+            return []
+
+    sqrt_disc = sqrt(
+        max(0.0, discriminant)
+    )
+
+    if sqrt_disc == 0.0:
+        return [-b / (2.0 * a)]
+
+    q = -0.5 * (
+        b + np.copysign(sqrt_disc, b)
+    )
+
+    roots = [q / a]
+
+    if abs(q) > atol:
+        roots.append(c / q)
+
+    roots = sorted(
+        float(r)
+        for r in roots
+        if np.isfinite(r)
+    )
+
+    unique: list[float] = []
+
+    for r in roots:
+
+        if (
+            not unique
+            or not np.isclose(
+                r,
+                unique[-1],
+                rtol=0.0,
+                atol=atol,
+            )
+        ):
+            unique.append(r)
+
+    return unique
+
+
+# ============================================================
+# 8. ANCIENNE INTERFACE DE CLASSIFICATION
+# ============================================================
 
 def classify_threshold_crossings_z(
-    J_curr: np.ndarray,
-    J_anchor: np.ndarray,
+    A0: np.ndarray,
+    A_anchor: np.ndarray,
+    z0: float,
+    z1: float,
     theta_A: float,
-    eps_boundary: float = 1e-15,
-    dedup_tol: float = 1e-14,
-) -> ThresholdCrossingsZ:
-    """
-    Résout et classe pour chaque nœud k in {0, ..., N-1} les racines de :
-        A_k(J^{(0)} + (J_curr - J^{(0)}) * z) - theta_A = 0
-        <=> c_2 * z^2 + c_1 * z + c_0 = 0,
-    avec :
-        c_2 = sum_{j != k} D_{kj}^2 >= 0,
-        c_1 = 2 * sum_{j != k} J^{(0)}_{kj} D_{kj},
-        c_0 = sum_{j != k} (J^{(0)}_{kj})^2 - theta_A,
-        D = J_curr - J^{(0)}.
+) -> list[tuple[float, int, str]]:
+    """Conservé pour rétro-compatibilité."""
 
-    Distingue :
-      - `interior_z` : racines dans (eps_boundary, 1 - eps_boundary), définissant
-        les instants tau = -ln(z)/gamma in (0, +inf) de changement de masque.
-      - `boundary_z` : racines aux bornes |z| <= eps_boundary ou |z - 1| <= eps_boundary,
-        volontairement exclues des points de coupure intérieurs.
-    """
-    mat_curr = _validate_J(J_curr)
-    mat_anchor = _validate_J(J_anchor)
-    if mat_curr.shape != mat_anchor.shape:
-        raise ValueError("Dimensions incompatibles entre J_curr et J_anchor.")
+    _ = (
+        A0,
+        A_anchor,
+        z0,
+        z1,
+        theta_A,
+    )
 
-    diff = mat_curr - mat_anchor
-    n = mat_curr.shape[0]
-    interior: List[float] = []
-    boundary: List[float] = []
-
-    for k in range(n):
-        d_row = diff[k]
-        j0_row = mat_anchor[k]
-
-        c2 = float(np.dot(d_row, d_row))
-        c1 = 2.0 * float(np.dot(j0_row, d_row))
-        c0 = float(np.dot(j0_row, j0_row)) - float(theta_A)
-
-        for z in _stable_quadratic_real_roots(c2, c1, c0):
-            if eps_boundary < z < 1.0 - eps_boundary:
-                interior.append(z)
-            elif abs(z) <= eps_boundary or abs(z - 1.0) <= eps_boundary:
-                boundary.append(float(np.clip(z, 0.0, 1.0)))
-
-    def _dedup_desc(vals: List[float]) -> np.ndarray:
-        if not vals:
-            return np.empty(0, dtype=np.float64)
-        s = sorted(vals, reverse=True)
-        out = [s[0]]
-        for v in s[1:]:
-            if abs(v - out[-1]) > dedup_tol:
-                out.append(v)
-        return np.asarray(out, dtype=np.float64)
-
-    return ThresholdCrossingsZ(
-        interior_z=_dedup_desc(interior),
-        boundary_z=_dedup_desc(boundary),
+    raise NotImplementedError(
+        "A(z0) et A(z1) ne suffisent pas à déterminer les "
+        "traversées quadratiques. Utiliser "
+        "solve_threshold_crossings_z(J0, J_anchor, ...)."
     )
 
 
-def solve_threshold_crossings_z(
-    J_curr: np.ndarray,
-    J_anchor: np.ndarray,
-    theta_A: float,
-    eps_boundary: float = 1e-15,
-    dedup_tol: float = 1e-14,
-) -> np.ndarray:
-    """
-    Retourne les racines strictement intérieures z in (0, 1) triées par ordre
-    décroissant (instants tau = -ln(z) / gamma croissants). Les racines aux
-    bornes z in {0, 1} sont volontairement exclues.
-    """
-    return classify_threshold_crossings_z(
-        J_curr=J_curr,
-        J_anchor=J_anchor,
-        theta_A=theta_A,
-        eps_boundary=eps_boundary,
-        dedup_tol=dedup_tol,
-    ).interior_z
+# ============================================================
+# 9. RÉSOLUTION DES TRAVERSÉES DE SEUIL
+# ============================================================
 
+def solve_threshold_crossings_z(
+    J0: np.ndarray,
+    J_anchor: np.ndarray,
+    z0: float,
+    z1: float,
+    theta_A: float,
+    atol: float = 1e-12,
+) -> list[tuple[float, int, str]]:
+    r"""
+    Résout A_k(z) = theta_A sur [z1, z0] pour :
+
+        J(z) = J_anchor + (J0 - J_anchor) * z
+    """
+
+    J0 = _validate_J(J0)
+    J_anchor = _validate_J(J_anchor)
+
+    if J0.shape != J_anchor.shape:
+        raise ValueError(
+            "J0 et J_anchor doivent avoir la même forme."
+        )
+
+    z0 = _finite_scalar("z0", z0)
+    z1 = _finite_scalar("z1", z1)
+    theta_A = _finite_scalar("theta_A", theta_A)
+    atol = _finite_scalar("atol", atol)
+
+    if z0 < z1:
+        raise ValueError("z0 doit être >= z1.")
+
+    if z1 < 0.0:
+        raise ValueError("z1 doit être >= 0.")
+
+    if atol <= 0.0:
+        raise ValueError("atol doit être strictement positif.")
+
+    D = J0 - J_anchor
+
+    events: list[tuple[float, int, str]] = []
+
+    for k in range(J0.shape[0]):
+
+        row_anchor = J_anchor[k]
+        row_delta = D[k]
+
+        a = float(
+            np.dot(row_delta, row_delta)
+        )
+
+        b = float(
+            2.0 * np.dot(row_anchor, row_delta)
+        )
+
+        c = float(
+            np.dot(row_anchor, row_anchor) - theta_A
+        )
+
+        roots = _stable_quadratic_real_roots(
+            a,
+            b,
+            c,
+            atol=atol,
+        )
+
+        for root in roots:
+
+            if root < z1 - atol or root > z0 + atol:
+                continue
+
+            z = float(
+                min(z0, max(z1, root))
+            )
+
+            eps = min(
+                max(1e-8, 100.0 * atol),
+                max((z0 - z1) * 0.25, atol),
+            )
+
+            zl = max(z1, z - eps)
+            zr = min(z0, z + eps)
+
+            poly_l = a * zl * zl + b * zl + c
+            poly_r = a * zr * zr + b * zr + c
+
+            if poly_l < 0.0 and poly_r > 0.0:
+                kind = "up"
+
+            elif poly_l > 0.0 and poly_r < 0.0:
+                kind = "down"
+
+            else:
+                kind = "touch"
+
+            events.append(
+                (z, k, kind)
+            )
+
+    # Tri par z décroissant :
+    # ordre chronologique de la dissipation.
+
+    events.sort(
+        key=lambda item: (-item[0], item[1])
+    )
+
+    unique: list[tuple[float, int, str]] = []
+
+    for event in events:
+
+        z, k, _kind = event
+
+        duplicate = any(
+            k == pk and abs(z - pz) <= atol
+            for pz, pk, _ in unique
+        )
+
+        if not duplicate:
+            unique.append(event)
+
+    return unique
+
+
+# ============================================================
+# 10. SIMULATION PAR THINNING D'OGATA
+# ============================================================
 
 def simulate_ogata_thinning(
     X0: np.ndarray,
     J0: np.ndarray,
     t_max: float,
     mu: float,
-    gamma: float,
     beta: float,
-    lam: float,
-    eta: float,
     theta_A: float,
-    fnk_fn: FitnessNKFn = zero_fnk,
-    psi_fn: PsiFn = psi_sym,
-    J_anchor: Optional[np.ndarray] = None,
-    rng: Optional[np.random.Generator] = None,
-    max_candidates: int = 5_000_000,
-) -> TrajectoryResult:
-    """
-    Simule en loi exacte la dynamique jointe (mutations, transport post-flip,
-    dissipation) sur [0, t_max] par amincissement d'Ogata avec horloge majorante
-    uniforme Lambda_max = N * mu.
-    """
-    if t_max < 0.0:
-        raise ValueError("t_max doit être >= 0.")
-    if mu < 0.0 or gamma < 0.0 or beta < 0.0:
-        raise ValueError("Les paramètres mu, gamma et beta doivent être >= 0.")
+    lam: float,
+    fnk_fn: FitnessFn,
+    rng: np.random.Generator | None = None,
+    eta: float = 0.0,
+    gamma: float = 0.0,
+    J_anchor: np.ndarray | None = None,
+    max_events: int = 100000,
+) -> list[dict]:
+    """Simulation stochastique par rejet d'Ogata."""
 
     X = _validate_state(X0).copy()
     J = _validate_J(J0).copy()
-    anchor = J.copy() if J_anchor is None else _validate_J(J_anchor).copy()
-    n = X.size
-    if J.shape[0] != n or anchor.shape[0] != n:
-        raise ValueError("Dimensions incompatibles entre X0, J0 et J_anchor.")
 
-    gen = np.random.default_rng() if rng is None else rng
-    events: List[JumpEvent] = []
+    if J.shape != (X.size, X.size):
+        raise ValueError(
+            "Dimensions incompatibles entre X0 et J0."
+        )
+
+    t_max = _finite_scalar("t_max", t_max)
+    mu = _finite_scalar("mu", mu)
+    beta = _finite_scalar("beta", beta)
+    theta_A = _finite_scalar("theta_A", theta_A)
+    lam = _finite_scalar("lam", lam)
+    eta = _finite_scalar("eta", eta)
+    gamma = _finite_scalar("gamma", gamma)
+
+    if (
+        t_max < 0.0
+        or mu < 0.0
+        or gamma < 0.0
+        or max_events < 0
+    ):
+        raise ValueError(
+            "Les paramètres de taux, temps et compteurs doivent être positifs."
+        )
+
+    if J_anchor is None:
+        J_anchor = J.copy()
+    else:
+        J_anchor = _validate_J(J_anchor)
+
+    if J_anchor.shape != J.shape:
+        raise ValueError(
+            "J_anchor doit avoir la même forme que J0."
+        )
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    events: list[dict] = []
+
     t = 0.0
-    n_candidates = 0
-    lambda_max = float(n) * float(mu)
 
-    if lambda_max == 0.0 or t_max == 0.0:
-        J_end = dissipate_J(J, anchor, gamma=gamma, dt=t_max)
-        return TrajectoryResult(
-            t_max=float(t_max),
-            X_final=X,
-            J_final=J_end,
-            events=events,
-            n_accepted=0,
-            n_candidates=0,
-            method="ogata_thinning",
-        )
-
-    while t < t_max:
-        if n_candidates >= max_candidates:
-            raise RuntimeError(
-                f"Nombre maximal d'événements candidats atteint ({max_candidates})."
-            )
-
-        u1 = float(gen.uniform(0.0, 1.0))
-        while u1 == 0.0:
-            u1 = float(gen.uniform(0.0, 1.0))
-        dt = -float(np.log(u1)) / lambda_max
-        n_candidates += 1
-
-        if t + dt > t_max:
-            J = dissipate_J(J, anchor, gamma=gamma, dt=t_max - t)
-            t = float(t_max)
-            break
-
-        t += dt
-        J = dissipate_J(J, anchor, gamma=gamma, dt=dt)
-
-        rates = transition_rates(
-            X, J, mu=mu, beta=beta, lam=lam, theta_A=theta_A, fnk_fn=fnk_fn
-        )
-        cum_rates = np.cumsum(rates)
-        total_rate = float(cum_rates[-1])
-        if total_rate > lambda_max * (1.0 + 1e-12):
-            raise AssertionError(
-                f"Violation de la borne majorante : Lambda={total_rate} > N*mu={lambda_max}."
-            )
-
-        u2 = float(gen.uniform(0.0, lambda_max))
-        if u2 < total_rate and total_rate > 0.0:
-            k = int(np.searchsorted(cum_rates, u2, side="right"))
-            if k >= n:
-                k = n - 1
-            X, J = mutate_postflip(X, J, k=k, eta=eta, psi_fn=psi_fn)
-            events.append(JumpEvent(time=t, node=k, X=X.copy(), J=J.copy()))
-
-    return TrajectoryResult(
-        t_max=float(t_max),
-        X_final=X,
-        J_final=J,
-        events=events,
-        n_accepted=len(events),
-        n_candidates=n_candidates,
-        method="ogata_thinning",
+    majorant = float(
+        X.size * mu
     )
 
+    if majorant == 0.0 or t_max == 0.0 or max_events == 0:
+        return events
+
+    for _ in range(max_events):
+
+        waiting = float(
+            rng.exponential(1.0 / majorant)
+        )
+
+        t_candidate = t + waiting
+
+        if t_candidate > t_max:
+            break
+
+        J_candidate = dissipate_J(
+            J,
+            J_anchor,
+            dt=waiting,
+            gamma=gamma,
+        )
+
+        rates = transition_rates(
+            X=X,
+            J=J_candidate,
+            mu=mu,
+            beta=beta,
+            theta_A=theta_A,
+            lam=lam,
+            fnk_fn=fnk_fn,
+        )
+
+        total_rate = float(
+            np.sum(rates)
+        )
+
+        acceptance = min(
+            1.0,
+            max(0.0, total_rate / majorant),
+        )
+
+        if rng.random() < acceptance and total_rate > 0.0:
+
+            k = int(
+                rng.choice(
+                    X.size,
+                    p=rates / total_rate,
+                )
+            )
+
+            X_before = X.copy()
+            J_before = J_candidate.copy()
+
+            X_after, J_after = mutate_postflip(
+                X,
+                J_candidate,
+                k=k,
+                eta=eta,
+            )
+
+            X = X_after
+            J = J_after
+
+            t = t_candidate
+
+            events.append(
+                {
+                    "t": t,
+                    "site": k,
+                    "X_before": X_before,
+                    "J_before": J_before,
+                    "X_after": X.copy(),
+                    "J_after": J.copy(),
+                    "rates": rates.copy(),
+                    "total_rate": total_rate,
+                    "accepted": True,
+                }
+            )
+
+        else:
+
+            J = J_candidate
+            t = t_candidate
+
+    return events
+
+
+# ============================================================
+# 11. SOLVEUR EXACT PAR MORCEAUX POUR lambda = 0
+# ============================================================
 
 def simulate_exact_piecewise_lambda0(
     X0: np.ndarray,
     J0: np.ndarray,
     t_max: float,
     mu: float,
-    gamma: float,
     beta: float,
-    eta: float,
     theta_A: float,
-    fnk_fn: FitnessNKFn = zero_fnk,
-    psi_fn: PsiFn = psi_sym,
-    J_anchor: Optional[np.ndarray] = None,
-    rng: Optional[np.random.Generator] = None,
-    max_events: int = 1_000_000,
-) -> TrajectoryResult:
+    eta: float = 0.0,
+    gamma: float = 0.0,
+    J_anchor: np.ndarray | None = None,
+    rng: np.random.Generator | None = None,
+    max_events: int = 100000,
+    fnk_fn: FitnessFn = zero_fnk,
+) -> list[dict]:
+    r"""
+    Simulation exacte par morceaux pour lambda = 0.
+
+    Entre deux mutations, J(t) dissipe vers J_anchor.
+    Le masque d'accessibilité est constant par morceaux
+    en z = exp(-gamma * Delta t).
     """
-    Solveur de Gillespie exact par morceaux pour le régime sans rétroaction
-    (lambda = 0) :
-      - Entre deux mutations, les poids de Boltzmann W_k(X) sont constants.
-      - Une unique horloge exponentielle E = -ln(u) ~ Exp(1) est tirée au
-        début de chaque intervalle inter-mutations ; le risque intégré
-        E_m = Lambda_m * Delta t_m est soustrait à chaque changement de masque
-        sans réinitialiser l'horloge.
-    """
-    if t_max < 0.0:
-        raise ValueError("t_max doit être >= 0.")
-    if mu < 0.0 or gamma < 0.0 or beta < 0.0:
-        raise ValueError("Les paramètres mu, gamma et beta doivent être >= 0.")
 
     X = _validate_state(X0).copy()
     J = _validate_J(J0).copy()
-    anchor = J.copy() if J_anchor is None else _validate_J(J_anchor).copy()
-    n = X.size
-    if J.shape[0] != n or anchor.shape[0] != n:
-        raise ValueError("Dimensions incompatibles entre X0, J0 et J_anchor.")
 
-    gen = np.random.default_rng() if rng is None else rng
-    events: List[JumpEvent] = []
-    t = 0.0
-
-    if mu == 0.0 or t_max == 0.0:
-        J_end = dissipate_J(J, anchor, gamma=gamma, dt=t_max)
-        return TrajectoryResult(
-            t_max=float(t_max),
-            X_final=X,
-            J_final=J_end,
-            events=events,
-            n_accepted=0,
-            n_candidates=0,
-            method="exact_piecewise_lambda0",
+    if J.shape != (X.size, X.size):
+        raise ValueError(
+            "Dimensions incompatibles entre X0 et J0."
         )
 
-    while t < t_max:
-        if len(events) >= max_events:
-            raise RuntimeError(f"Nombre maximal d'événements atteint ({max_events}).")
+    t_max = _finite_scalar("t_max", t_max)
+    mu = _finite_scalar("mu", mu)
+    beta = _finite_scalar("beta", beta)
+    theta_A = _finite_scalar("theta_A", theta_A)
+    eta = _finite_scalar("eta", eta)
+    gamma = _finite_scalar("gamma", gamma)
 
-        remaining_t = float(t_max) - t
+    if (
+        t_max < 0.0
+        or mu < 0.0
+        or gamma < 0.0
+        or max_events < 0
+    ):
+        raise ValueError(
+            "Paramètres non valides."
+        )
 
-        # Poids de Boltzmann constants entre deux mutations (lambda = 0)
-        boltz = np.empty(n, dtype=np.float64)
-        for k in range(n):
-            df_k = delta_fitness_k(X, J, k=k, lam=0.0, fnk_fn=fnk_fn)
-            exponent = float(beta) * df_k
-            boltz[k] = 1.0 if exponent >= 0.0 else float(np.exp(exponent))
+    if J_anchor is None:
+        J_anchor = J.copy()
+    else:
+        J_anchor = _validate_J(J_anchor)
+
+    if J_anchor.shape != J.shape:
+        raise ValueError(
+            "J_anchor doit avoir la même forme que J0."
+        )
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    events: list[dict] = []
+
+    t = 0.0
+
+    if t_max == 0.0 or mu == 0.0 or max_events == 0:
+        return events
+
+    event_count = 0
+
+    while t < t_max and event_count < max_events:
+
+        remaining = t_max - t
+
+        # --------------------------------------------------------
+        # Cas non dissipatif
+        # --------------------------------------------------------
 
         if gamma == 0.0:
-            active = (accessibility_A(J) > float(theta_A)).astype(np.float64)
-            rates = float(mu) * active * boltz
-            cum_rates = np.cumsum(rates)
-            total_rate = float(cum_rates[-1])
+
+            rates = transition_rates(
+                X=X,
+                J=J,
+                mu=mu,
+                beta=beta,
+                theta_A=theta_A,
+                lam=0.0,
+                fnk_fn=fnk_fn,
+            )
+
+            total_rate = float(
+                np.sum(rates)
+            )
+
             if total_rate <= 0.0:
-                t = float(t_max)
                 break
-            u1 = float(gen.uniform(0.0, 1.0))
-            while u1 == 0.0:
-                u1 = float(gen.uniform(0.0, 1.0))
-            dt = -float(np.log(u1)) / total_rate
-            if t + dt > t_max:
-                t = float(t_max)
+
+            waiting = float(
+                rng.exponential(1.0 / total_rate)
+            )
+
+            if waiting >= remaining:
                 break
-            t += dt
-            u2 = float(gen.uniform(0.0, total_rate))
-            k = int(np.searchsorted(cum_rates, u2, side="right"))
-            if k >= n:
-                k = n - 1
-            X, J = mutate_postflip(X, J, k=k, eta=eta, psi_fn=psi_fn)
-            events.append(JumpEvent(time=t, node=k, X=X.copy(), J=J.copy()))
+
+            k = int(
+                rng.choice(
+                    X.size,
+                    p=rates / total_rate,
+                )
+            )
+
+            X_before = X.copy()
+            J_before = J.copy()
+
+            X, J = mutate_postflip(
+                X,
+                J,
+                k=k,
+                eta=eta,
+            )
+
+            t += waiting
+            event_count += 1
+
+            events.append(
+                {
+                    "t": t,
+                    "site": k,
+                    "X_before": X_before,
+                    "J_before": J_before,
+                    "X_after": X.copy(),
+                    "J_after": J.copy(),
+                    "rates": rates.copy(),
+                    "total_rate": total_rate,
+                    "accepted": True,
+                }
+            )
+
             continue
 
-        # Résolution analytique des franchissements strictement intérieurs sur (0, remaining_t)
-        z_roots = solve_threshold_crossings_z(J, anchor, theta_A=theta_A)
-        if z_roots.size > 0:
-            taus_all = -np.log(z_roots) / float(gamma)
-            taus = taus_all[(taus_all > 0.0) & (taus_all < remaining_t)]
-        else:
-            taus = np.empty(0, dtype=np.float64)
+        # --------------------------------------------------------
+        # Cas dissipatif : z = exp(-gamma * (tau - t))
+        # --------------------------------------------------------
 
-        boundaries = np.concatenate(([0.0], taus, [remaining_t]))
+        z_start = 1.0
 
-        # Horloge exponentielle unique conservée à travers tous les sous-segments
-        u = float(gen.uniform(0.0, 1.0))
-        while u == 0.0:
-            u = float(gen.uniform(0.0, 1.0))
-        hazard_remaining = -float(np.log(u))
-        jumped = False
+        z_end = float(
+            exp(-gamma * remaining)
+        )
 
-        for m in range(boundaries.size - 1):
-            tau_start = float(boundaries[m])
-            tau_end = float(boundaries[m + 1])
-            seg_len = tau_end - tau_start
-            if seg_len <= 0.0:
+        crossings = solve_threshold_crossings_z(
+            J0=J,
+            J_anchor=J_anchor,
+            z0=z_start,
+            z1=z_end,
+            theta_A=theta_A,
+        )
+
+        boundaries = [z_start]
+
+        boundaries.extend(
+            z
+            for z, _, _ in crossings
+            if z_end < z < z_start
+        )
+
+        boundaries.append(z_end)
+
+        boundaries = sorted(
+            set(boundaries),
+            reverse=True,
+        )
+
+        mutation_occurred = False
+
+        J_ref = J.copy()
+        t_ref = t
+
+        for z_a, z_b in zip(
+            boundaries[:-1],
+            boundaries[1:],
+        ):
+
+            if z_a <= 0.0 or z_b <= 0.0:
                 continue
 
-            tau_mid = 0.5 * (tau_start + tau_end)
-            J_mid = dissipate_J(J, anchor, gamma=gamma, dt=tau_mid)
-            active_mid = (accessibility_A(J_mid) > float(theta_A)).astype(np.float64)
-            rates_m = float(mu) * active_mid * boltz
-            cum_rates_m = np.cumsum(rates_m)
-            lam_m = float(cum_rates_m[-1])
+            dt_segment = (
+                log(z_a / z_b) / gamma
+            )
 
-            if lam_m <= 0.0:
+            if dt_segment <= 0.0:
                 continue
 
-            hazard_segment = lam_m * seg_len
-            if hazard_remaining < hazard_segment:
-                wait = hazard_remaining / lam_m
-                tau_hit = tau_start + wait
-                t += tau_hit
-                J = dissipate_J(J, anchor, gamma=gamma, dt=tau_hit)
+            z_mid = 0.5 * (z_a + z_b)
 
-                u2 = float(gen.uniform(0.0, lam_m))
-                k = int(np.searchsorted(cum_rates_m, u2, side="right"))
-                if k >= n:
-                    k = n - 1
-                X, J = mutate_postflip(X, J, k=k, eta=eta, psi_fn=psi_fn)
-                events.append(JumpEvent(time=t, node=k, X=X.copy(), J=J.copy()))
-                jumped = True
-                break
+            J_mid = _validate_J(
+                J_anchor
+                + (J_ref - J_anchor) * z_mid
+            )
 
-            hazard_remaining -= hazard_segment
+            rates = transition_rates(
+                X=X,
+                J=J_mid,
+                mu=mu,
+                beta=beta,
+                theta_A=theta_A,
+                lam=0.0,
+                fnk_fn=fnk_fn,
+            )
 
-        if not jumped:
-            J = dissipate_J(J, anchor, gamma=gamma, dt=remaining_t)
-            t = float(t_max)
-            break
+            total_rate = float(
+                np.sum(rates)
+            )
 
-    return TrajectoryResult(
-        t_max=float(t_max),
-        X_final=X,
-        J_final=J,
-        events=events,
-        n_accepted=len(events),
-        n_candidates=len(events),
-        method="exact_piecewise_lambda0",
+            if total_rate > 0.0:
+
+                waiting = float(
+                    rng.exponential(1.0 / total_rate)
+                )
+
+                if waiting < dt_segment:
+
+                    t_event = t + waiting
+
+                    tau = t_event - t_ref
+
+                    J_event = dissipate_J(
+                        J_ref,
+                        J_anchor,
+                        dt=tau,
+                        gamma=gamma,
+                    )
+
+                    k = int(
+                        rng.choice(
+                            X.size,
+                            p=rates / total_rate,
+                        )
+                    )
+
+                    X_before = X.copy()
+                    J_before = J_event.copy()
+
+                    X, J = mutate_postflip(
+                        X,
+                        J_event,
+                        k=k,
+                        eta=eta,
+                    )
+
+                    t = t_event
+                    event_count += 1
+                    mutation_occurred = True
+
+                    events.append(
+                        {
+                            "t": t,
+                            "site": k,
+                            "X_before": X_before,
+                            "J_before": J_before,
+                            "X_after": X.copy(),
+                            "J_after": J.copy(),
+                            "rates": rates.copy(),
+                            "total_rate": total_rate,
+                            "accepted": True,
+                        }
+                    )
+
+                    break
+
+            # Aucun saut : progression jusqu'au segment suivant.
+
+            t += dt_segment
+
+            J = dissipate_J(
+                J_ref,
+                J_anchor,
+                dt=t - t_ref,
+                gamma=gamma,
+            )
+
+        if mutation_occurred:
+            continue
+
+        J = dissipate_J(
+            J_ref,
+            J_anchor,
+            dt=t_max - t_ref,
+            gamma=gamma,
+        )
+
+        t = t_max
+        break
+
+    return events
+
+
+# ============================================================
+# 12. WASSERSTEIN-1 EMPIRIQUE EN DIMENSION 1
+# ============================================================
+
+def wasserstein_1d(
+    x: Sequence[float],
+    y: Sequence[float],
+) -> float:
+    r"""
+    Distance de Wasserstein-1 unidimensionnelle
+    sur deux échantillons empiriques.
+    """
+
+    x_arr = np.sort(
+        np.asarray(x, dtype=float).ravel()
+    )
+
+    y_arr = np.sort(
+        np.asarray(y, dtype=float).ravel()
+    )
+
+    if x_arr.size == 0 or y_arr.size == 0:
+        raise ValueError(
+            "Les deux échantillons doivent être non vides."
+        )
+
+    if (
+        not np.all(np.isfinite(x_arr))
+        or not np.all(np.isfinite(y_arr))
+    ):
+        raise ValueError(
+            "Les échantillons doivent contenir des valeurs finies."
+        )
+
+    i = 0
+    j = 0
+
+    mass_x = 1.0 / x_arr.size
+    mass_y = 1.0 / y_arr.size
+
+    remaining_x = mass_x
+    remaining_y = mass_y
+
+    distance = 0.0
+
+    while i < x_arr.size and j < y_arr.size:
+
+        transported = min(
+            remaining_x,
+            remaining_y,
+        )
+
+        distance += (
+            transported
+            * abs(x_arr[i] - y_arr[j])
+        )
+
+        remaining_x -= transported
+        remaining_y -= transported
+
+        if remaining_x <= 1e-15:
+            i += 1
+            remaining_x = (
+                mass_x if i < x_arr.size else 0.0
+            )
+
+        if remaining_y <= 1e-15:
+            j += 1
+            remaining_y = (
+                mass_y if j < y_arr.size else 0.0
+            )
+
+    return float(distance)
+
+
+# ============================================================
+# 13. SLICED WASSERSTEIN-1
+# ============================================================
+
+def sliced_wasserstein_1(
+    X: np.ndarray,
+    Y: np.ndarray,
+    n_projections: int = 128,
+    rng: np.random.Generator | None = None,
+) -> float:
+    """Distance Sliced Wasserstein-1 par projections aléatoires."""
+
+    X = np.asarray(X, dtype=float)
+    Y = np.asarray(Y, dtype=float)
+
+    if X.ndim != 2 or Y.ndim != 2:
+        raise ValueError(
+            "X et Y doivent être bidimensionnels."
+        )
+
+    if X.shape[0] == 0 or Y.shape[0] == 0:
+        raise ValueError(
+            "X et Y doivent contenir au moins un point."
+        )
+
+    if X.shape[1] != Y.shape[1]:
+        raise ValueError(
+            "X et Y doivent avoir la même dimension de caractéristiques."
+        )
+
+    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(Y)):
+        raise ValueError(
+            "X et Y doivent contenir des valeurs finies."
+        )
+
+    if n_projections < 1:
+        raise ValueError(
+            "n_projections doit être >= 1."
+        )
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dimension = X.shape[1]
+
+    directions = rng.normal(
+        size=(n_projections, dimension)
+    )
+
+    norms = np.linalg.norm(
+        directions,
+        axis=1,
+        keepdims=True,
+    )
+
+    zero_rows = norms[:, 0] == 0.0
+
+    while np.any(zero_rows):
+
+        directions[zero_rows] = rng.normal(
+            size=(
+                int(np.sum(zero_rows)),
+                dimension,
+            )
+        )
+
+        norms = np.linalg.norm(
+            directions,
+            axis=1,
+            keepdims=True,
+        )
+
+        zero_rows = norms[:, 0] == 0.0
+
+    directions /= norms
+
+    distances = [
+        wasserstein_1d(
+            X @ direction,
+            Y @ direction,
+        )
+        for direction in directions
+    ]
+
+    return float(
+        np.mean(distances)
     )
 
 
-def wasserstein_1d(u_samples: Sequence[float], v_samples: Sequence[float]) -> float:
-    """
-    Calcule la distance de Wasserstein-1 (W_1) exacte entre deux échantillons
-    empiriques unidimensionnels de tailles quelconques (n_u, n_v >= 1).
-    """
-    u = np.sort(np.asarray(u_samples, dtype=np.float64).ravel())
-    v = np.sort(np.asarray(v_samples, dtype=np.float64).ravel())
-    if u.size == 0 or v.size == 0:
-        raise ValueError("Les échantillons doivent être non vides.")
-    if u.size == v.size:
-        return float(np.mean(np.abs(u - v)))
-
-    all_values = np.concatenate([u, v])
-    all_values.sort()
-    deltas = np.diff(all_values)
-    if deltas.size == 0:
-        return 0.0
-
-    cdf_u = np.searchsorted(u, all_values[:-1], side="right") / float(u.size)
-    cdf_v = np.searchsorted(v, all_values[:-1], side="right") / float(v.size)
-    return float(np.sum(np.abs(cdf_u - cdf_v) * deltas))
-
-
-def sliced_wasserstein_1(
-    U: np.ndarray,
-    V: np.ndarray,
-    n_projections: int = 32,
-    seed: int = 0,
-) -> float:
-    """
-    Distance de Wasserstein-1 projetée (Sliced Wasserstein-1) entre deux
-    nuages multivariés U in R^{n x d} et V in R^{m x d}.
-    """
-    arr_u = np.asarray(U, dtype=np.float64)
-    arr_v = np.asarray(V, dtype=np.float64)
-    if arr_u.ndim != 2 or arr_v.ndim != 2 or arr_u.shape[1] != arr_v.shape[1]:
-        raise ValueError("U et V doivent être des matrices 2D de même dimension d.")
-    if arr_u.shape[0] == 0 or arr_v.shape[0] == 0:
-        raise ValueError("Les échantillons U et V doivent être non vides.")
-
-    d = arr_u.shape[1]
-    rng = np.random.default_rng(seed)
-    dirs = rng.normal(0.0, 1.0, size=(n_projections, d))
-    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
-    dirs = dirs / np.maximum(norms, 1e-15)
-
-    proj_u = arr_u @ dirs.T
-    proj_v = arr_v @ dirs.T
-    total = 0.0
-    for p in range(n_projections):
-        total += wasserstein_1d(proj_u[:, p], proj_v[:, p])
-    return total / float(n_projections)
-
+# ============================================================
+# 14. ENERGY DISTANCE
+# ============================================================
 
 def energy_distance(
-    U: np.ndarray,
-    V: np.ndarray,
-    block_size: int = 128,
+    X: np.ndarray,
+    Y: np.ndarray,
 ) -> float:
+    r"""
+    Energy distance empirique entre deux distributions
+    multivariées.
     """
-    Distance d'énergie multivariée D_E(U, V) = sqrt(2 E||X - Y|| - E||X - X'|| - E||Y - Y'||),
-    calculée par blocs de taille `block_size` afin de borner strictement
-    l'empreinte mémoire à O(block_size * max(n, m) * d).
-    """
-    arr_u = np.asarray(U, dtype=np.float64)
-    arr_v = np.asarray(V, dtype=np.float64)
-    if arr_u.ndim != 2 or arr_v.ndim != 2 or arr_u.shape[1] != arr_v.shape[1]:
-        raise ValueError("U et V doivent être des matrices 2D de même dimension d.")
-    if arr_u.shape[0] < 2 or arr_v.shape[0] < 2:
-        raise ValueError("Au moins 2 échantillons requis dans U et V.")
-    if block_size < 1:
-        raise ValueError("block_size doit être >= 1.")
 
-    def _mean_cross_blocked(A: np.ndarray, B: np.ndarray) -> float:
-        n_a, n_b = A.shape[0], B.shape[0]
-        total = 0.0
-        for start in range(0, n_a, block_size):
-            end = min(start + block_size, n_a)
-            diff = A[start:end, None, :] - B[None, :, :]
-            total += float(np.sum(np.linalg.norm(diff, axis=-1)))
-        return total / float(n_a * n_b)
+    X = np.asarray(X, dtype=float)
+    Y = np.asarray(Y, dtype=float)
 
-    def _mean_within_blocked(A: np.ndarray) -> float:
-        n_a = A.shape[0]
-        total = 0.0
-        for start in range(0, n_a, block_size):
-            end = min(start + block_size, n_a)
-            diff = A[start:end, None, :] - A[None, :, :]
-            total += float(np.sum(np.linalg.norm(diff, axis=-1)))
-        return total / float(n_a * (n_a - 1))
+    if X.ndim != 2 or Y.ndim != 2:
+        raise ValueError(
+            "X et Y doivent être bidimensionnels."
+        )
 
-    e_xy = _mean_cross_blocked(arr_u, arr_v)
-    e_xx = _mean_within_blocked(arr_u)
-    e_yy = _mean_within_blocked(arr_v)
-    val = max(0.0, 2.0 * e_xy - e_xx - e_yy)
-    return float(np.sqrt(val))
+    if X.shape[0] == 0 or Y.shape[0] == 0:
+        raise ValueError(
+            "X et Y doivent contenir au moins un point."
+        )
+
+    if X.shape[1] != Y.shape[1]:
+        raise ValueError(
+            "Dimensions incompatibles entre X et Y."
+        )
+
+    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(Y)):
+        raise ValueError(
+            "X et Y doivent contenir des valeurs finies."
+        )
+
+    def mean_pairwise_dist(
+        A: np.ndarray,
+        B: np.ndarray,
+    ) -> float:
+
+        diffs = (
+            A[:, None, :]
+            - B[None, :, :]
+        )
+
+        return float(
+            np.mean(
+                np.linalg.norm(
+                    diffs,
+                    axis=-1,
+                )
+            )
+        )
+
+    cross = mean_pairwise_dist(X, Y)
+    within_x = mean_pairwise_dist(X, X)
+    within_y = mean_pairwise_dist(Y, Y)
+
+    squared_dist = (
+        2.0 * cross
+        - within_x
+        - within_y
+    )
+
+    return float(
+        sqrt(max(0.0, squared_dist))
+    )
