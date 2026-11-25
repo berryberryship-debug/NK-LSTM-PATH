@@ -7,7 +7,7 @@ Modélisation multi-échelle des paysages NK, des trajectoires adaptatives, des 
 - **Auteur :** Xioranne Lessard
 - **Projet :** Axiomes Base Labs
 - **Version :** 0.4 — Audit algébrique exact \(N=3\), audits numériques de non-commutativité \(N=6\), balayage de l'intensité de transport et audit de reproductibilité multi-graines.
-- **Statut :** Recherche exploratoire. L'audit algébrique à \(N=3\), le balayage numérique à \(N=6\) et l'audit multi-graines ont été exécutés. La dynamique jointe avec dissipation, la persistance temporelle de l'accessibilité et l'inférence LSTM restent à valider.
+- **Statut :** Recherche exploratoire. L'audit algébrique à \(N=3\), le balayage numérique à \(N=6\) et l'audit multi-graines ont été exécutés. Une suite de huit tests de validation de `trajectories.py` est implémentée. Son exécution complète reste à confirmer. La validation de la dynamique jointe, de la persistance temporelle de l'accessibilité et de l'inférence LSTM demeure ouverte.
 
 ---
 
@@ -374,11 +374,9 @@ où \(\gamma\) est le coefficient de dissipation.
 
 Cette évolution préserve la symétrie et la diagonale nulle lorsque \(J(t_0)\) et \(J^{(0)}\) respectent ces contraintes.
 
-#### 4. Méthode d'intégration stochastique envisagée
+#### 4. Méthode d'intégration stochastique
 
-Lorsque \(\lambda\neq0\), les taux peuvent varier continuellement entre deux mutations en raison de l'évolution de \(J(t)\).
-
-Une simulation par amincissement d'Ogata (*thinning*) est prévue.
+La simulation par amincissement d'Ogata (*thinning*) est implémentée dans le moteur de trajectoires. Un simulateur analytique par morceaux, `simulate_exact_piecewise_lambda0`, est également prévu comme contrôle lorsque \(\lambda=0\).
 
 Sous les conditions :
 
@@ -406,7 +404,9 @@ et donc :
 
 Cette borne fournit une intensité supérieure pour le processus de proposition utilisé par l'amincissement.
 
-La validation de l'intégration stochastique complète reste à effectuer, notamment pour vérifier la gestion des taux variables, des événements acceptés et de la relaxation entre événements.
+La suite de tests de `trajectories.py` contient notamment des vérifications de la borne d'intensité, de la dissipation analytique, du transport post-flip, de la conservation du risque intégré et de la comparaison en loi des deux simulateurs à \(\lambda=0\).
+
+La réussite de l'ensemble de ces tests doit être confirmée par leur exécution complète.
 
 ### D — Reconstruction temporelle par LSTM
 
@@ -1073,49 +1073,33 @@ Le rapprochement est strictement structurel : le chemin parcouru peut modifier l
 
 ## 9. Organisation du dépôt
 
-Arborescence cible du projet :
+L'arborescence ci-dessous reprend uniquement les chemins établis par les fichiers sources et les instructions d'importation effectivement transmis.
 
 ```text
 NK-LSTM-PATH/
 │
 ├── README.md
 │
-├── docs/
-│   ├── audit_courbure_N3.md
-│   ├── audit_robustesse_eta_N6.md
-│   └── audit_reproductibilite_multigraines_N6.md
-│
 ├── src/
 │   ├── fiber_bundle.py
-│   ├── config.py
-│   ├── nk_landscape.py
-│   ├── trajectories.py
-│   ├── datasets.py
-│   └── metrics.py
-│
-├── models/
-│   ├── baseline_state.py
-│   ├── baseline_history.py
-│   └── lstm_model.py
-│
-├── experiments/
-│   ├── experiment_01_nk.py
-│   ├── experiment_02_audit.py
-│   ├── balayage_commutateur_nk_v3.py
-│   ├── audit_robustesse_eta.py
-│   ├── audit_reproductibilite_graines.py
-│   └── controls.py
+│   └── trajectories.py
 │
 └── tests/
-    ├── test_curvature_N3.py
-    ├── test_nk.py
-    ├── test_leakage.py
-    └── test_integrable_transport.py
+    └── test_trajectories.py
 ```
 
-Cette arborescence est une cible d'organisation. Les chemins effectifs des fichiers devront être harmonisés lors de leur intégration au dépôt.
+### Fichiers dont l'emplacement reste à confirmer
 
-Les résultats expérimentaux doivent être accompagnés des versions exactes des scripts qui les produisent.
+Les noms suivants sont identifiés dans les imports, les commandes d'exécution ou les audits précédents. Leur position exacte dans le dépôt n'est pas établie par les extraits disponibles :
+
+- `nk_landscape.py`
+- `balayage_commutateur_nk_v3.py`
+- `audit_robustesse_eta.py`
+- `audit_reproductibilite_graines.py`
+
+Ils ne sont donc pas intégrés artificiellement à l'arborescence ci-dessus.
+
+Aucun dossier `docs/`, `models/` ou `experiments/` n'est présumé exister. L'arborescence sera complétée uniquement à partir de l'inventaire réel du dépôt.
 
 ---
 
@@ -1136,13 +1120,43 @@ Les résultats expérimentaux doivent être accompagnés des versions exactes de
 | Invariance géométrique sous variation de `nk_seed` | Observée et conforme à l'architecture du code |
 | Écart 80.0 % / 82.7 % sur \(\Delta w\neq0\) | À réconcilier |
 | Appariement exact des états initiaux entre les valeurs de \(\eta\) | À confirmer dans le code |
+| Suite de huit tests dans `tests/test_trajectories.py` | Implémentée ; exécution complète à confirmer |
+| Compatibilité des constructions `NKLandscape` dans le fichier de tests | À corriger ou à vérifier |
 | Contrôle de transport intégrable | À implémenter et tester |
-| Dynamique jointe avec dissipation | À exécuter et tester |
+| Dynamique jointe avec dissipation | Tests présents ; validation d'exécution à confirmer |
+| Validation du simulateur d'Ogata | Test prévu dans la suite ; réussite à confirmer |
+| Validation du simulateur exact par morceaux à \(\lambda=0\) | Test prévu dans la suite ; réussite à confirmer |
+| Conservation du risque intégré à travers un changement de masque | Test prévu dans la suite ; réussite à confirmer |
 | Persistance temporelle de \(D_J(t)\) | À tester |
 | Persistance temporelle de \(D_{\mathcal T}(t)\) | À tester |
 | Robustesse de l'accessibilité hors proximité du seuil | À tester |
 | Comparaison M1–M4 | À exécuter |
 | Généralisation à \(N=8\) et \(N=20\) | À exécuter |
+
+### Précision sur la suite de tests
+
+Le fichier `tests/test_trajectories.py` contient huit méthodes de test couvrant notamment :
+
+1. la borne supérieure des taux et l'invariance de \(\Delta F_k\) à \(\lambda=0\) ;
+2. la dissipation analytique et sa propriété de semi-groupe ;
+3. le transport post-flip et la dissipation des arêtes non incidentes ;
+4. le bilan détaillé de Metropolis, le silence sous le seuil et les lois élémentaires des événements ;
+5. la stabilité numérique du solveur quadratique ;
+6. la conservation du risque intégré à travers les changements du masque d'accessibilité ;
+7. la validation croisée en loi entre le simulateur d'Ogata et le simulateur exact par morceaux ;
+8. la sélection du canal lorsque le tirage uniforme vaut exactement zéro.
+
+Ces tests sont des validations implémentées, pas des résultats de test présumés réussis.
+
+Le fichier transmis comporte notamment trois appels de construction de la forme :
+
+```python
+traj.NKLandscape(n=..., k=..., seed=...)
+```
+
+Or, la classe `NKLandscape` dont la définition a été communiquée utilise les champs `n_spins`, `k_epistasis`, `neighbors` et `tables`, avec la méthode de génération `generate()`.
+
+Ces appels doivent être harmonisés avec cette interface avant de considérer le fichier de tests comme exécutable sans erreur.
 
 ---
 
@@ -1180,17 +1194,29 @@ Pour chaque expérience, enregistrer :
 
 L'appariement des réalisations initiales entre les valeurs de \(\eta\) doit être confirmé directement dans le code.
 
-### Étape 3 — Validation du contrôle intégrable
+### Étape 3 — Mise en conformité et exécution de la suite de tests
+
+Harmoniser les constructions de `NKLandscape` dans `tests/test_trajectories.py` avec l'interface réelle de la classe.
+
+Exécuter ensuite la suite complète et consigner :
+
+- les tests réussis ;
+- les tests échoués ;
+- les éventuelles erreurs d'interface ;
+- les tolérances numériques ;
+- les paramètres et graines utilisés.
+
+### Étape 4 — Validation du contrôle intégrable
 
 Implémenter le transport candidat, vérifier sa commutation par tests unitaires et comparer ses résultats à ceux du transport symétrique.
 
-### Étape 4 — Dynamique jointe et dissipation
+### Étape 5 — Dynamique jointe et dissipation
 
-Implémenter et tester le processus comprenant les mutations, le transport post-flip et la relaxation continue.
+Valider le processus comprenant les mutations, le transport post-flip et la relaxation continue.
 
 Contrôler la borne d'intensité utilisée par l'amincissement, la gestion des événements et la conservation des contraintes de la fibre.
 
-### Étape 5 — Persistance temporelle de la mémoire métrique et de l'accessibilité
+### Étape 6 — Persistance temporelle de la mémoire métrique et de l'accessibilité
 
 Suivre simultanément :
 
@@ -1203,11 +1229,11 @@ m_{k,B}(t)
 
 Distinguer les divergences transitoires produites par la proximité du seuil d'une éventuelle mémoire d'accessibilité dépendante de l'histoire.
 
-### Étape 6 — Reconstruction LSTM
+### Étape 7 — Reconstruction LSTM
 
 Construire les jeux de données temporels, entraîner M1–M4 et comparer leurs capacités de reconstruction et de prédiction sur des trajectoires et des paysages indépendants.
 
-### Étape 7 — Extension de l'échelle
+### Étape 8 — Extension de l'échelle
 
 Après validation des contrôles précédents, étendre progressivement les expériences à :
 
