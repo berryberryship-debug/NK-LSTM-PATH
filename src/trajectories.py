@@ -131,9 +131,10 @@ def _draw_unit_uniform(rng: Any) -> float:
 
 
 def _draw_exponential(rng: Any, rate: float) -> float:
-    """Tire un temps d'attente Exp(rate) à partir de `uniform(0.0, 1.0)`."""
+    """Tire un temps d'attente Exp(rate) via -ln(u1) / rate (u1 in (0, 1])."""
     u = _draw_unit_uniform(rng)
-    return float(-log(1.0 - u) / rate)
+    u_pos = max(u, np.finfo(np.float64).tiny)
+    return float(-log(u_pos) / rate)
 
 
 def _select_channel_from_rates(
@@ -152,7 +153,6 @@ def _select_channel_from_rates(
     if not np.isfinite(total_rate) or total_rate <= 0.0:
         raise ValueError("total_rate doit être strictement positif et fini.")
 
-    # Tirage directement dans l'intervalle des taux cumulés.
     if hasattr(rng, "uniform"):
         u2 = float(rng.uniform(0.0, total_rate))
     elif hasattr(rng, "random"):
@@ -163,11 +163,9 @@ def _select_channel_from_rates(
     if not np.isfinite(u2):
         raise ValueError("Le tirage du canal doit être fini.")
 
-    # Protection contre les éventuelles bornes numériques.
     u2 = min(max(u2, 0.0), np.nextafter(total_rate, 0.0))
     cumulative = np.cumsum(rates)
 
-    # side='right' écarte les canaux de taux nul lorsque u2 == 0.
     k = int(np.searchsorted(cumulative, u2, side="right"))
     if k >= rates.size:
         positive = np.flatnonzero(rates > 0.0)
@@ -728,11 +726,23 @@ def simulate_ogata_thinning(
             fnk_fn=fnk_fn,
         )
         total_rate = float(np.sum(rates))
-        acceptance = min(1.0, max(0.0, total_rate / majorant))
 
-        u_acc = _draw_unit_uniform(rng)
-        if total_rate > 0.0 and u_acc < acceptance:
-            k = _select_channel_from_rates(rng, rates, total_rate)
+        if hasattr(rng, "uniform"):
+            u2 = float(rng.uniform(0.0, majorant))
+        elif hasattr(rng, "random"):
+            u2 = float(rng.random()) * majorant
+        else:  # pragma: no cover
+            raise TypeError("rng doit exposer `uniform(0.0, majorant)` ou `random()`.")
+
+        u2 = min(max(u2, 0.0), np.nextafter(majorant, 0.0))
+
+        if total_rate > 0.0 and u2 < total_rate:
+            cumulative = np.cumsum(rates)
+            k = int(np.searchsorted(cumulative, u2, side="right"))
+            if k >= rates.size:
+                positive = np.flatnonzero(rates > 0.0)
+                k = int(positive[-1])
+
             X_after, J_after = mutate_postflip(
                 X,
                 J_candidate,
