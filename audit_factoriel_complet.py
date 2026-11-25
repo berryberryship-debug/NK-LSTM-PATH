@@ -1,42 +1,14 @@
-
 """
-audit_factoriel_complet.py
+analyse_hierarchique_factoriel.py
 Projet : NK-LSTM-PATH
 
-AUDIT FACTORIEL CROISÉ :
-    init_seed x nk_seed x eta
+ANALYSE HIÉRARCHIQUE POST-HOC AUTO-ADAPTATIVE SUR res_factoriel_22500.json
+(SANS NOUVELLE SIMULATION)
 
-Objectifs
----------
-1. Mesurer l'effet de eta.
-2. Mesurer la sensibilité aux configurations initiales.
-3. Mesurer la sensibilité aux paysages NK.
-4. Examiner descriptivement l'interaction init_seed x nk_seed.
-5. Exporter les résultats détaillés en JSON.
-
-Protocole par défaut
--------------------
-N = 6
-10 configurations initiales par init_seed
-5 graines initiales
-5 graines NK
-6 valeurs de eta
-15 paires non ordonnées par configuration.
-
-Nombre attendu :
-    5 x 5 x 6 x 10 x 15 = 22 500 comparaisons.
-
-Le même ensemble de configurations initiales est réutilisé
-pour tous les paysages NK et toutes les valeurs de eta associées
-à une même graine initiale.
-
-Le même paysage NK est réutilisé pour toutes les configurations
-initiales et toutes les valeurs de eta associées à une même
-graine NK.
-
-Les statistiques entre cellules sont descriptives.
-Les 22 500 comparaisons ne sont pas 22 500 réplications
-indépendantes.
+Détecte automatiquement le schéma JSON des résultats factoriels et réalise :
+- La vérification d'invariance structurelle de J et A vis-à-vis de nk_seed
+- Le modèle mixte croisé (init_seed & nk_seed aléatoires, eta fixe répété sur n = 25 unités)
+- L'estimation des pentes individuelles et de leur dispersion sur les 25 unités.
 """
 
 from __future__ import annotations
@@ -44,1026 +16,458 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-
-from balayage_commutateur_nk_v3 import (
-    ExperimentConfig,
-    build_transition_adapter,
-    sample_binary_symmetric_states,
-    sweep_symmetric_order,
-    validate_config,
-)
-
-from trajectories import NKLandscape
+from scipy import stats
 
 
-# ================================================================
-# 1. PARAMÈTRES PAR DÉFAUT
-# ================================================================
+METRIC_ALIASES: Dict[str, List[str]] = {
+    "mean_gap_fro": ["mean_gap_fro", "mean_non_commut_gap_fro", "mean_J_gap", "gap_mean"],
+    "max_gap_fro": ["max_gap_fro", "max_non_commut_gap_fro", "max_J_gap", "gap_max"],
+    "mean_delta_A": ["mean_delta_A", "mean_delta_A_norm", "delta_A_mean"],
+    "max_delta_A": ["max_delta_A", "max_delta_A_norm", "delta_A_max"],
+    "mean_delta_w": ["mean_delta_w", "mean_delta_w_norm", "delta_w_mean"],
+    "max_delta_w": ["max_delta_w", "max_delta_w_norm", "delta_w_max"],
+    "frac_nonzero_delta_w": [
+        "frac_nonzero_delta_w",
+        "frac_dw_nonzero",
+        "dw_nonzero_frac",
+        "dw_nonzero_pct",
+    ],
+    "total_crossings": [
+        "total_crossings",
+        "total_threshold_crossings",
+        "crossings",
+        "mask_disagreements",
+    ],
+}
 
-DEFAULT_ETA_GRID = [0.0, 0.05, 0.1, 0.25, 0.5, 1.0]
-
-DEFAULT_INIT_SEEDS = [7, 13, 21, 42, 99]
-DEFAULT_NK_SEEDS = [7, 13, 21, 42, 99]
-
-DEFAULT_N_SITES = 6
-DEFAULT_N_INITIAL_STATES = 10
-DEFAULT_SCALE_J = 0.2
-
-DEFAULT_MU = 1.0
-DEFAULT_BETA = 1.0
-DEFAULT_THETA_A = 0.1
-DEFAULT_LAM = 0.5
-DEFAULT_NK_K = 3
-
-
-# ================================================================
-# 2. VALIDATION DES LISTES
-# ================================================================
-
-def parse_float_list(raw: str, name: str) -> list[float]:
-    """Convertit une liste de réels séparés par virgules ou espaces."""
-
-    tokens = raw.replace(";", " ").replace(",", " ").split()
-
-    if not tokens:
-        raise ValueError(f"{name} ne peut pas être vide.")
-
-    values = []
-
-    for token in tokens:
-        try:
-            value = float(token)
-        except ValueError as exc:
-            raise ValueError(
-                f"Valeur invalide dans {name} : {token}"
-            ) from exc
-
-        if not np.isfinite(value):
-            raise ValueError(
-                f"Valeur non finie dans {name} : {token}"
-            )
-
-        if value in values:
-            raise ValueError(
-                f"Valeur dupliquée dans {name} : {value}"
-            )
-
-        values.append(value)
-
-    return values
+INIT_SEED_KEYS = ["init_seed", "random_seed", "seed_init", "init"]
+NK_SEED_KEYS = ["nk_seed", "seed_nk", "nk"]
+ETA_KEYS = ["eta", "eta_val", "eta_value"]
 
 
-def parse_seed_list(raw: str, name: str) -> list[int]:
-    """Convertit et valide une liste de graines entières."""
-
-    tokens = raw.replace(";", " ").replace(",", " ").split()
-
-    if not tokens:
-        raise ValueError(f"{name} ne peut pas être vide.")
-
-    values = []
-
-    for token in tokens:
-        try:
-            value = int(token)
-        except ValueError as exc:
-            raise ValueError(
-                f"Graine invalide dans {name} : {token}"
-            ) from exc
-
-        if value < 0:
-            raise ValueError(
-                f"Les graines doivent être >= 0 : {value}"
-            )
-
-        if value in values:
-            raise ValueError(
-                f"Graine dupliquée dans {name} : {value}"
-            )
-
-        values.append(value)
-
-    return values
+def _find_first_key(mapping: Dict[str, Any], candidates: List[str]) -> Optional[str]:
+    for key in candidates:
+        if key in mapping:
+            return key
+    lower_map = {k.lower(): k for k in mapping.keys()}
+    for key in candidates:
+        if key.lower() in lower_map:
+            return lower_map[key.lower()]
+    return None
 
 
-def validate_global_parameters(args: argparse.Namespace) -> None:
-    """Valide les paramètres communs avant la génération des données."""
+def _extract_cell_records(payload: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Extrait la liste des cellules factorielles et un dictionnaire de métadonnées."""
+    meta: Dict[str, Any] = {}
+    if isinstance(payload, list):
+        if payload and all(isinstance(item, dict) for item in payload):
+            return payload, meta
+        raise ValueError("La liste JSON racine ne contient pas de dictionnaires de cellules.")
 
-    integer_values = {
-        "n_sites": args.n_sites,
-        "n_initial_states": args.n_initial_states,
-        "nk_K": args.nk_K,
-    }
+    if not isinstance(payload, dict):
+        raise ValueError("Format JSON racine non reconnu.")
 
-    for name, value in integer_values.items():
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"{name} doit être un entier.")
+    for k, v in payload.items():
+        if isinstance(v, dict):
+            meta[k] = v
+        elif not isinstance(v, list):
+            meta[k] = v
 
-    if args.n_sites < 2:
-        raise ValueError("n_sites doit être >= 2.")
+    for preferred in ("cells", "results", "records", "data", "entries", "rows", "factorial_cells"):
+        val = payload.get(preferred)
+        if isinstance(val, list) and val and all(isinstance(item, dict) for item in val):
+            return val, meta
 
-    if args.n_initial_states < 1:
-        raise ValueError("n_initial_states doit être >= 1.")
+    for k, v in payload.items():
+        if isinstance(v, list) and v and all(isinstance(item, dict) for item in v):
+            return v, meta
 
-    if not (0 <= args.nk_K < args.n_sites):
-        raise ValueError("nk_K doit vérifier 0 <= K < N.")
-
-    real_values = {
-        "scale_J": args.scale_J,
-        "mu": args.mu,
-        "beta": args.beta,
-        "theta_A": args.theta_A,
-        "lam": args.lam,
-    }
-
-    for name, value in real_values.items():
-        if not np.isfinite(value):
-            raise ValueError(f"{name} doit être fini.")
-
-    if args.scale_J < 0.0:
-        raise ValueError("scale_J doit être >= 0.")
-
-    if args.mu < 0.0:
-        raise ValueError("mu doit être >= 0.")
+    raise ValueError(
+        f"Impossible de localiser une liste de cellules dans les clés JSON : {list(payload.keys())}"
+    )
 
 
-# ================================================================
-# 3. ARGUMENTS DE LIGNE DE COMMANDE
-# ================================================================
+def _extract_grid_from_meta(
+    meta: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+    key_candidates: List[str],
+    list_candidates: List[str],
+    cast_fn: Any,
+) -> List[Any]:
+    for container in [meta] + [v for v in meta.values() if isinstance(v, dict)]:
+        if not isinstance(container, dict):
+            continue
+        found_list_key = _find_first_key(container, list_candidates)
+        if found_list_key and isinstance(container[found_list_key], list) and container[found_list_key]:
+            return [cast_fn(x) for x in container[found_list_key]]
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Audit factoriel croisé NK-LSTM-PATH : "
-            "init_seed x nk_seed x eta."
+    cell_key = _find_first_key(cells[0], key_candidates)
+    if cell_key is None:
+        raise ValueError(f"Clé introuvable parmi {key_candidates} dans les cellules : {list(cells[0].keys())}")
+
+    unique_vals: List[Any] = []
+    for c in cells:
+        val = cast_fn(c[cell_key])
+        if not any(
+            (val == existing) or (isinstance(val, float) and isinstance(existing, float) and np.isclose(val, existing))
+            for existing in unique_vals
+        ):
+            unique_vals.append(val)
+
+    unique_vals.sort()
+    return unique_vals
+
+
+def _resolve_metric_value(cell: Dict[str, Any], canonical_name: str, aliases: List[str]) -> float:
+    key = _find_first_key(cell, aliases)
+    if key is None:
+        raise KeyError(
+            f"Métrique '{canonical_name}' introuvable (cherché : {aliases}) dans : {list(cell.keys())}"
         )
-    )
-
-    parser.add_argument(
-        "--non-interactive",
-        action="store_true",
-        help="Exécute avec les paramètres fournis ou les valeurs par défaut.",
-    )
-
-    parser.add_argument(
-        "--eta-grid",
-        type=str,
-        default="0,0.05,0.1,0.25,0.5,1.0",
-    )
-
-    parser.add_argument(
-        "--init-seeds",
-        type=str,
-        default="7,13,21,42,99",
-    )
-
-    parser.add_argument(
-        "--nk-seeds",
-        type=str,
-        default="7,13,21,42,99",
-    )
-
-    parser.add_argument("--n-sites", type=int, default=DEFAULT_N_SITES)
-    parser.add_argument(
-        "--n-initial-states",
-        type=int,
-        default=DEFAULT_N_INITIAL_STATES,
-    )
-    parser.add_argument("--scale-J", type=float, default=DEFAULT_SCALE_J)
-
-    parser.add_argument("--mu", type=float, default=DEFAULT_MU)
-    parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
-    parser.add_argument("--theta-A", type=float, default=DEFAULT_THETA_A)
-    parser.add_argument("--lam", type=float, default=DEFAULT_LAM)
-    parser.add_argument("--nk-K", type=int, default=DEFAULT_NK_K)
-
-    parser.add_argument(
-        "--json-out",
-        type=str,
-        default=None,
-        help="Chemin d'export JSON des résultats.",
-    )
-
-    return parser.parse_args()
+    val = float(cell[key])
+    if canonical_name == "frac_nonzero_delta_w" and "pct" in key.lower() and val > 1.0:
+        val = val / 100.0
+    return val
 
 
-# ================================================================
-# 4. CONFIGURATION EXPÉRIMENTALE
-# ================================================================
+def load_factorial_tensor(
+    json_path: str | Path,
+) -> Tuple[Dict[str, Any], List[int], List[int], List[float], Dict[str, np.ndarray]]:
+    raw_obj = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    cells, meta = _extract_cell_records(raw_obj)
 
-def make_config(
-    args: argparse.Namespace,
-    init_seed: int,
-    nk_seed: int,
-    eta: float,
-) -> ExperimentConfig:
-    """Construit une configuration validée pour une cellule factorielle."""
-
-    cfg = ExperimentConfig(
-        n_sites=args.n_sites,
-        n_seeds=args.n_initial_states,
-        random_seed=init_seed,
-        scale_J=args.scale_J,
-
-        eta=eta,
-        mu=args.mu,
-        beta=args.beta,
-        theta_A=args.theta_A,
-        lam=args.lam,
-
-        nk_K=args.nk_K,
-        nk_seed=nk_seed,
-    )
-
-    validate_config(cfg)
-
-    return cfg
-
-
-# ================================================================
-# 5. INVARIANTS STRUCTURELS
-# ================================================================
-
-def validate_summary(
-    summary: Any,
-    cfg: ExperimentConfig,
-    expected_comparisons: int,
-) -> None:
-    """Vérifie les invariants algorithmiques de chaque cellule."""
-
-    if summary.n_samples != expected_comparisons:
-        raise RuntimeError(
-            f"Nombre de comparaisons incorrect : "
-            f"{summary.n_samples}, attendu : {expected_comparisons}."
+    init_seeds = [
+        int(x)
+        for x in _extract_grid_from_meta(
+            meta, cells, INIT_SEED_KEYS, ["init_seeds", "random_seeds", "seeds_init"], int
         )
-
-    if summary.frac_same_X_endpoint != 1.0:
-        raise RuntimeError(
-            "Les deux ordres ne produisent pas le même état X final."
+    ]
+    nk_seeds = [
+        int(x)
+        for x in _extract_grid_from_meta(
+            meta, cells, NK_SEED_KEYS, ["nk_seeds", "seeds_nk"], int
         )
-
-    metrics = [
-        summary.mean_non_commut_gap_fro,
-        summary.max_non_commut_gap_fro,
-        summary.max_symmetry_error,
-        summary.max_diagonal_error,
-        summary.mean_delta_A_norm,
-        summary.max_delta_A_norm,
-        summary.mean_delta_w_norm,
-        summary.max_delta_w_norm,
-        summary.frac_nonzero_delta_w,
+    ]
+    eta_values = [
+        float(x)
+        for x in _extract_grid_from_meta(
+            meta, cells, ETA_KEYS, ["eta_values", "etas", "eta_grid"], float
+        )
     ]
 
-    if not np.all(np.isfinite(metrics)):
-        raise RuntimeError("Une métrique contient NaN ou infini.")
+    init_key = _find_first_key(cells[0], INIT_SEED_KEYS)
+    nk_key = _find_first_key(cells[0], NK_SEED_KEYS)
+    eta_key = _find_first_key(cells[0], ETA_KEYS)
+    assert init_key is not None and nk_key is not None and eta_key is not None
 
-    tolerance = max(
-        1e-12,
-        10.0 * cfg.rtol,
-        10.0 * cfg.atol,
-    )
+    n_i, n_k, n_e = len(init_seeds), len(nk_seeds), len(eta_values)
+    idx_i = {s: idx for idx, s in enumerate(init_seeds)}
+    idx_k = {s: idx for idx, s in enumerate(nk_seeds)}
 
-    if summary.max_symmetry_error > tolerance:
-        raise RuntimeError("La symétrie de J n'est pas conservée.")
-
-    if summary.max_diagonal_error > tolerance:
-        raise RuntimeError("La diagonale de J n'est pas nulle.")
-
-    # Contrôle analytique du cas eta = 0.
-    if cfg.eta == 0.0:
-
-        zero_metrics = [
-            summary.mean_non_commut_gap_fro,
-            summary.max_non_commut_gap_fro,
-            summary.mean_delta_A_norm,
-            summary.max_delta_A_norm,
-            summary.mean_delta_w_norm,
-            summary.max_delta_w_norm,
-        ]
-
-        if any(abs(float(value)) > tolerance for value in zero_metrics):
-            raise RuntimeError(
-                "Invariant eta=0 violé : les deux ordres devraient "
-                "produire des états complets identiques."
-            )
-
-        if summary.frac_same_full_endpoint_exact != 1.0:
-            raise RuntimeError(
-                "Les états complets ne sont pas identiques à eta=0."
-            )
-
-        if summary.total_threshold_crossings != 0:
-            raise RuntimeError(
-                "Désaccord de masque actif détecté à eta=0."
-            )
-
-
-# ================================================================
-# 6. CONSTRUCTION D'UNE CELLULE FACTORIELLE
-# ================================================================
-
-def run_factorial_cell(
-    args: argparse.Namespace,
-    initial_states: list[tuple[np.ndarray, np.ndarray]],
-    landscape: NKLandscape,
-    init_seed: int,
-    nk_seed: int,
-    eta: float,
-    expected_comparisons: int,
-) -> dict:
-    """
-    Exécute une cellule :
-
-        (init_seed, nk_seed, eta)
-
-    Les états initiaux et le paysage NK sont déjà construits
-    et réutilisés pour les autres cellules.
-    """
-
-    cfg = make_config(
-        args=args,
-        init_seed=init_seed,
-        nk_seed=nk_seed,
-        eta=eta,
-    )
-
-    if landscape.N != args.n_sites:
-        raise RuntimeError("Dimension incorrecte du paysage NK.")
-
-    if landscape.K != args.nk_K:
-        raise RuntimeError("Valeur K incorrecte du paysage NK.")
-
-    # Transmission de l'instance :
-    # le calcul incrémental delta_fitness_flip reste accessible.
-    adapter = build_transition_adapter(
-        cfg,
-        fnk_fn=landscape,
-    )
-
-    summary = sweep_symmetric_order(
-        initial_states=initial_states,
-        eta=cfg.eta,
-        transition_fn=adapter,
-        theta_A=cfg.theta_A,
-        unordered_pairs_only=cfg.unordered_pairs_only,
-        tol_w=cfg.tol_w,
-        rtol=cfg.rtol,
-        atol=cfg.atol,
-    )
-
-    validate_summary(
-        summary=summary,
-        cfg=cfg,
-        expected_comparisons=expected_comparisons,
-    )
-
-    denominator = summary.n_samples * args.n_sites
-
-    return {
-        "init_seed": int(init_seed),
-        "nk_seed": int(nk_seed),
-        "eta": float(eta),
-
-        "n_samples": int(summary.n_samples),
-
-        "mean_gap_fro": float(summary.mean_non_commut_gap_fro),
-        "max_gap_fro": float(summary.max_non_commut_gap_fro),
-
-        "max_symmetry_error": float(summary.max_symmetry_error),
-        "max_diagonal_error": float(summary.max_diagonal_error),
-
-        "frac_same_X": float(summary.frac_same_X_endpoint),
-        "frac_same_full_exact": float(
-            summary.frac_same_full_endpoint_exact
-        ),
-        "frac_same_full_close": float(
-            summary.frac_same_full_endpoint_close
-        ),
-
-        "mean_delta_A": float(summary.mean_delta_A_norm),
-        "max_delta_A": float(summary.max_delta_A_norm),
-
-        "mean_delta_w": float(summary.mean_delta_w_norm),
-        "max_delta_w": float(summary.max_delta_w_norm),
-
-        "frac_nonzero_delta_w": float(
-            summary.frac_nonzero_delta_w
-        ),
-
-        "active_mask_disagreements": int(
-            summary.total_threshold_crossings
-        ),
-
-        "active_mask_disagreements_pct": float(
-            100.0 * summary.total_threshold_crossings / denominator
-        ),
+    tensors = {
+        m: np.full((n_i, n_k, n_e), np.nan, dtype=np.float64) for m in METRIC_ALIASES
     }
 
-
-# ================================================================
-# 7. AGRÉGATION DES CELLULES
-# ================================================================
-
-METRICS = (
-    "mean_gap_fro",
-    "max_gap_fro",
-    "mean_delta_A",
-    "mean_delta_w",
-    "frac_nonzero_delta_w",
-    "active_mask_disagreements_pct",
-)
-
-
-def mean_sd(values: list[float]) -> dict:
-    """Moyenne et écart-type descriptifs d'une série de cellules."""
-
-    array = np.asarray(values, dtype=np.float64)
-
-    if array.size == 0 or not np.all(np.isfinite(array)):
-        raise ValueError("Série vide ou non finie dans l'agrégation.")
-
-    return {
-        "mean": float(np.mean(array)),
-        "sd": float(np.std(array, ddof=1)) if array.size > 1 else 0.0,
-    }
-
-
-def aggregate_by_factor(
-    rows: list[dict],
-    factor: str,
-    levels: list,
-) -> list[dict]:
-    """
-    Agrège les cellules selon un facteur en moyennant
-    sur tous les niveaux des autres facteurs.
-    """
-
-    output = []
-
-    for level in levels:
-        group = [row for row in rows if row[factor] == level]
-
-        if not group:
-            raise RuntimeError(
-                f"Aucune cellule trouvée pour {factor}={level}."
-            )
-
-        record = {
-            factor: level,
-            "n_cells": len(group),
-        }
-
-        for metric in METRICS:
-            record[metric] = mean_sd(
-                [float(row[metric]) for row in group]
-            )
-
-        output.append(record)
-
-    return output
-
-
-def calculate_init_nk_interactions(
-    rows: list[dict],
-    eta_grid: list[float],
-    init_seeds: list[int],
-    nk_seeds: list[int],
-) -> list[dict]:
-    """
-    Calcule un résidu d'interaction descriptif init_seed x nk_seed.
-
-    Pour chaque eta et chaque métrique :
-
-        R_ij = Y_ij - moyenne_ligne_i - moyenne_colonne_j + moyenne_globale
-
-    RMS(R) et max(abs(R)) décrivent l'écart au modèle additif
-    à deux facteurs.
-
-    Ces statistiques ne constituent pas, à elles seules,
-    un test statistique d'interaction.
-    """
-
-    output = []
-
-    for eta in eta_grid:
-        eta_rows = [row for row in rows if row["eta"] == eta]
-
-        if len(eta_rows) != len(init_seeds) * len(nk_seeds):
-            raise RuntimeError(
-                f"Cellules manquantes pour eta={eta}."
-            )
-
-        item = {"eta": float(eta)}
-
-        for metric in ("mean_gap_fro", "mean_delta_A", "mean_delta_w"):
-            matrix = np.empty(
-                (len(init_seeds), len(nk_seeds)),
-                dtype=np.float64,
-            )
-
-            for i, init_seed in enumerate(init_seeds):
-                for j, nk_seed in enumerate(nk_seeds):
-                    matches = [
-                        row for row in eta_rows
-                        if row["init_seed"] == init_seed
-                        and row["nk_seed"] == nk_seed
-                    ]
-
-                    if len(matches) != 1:
-                        raise RuntimeError(
-                            "Cellule factorielle manquante ou dupliquée : "
-                            f"init={init_seed}, NK={nk_seed}, eta={eta}."
-                        )
-
-                    matrix[i, j] = matches[0][metric]
-
-            residual = (
-                matrix
-                - np.mean(matrix, axis=1, keepdims=True)
-                - np.mean(matrix, axis=0, keepdims=True)
-                + np.mean(matrix)
-            )
-
-            item[f"{metric}_interaction_rms"] = float(
-                np.sqrt(np.mean(residual ** 2))
-            )
-
-            item[f"{metric}_interaction_max_abs"] = float(
-                np.max(np.abs(residual))
-            )
-
-        output.append(item)
-
-    return output
-
-
-# ================================================================
-# 8. AFFICHAGE
-# ================================================================
-
-def print_eta_summary(rows: list[dict]) -> None:
-    """Affiche les effets descriptifs selon eta."""
-
-    print()
-    print("=" * 150)
-    print("SYNTHÈSE PAR ETA — MOYENNE ± ÉCART-TYPE ENTRE CELLULES DE GRAINES")
-    print("=" * 150)
-
-    print(
-        f"{'eta':>7} | {'Cellules':>8} | "
-        f"{'Gap J':>23} | {'Delta A':>23} | "
-        f"{'Delta w':>23} | {'Paires Δw != 0':>17} | "
-        f"{'Désaccords (%)':>17}"
-    )
-    print("-" * 150)
-
-    for row in rows:
-        gap = row["mean_gap_fro"]
-        delta_a = row["mean_delta_A"]
-        delta_w = row["mean_delta_w"]
-        nonzero = row["frac_nonzero_delta_w"]
-        masks = row["active_mask_disagreements_pct"]
-
-        print(
-            f"{row['eta']:7.3g} | "
-            f"{row['n_cells']:8d} | "
-            f"{gap['mean']:.5e} ± {gap['sd']:.2e} | "
-            f"{delta_a['mean']:.5e} ± {delta_a['sd']:.2e} | "
-            f"{delta_w['mean']:.5e} ± {delta_w['sd']:.2e} | "
-            f"{100.0 * nonzero['mean']:7.2f}% ± {100.0 * nonzero['sd']:.2f}% | "
-            f"{masks['mean']:7.2f} ± {masks['sd']:.2f}"
-        )
-
-    print("=" * 150)
-
-
-def print_seed_summary(
-    title: str,
-    rows: list[dict],
-    factor: str,
-) -> None:
-    """Affiche les effets marginaux descriptifs d'une graine."""
-
-    print()
-    print("=" * 126)
-    print(title)
-    print("=" * 126)
-
-    print(
-        f"{factor:>10} | {'Cellules':>8} | "
-        f"{'Gap J':>22} | {'Delta A':>22} | "
-        f"{'Delta w':>22} | {'Désaccords (%)':>18}"
-    )
-    print("-" * 126)
-
-    for row in rows:
-        gap = row["mean_gap_fro"]
-        delta_a = row["mean_delta_A"]
-        delta_w = row["mean_delta_w"]
-        masks = row["active_mask_disagreements_pct"]
-
-        print(
-            f"{row[factor]:10d} | "
-            f"{row['n_cells']:8d} | "
-            f"{gap['mean']:.5e} ± {gap['sd']:.2e} | "
-            f"{delta_a['mean']:.5e} ± {delta_a['sd']:.2e} | "
-            f"{delta_w['mean']:.5e} ± {delta_w['sd']:.2e} | "
-            f"{masks['mean']:8.2f} ± {masks['sd']:.2f}"
-        )
-
-    print("=" * 126)
-
-
-def print_interaction_summary(rows: list[dict]) -> None:
-    """Affiche les résidus d'interaction init x NK."""
-
-    print()
-    print("=" * 110)
-    print("INTERACTION DESCRIPTIVE init_seed x nk_seed")
-    print("RMS des résidus après retrait des effets additifs des deux facteurs")
-    print("=" * 110)
-
-    print(
-        f"{'eta':>7} | {'RMS interaction Gap J':>24} | "
-        f"{'RMS interaction Delta A':>25} | "
-        f"{'RMS interaction Delta w':>25}"
-    )
-    print("-" * 110)
-
-    for row in rows:
-        print(
-            f"{row['eta']:7.3g} | "
-            f"{row['mean_gap_fro_interaction_rms']:24.5e} | "
-            f"{row['mean_delta_A_interaction_rms']:25.5e} | "
-            f"{row['mean_delta_w_interaction_rms']:25.5e}"
-        )
-
-    print("=" * 110)
-
-
-# ================================================================
-# 9. EXPORT JSON
-# ================================================================
-
-def export_json(
-    output_path: str,
-    metadata: dict,
-    cells: list[dict],
-    by_eta: list[dict],
-    by_init_seed: list[dict],
-    by_nk_seed: list[dict],
-    interactions: list[dict],
-) -> None:
-    """Exporte les données détaillées et les agrégations."""
-
-    path = Path(output_path)
-
-    if path.suffix.lower() != ".json":
-        raise ValueError("Le fichier de sortie doit porter l'extension .json.")
-
-    if path.parent != Path("."):
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "project": "NK-LSTM-PATH",
-        "audit": "factoriel_complet",
-        "metadata": metadata,
-        "number_of_cells": len(cells),
-        "number_of_pair_comparisons": int(
-            sum(row["n_samples"] for row in cells)
-        ),
-        "interpretation": {
-            "statistics": "Descriptives, non assimilables à des tests d'inférence.",
-            "pair_comparisons": (
-                "Les comparaisons de mutations sont regroupées dans des cellules "
-                "de graines et ne sont pas toutes indépendantes."
-            ),
-            "mask_disagreements": (
-                "Désaccords entre les masques d'accessibilité finaux, "
-                "pas des franchissements temporels."
-            ),
-            "interaction": (
-                "Résidu descriptif du modèle additif init_seed + nk_seed."
-            ),
-        },
-        "cells": cells,
-        "summary_by_eta": by_eta,
-        "summary_by_init_seed": by_init_seed,
-        "summary_by_nk_seed": by_nk_seed,
-        "init_nk_interactions_by_eta": interactions,
-    }
-
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False),
-        encoding="utf-8",
-    )
-
-    print()
-    print(f"Export JSON enregistré : {path.resolve()}")
-
-
-# ================================================================
-# 10. AUDIT FACTORIEL COMPLET
-# ================================================================
-
-def run_factorial_audit(args: argparse.Namespace) -> dict:
-    """Exécute les 25 x 6 cellules du plan factoriel."""
-
-    validate_global_parameters(args)
-
-    eta_grid = parse_float_list(args.eta_grid, "eta_grid")
-    init_seeds = parse_seed_list(args.init_seeds, "init_seeds")
-    nk_seeds = parse_seed_list(args.nk_seeds, "nk_seeds")
-
-    if len(init_seeds) < 2:
-        raise ValueError("Au moins deux graines initiales sont nécessaires.")
-
-    if len(nk_seeds) < 2:
-        raise ValueError("Au moins deux graines NK sont nécessaires.")
-
-    n_sites = args.n_sites
-    n_initial_states = args.n_initial_states
-
-    if n_sites >= 2:
-        pairs_per_state = n_sites * (n_sites - 1) // 2
-    else:
-        raise ValueError("N doit être >= 2.")
-
-    # ------------------------------------------------------------
-    # Génération unique des configurations initiales
-    # ------------------------------------------------------------
-
-    print()
-    print("=" * 100)
-    print("NK-LSTM-PATH — AUDIT FACTORIEL COMPLET")
-    print("=" * 100)
-
-    print(f"N                              : {n_sites}")
-    print(f"Configurations par init_seed   : {n_initial_states}")
-    print(f"Échelle initiale de J          : {args.scale_J}")
-    print(f"Graines initiales              : {init_seeds}")
-    print(f"Graines NK                     : {nk_seeds}")
-    print(f"Grille eta                     : {eta_grid}")
-    print(f"mu                             : {args.mu}")
-    print(f"beta                           : {args.beta}")
-    print(f"theta_A                        : {args.theta_A}")
-    print(f"lambda                         : {args.lam}")
-    print(f"K                              : {args.nk_K}")
-
-    initial_states_by_seed = {}
-
-    print()
-    print("Génération des configurations initiales...")
-
-    for seed in init_seeds:
-        rng = np.random.default_rng(seed)
-
-        states = sample_binary_symmetric_states(
-            n_sites=n_sites,
-            n_seeds=n_initial_states,
-            rng=rng,
-            scale=args.scale_J,
-        )
-
-        if len(states) != n_initial_states:
-            raise RuntimeError(
-                f"Génération incomplète pour init_seed={seed}."
-            )
-
-        initial_states_by_seed[seed] = states
-
-    # ------------------------------------------------------------
-    # Génération unique des paysages NK
-    # ------------------------------------------------------------
-
-    print("Génération des paysages NK...")
-
-    landscapes_by_seed = {}
-
-    for seed in nk_seeds:
-        landscape = NKLandscape(
-            N=n_sites,
-            K=args.nk_K,
-            seed=seed,
-        )
-
-        landscapes_by_seed[seed] = landscape
-
-    # ------------------------------------------------------------
-    # Taille du plan factoriel
-    # ------------------------------------------------------------
-
-    unordered_only = True
-    comparisons_per_cell = n_initial_states * pairs_per_state
-
-    n_cells = (
-        len(init_seeds)
-        * len(nk_seeds)
-        * len(eta_grid)
-    )
-
-    expected_total = n_cells * comparisons_per_cell
-
-    print()
-    print("STRUCTURE DU PLAN")
-    print(f"Cellules factorielles             : {n_cells}")
-    print(f"Comparaisons par cellule          : {comparisons_per_cell}")
-    print(f"Comparaisons totales attendues    : {expected_total}")
-    print()
-
-    # ------------------------------------------------------------
-    # Boucle factorielle
-    # ------------------------------------------------------------
-
-    cells = []
-    cell_index = 0
-
-    for init_seed in init_seeds:
-        initial_states = initial_states_by_seed[init_seed]
-
-        for nk_seed in nk_seeds:
-            landscape = landscapes_by_seed[nk_seed]
-
-            for eta in eta_grid:
-                cell_index += 1
-
-                print(
-                    f"[CELL {cell_index}/{n_cells}] "
-                    f"init_seed={init_seed}, "
-                    f"nk_seed={nk_seed}, "
-                    f"eta={eta:g}"
-                )
-
-                cell = run_factorial_cell(
-                    args=args,
-                    initial_states=initial_states,
-                    landscape=landscape,
-                    init_seed=init_seed,
-                    nk_seed=nk_seed,
-                    eta=eta,
-                    expected_comparisons=comparisons_per_cell,
-                )
-
-                cells.append(cell)
-
-    # ------------------------------------------------------------
-    # Vérification globale du nombre de comparaisons
-    # ------------------------------------------------------------
-
-    actual_total = sum(
-        row["n_samples"] for row in cells
-    )
-
-    if len(cells) != n_cells:
-        raise RuntimeError(
-            f"Nombre de cellules incorrect : {len(cells)} != {n_cells}."
-        )
-
-    if actual_total != expected_total:
-        raise RuntimeError(
-            f"Nombre total incorrect : {actual_total} != {expected_total}."
-        )
-
-    # ------------------------------------------------------------
-    # Agrégations équilibrées
-    # ------------------------------------------------------------
-
-    by_eta = aggregate_by_factor(
-        cells,
-        factor="eta",
-        levels=eta_grid,
-    )
-
-    by_init_seed = aggregate_by_factor(
-        cells,
-        factor="init_seed",
-        levels=init_seeds,
-    )
-
-    by_nk_seed = aggregate_by_factor(
-        cells,
-        factor="nk_seed",
-        levels=nk_seeds,
-    )
-
-    interactions = calculate_init_nk_interactions(
-        rows=cells,
-        eta_grid=eta_grid,
-        init_seeds=init_seeds,
-        nk_seeds=nk_seeds,
-    )
-
-    # ------------------------------------------------------------
-    # Métadonnées
-    # ------------------------------------------------------------
-
-    metadata = {
-        "n_sites": n_sites,
-        "n_initial_states_per_init_seed": n_initial_states,
-        "scale_J": float(args.scale_J),
-
+    for c in cells:
+        i = idx_i[int(c[init_key])]
+        k = idx_k[int(c[nk_key])]
+        c_eta = float(c[eta_key])
+        e_matches = [idx for idx, val in enumerate(eta_values) if np.isclose(val, c_eta)]
+        if len(e_matches) != 1:
+            raise ValueError(f"Ambiguïté ou valeur absente sur eta={c_eta} dans {eta_values}")
+        e = e_matches[0]
+
+        for canonical_name, aliases in METRIC_ALIASES.items():
+            tensors[canonical_name][i, k, e] = _resolve_metric_value(c, canonical_name, aliases)
+
+    for m, arr in tensors.items():
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"Valeurs manquantes ou non finies dans le tenseur '{m}'.")
+
+    design_info = {
+        "n_init_seeds": n_i,
+        "n_nk_seeds": n_k,
+        "n_eta_values": n_e,
+        "n_units": n_i * n_k,
         "init_seeds": init_seeds,
         "nk_seeds": nk_seeds,
-        "eta_grid": eta_grid,
+        "eta_values": eta_values,
+        "meta_detected": meta,
+    }
+    return design_info, init_seeds, nk_seeds, eta_values, tensors
 
-        "mu": float(args.mu),
-        "beta": float(args.beta),
-        "theta_A": float(args.theta_A),
-        "lam": float(args.lam),
-        "nk_K": int(args.nk_K),
 
-        "pairs_per_state": int(pairs_per_state),
-        "comparisons_per_cell": int(comparisons_per_cell),
-        "number_of_cells": int(n_cells),
-        "expected_total_comparisons": int(expected_total),
+def verify_structural_nk_invariance(tensors: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """Vérifie l'invariance structurelle de J et A vis-à-vis de nk_seed."""
+    results: Dict[str, float] = {}
+    for key in ["mean_gap_fro", "max_gap_fro", "mean_delta_A", "max_delta_A"]:
+        results[key] = float(np.max(np.ptp(tensors[key], axis=1)))
+    return results
 
-        "unordered_pairs_only": unordered_only,
+
+def mixed_two_way_random_repeated_anova(Y: np.ndarray) -> Dict[str, float]:
+    """
+    Décomposition hiérarchique pour un plan croisé à 2 facteurs aléatoires
+    (I: init_seed, K: nk_seed) et 1 facteur fixe répété (E: eta),
+    sans réplication interne par cellule (n_units = I * K).
+    """
+    I, K, E = Y.shape
+    grand = float(np.mean(Y))
+
+    m_i = np.mean(Y, axis=(1, 2), keepdims=True)
+    m_k = np.mean(Y, axis=(0, 2), keepdims=True)
+    m_e = np.mean(Y, axis=(0, 1), keepdims=True)
+
+    m_ik = np.mean(Y, axis=2, keepdims=True)
+    m_ie = np.mean(Y, axis=1, keepdims=True)
+    m_ke = np.mean(Y, axis=0, keepdims=True)
+
+    ss_i = float(np.sum((m_i - grand) ** 2))
+    ss_k = float(np.sum((m_k - grand) ** 2))
+    ss_e = float(np.sum((m_e - grand) ** 2))
+
+    ss_ik = float(np.sum((m_ik - m_i - m_k + grand) ** 2))
+    ss_ie = float(np.sum((m_ie - m_i - m_e + grand) ** 2))
+    ss_ke = float(np.sum((m_ke - m_k - m_e + grand) ** 2))
+
+    res_ike = Y - m_ik - m_ie - m_ke + m_i + m_k + m_e - grand
+    ss_ike = float(np.sum(res_ike ** 2))
+
+    df_i = I - 1
+    df_k = K - 1
+    df_e = E - 1
+    df_ik = df_i * df_k
+    df_ie = df_i * df_e
+    df_ke = df_k * df_e
+    df_ike = df_i * df_k * df_e
+
+    ms_i = ss_i / df_i
+    ms_k = ss_k / df_k
+    ms_e = ss_e / df_e
+    ms_ik = ss_ik / df_ik
+    ms_ie = ss_ie / df_ie
+    ms_ke = ss_ke / df_ke
+    ms_ike = ss_ike / df_ike
+
+    f_i = ms_i / ms_ik if ms_ik > 0 else np.nan
+    p_i = float(stats.f.sf(f_i, df_i, df_ik)) if np.isfinite(f_i) else np.nan
+
+    f_k = ms_k / ms_ik if ms_ik > 0 else np.nan
+    p_k = float(stats.f.sf(f_k, df_k, df_ik)) if np.isfinite(f_k) else np.nan
+
+    f_ik = ms_ik / ms_ike if ms_ike > 0 else np.nan
+    p_ik = float(stats.f.sf(f_ik, df_ik, df_ike)) if np.isfinite(f_ik) else np.nan
+
+    f_ie = ms_ie / ms_ike if ms_ike > 0 else np.nan
+    p_ie = float(stats.f.sf(f_ie, df_ie, df_ike)) if np.isfinite(f_ie) else np.nan
+
+    f_ke = ms_ke / ms_ike if ms_ike > 0 else np.nan
+    p_ke = float(stats.f.sf(f_ke, df_ke, df_ike)) if np.isfinite(f_ke) else np.nan
+
+    denom_e = ms_ie + ms_ke - ms_ike
+    if denom_e > 0:
+        f_e = ms_e / denom_e
+        num_df = denom_e ** 2
+        den_df = (ms_ie ** 2) / df_ie + (ms_ke ** 2) / df_ke + (ms_ike ** 2) / df_ike
+        df_e_denom = num_df / den_df if den_df > 0 else np.nan
+        p_e = float(stats.f.sf(f_e, df_e, df_e_denom)) if np.isfinite(df_e_denom) else np.nan
+    else:
+        f_e, df_e_denom, p_e = np.nan, np.nan, np.nan
+
+    var_ike = max(0.0, ms_ike)
+    var_ik = max(0.0, (ms_ik - ms_ike) / E)
+    var_i = max(0.0, (ms_i - ms_ik) / (K * E))
+    var_k = max(0.0, (ms_k - ms_ik) / (I * E))
+    var_ie = max(0.0, (ms_ie - ms_ike) / K)
+    var_ke = max(0.0, (ms_ke - ms_ike) / I)
+
+    var_random_total = var_i + var_k + var_ik + var_ie + var_ke + var_ike
+    icc_init = var_i / var_random_total if var_random_total > 0 else 0.0
+    icc_nk = var_k / var_random_total if var_random_total > 0 else 0.0
+    icc_ik = var_ik / var_random_total if var_random_total > 0 else 0.0
+
+    return {
+        "df_i": df_i, "df_k": df_k, "df_e": df_e,
+        "df_ik": df_ik, "df_ie": df_ie, "df_ke": df_ke, "df_ike": df_ike,
+        "ms_e": ms_e, "ms_i": ms_i, "ms_k": ms_k,
+        "ms_ik": ms_ik, "ms_ie": ms_ie, "ms_ke": ms_ke, "ms_ike": ms_ike,
+        "F_eta": f_e, "df2_eta": df_e_denom, "p_eta": p_e,
+        "F_init": f_i, "p_init": p_i,
+        "F_nk": f_k, "p_nk": p_k,
+        "F_init_x_nk": f_ik, "p_init_x_nk": p_ik,
+        "F_eta_x_init": f_ie, "p_eta_x_init": p_ie,
+        "F_eta_x_nk": f_ke, "p_eta_x_nk": p_ke,
+        "var_init": var_i,
+        "var_nk": var_k,
+        "var_init_x_nk": var_ik,
+        "var_eta_x_init": var_ie,
+        "var_eta_x_nk": var_ke,
+        "var_resid": var_ike,
+        "var_random_total": var_random_total,
+        "icc_init": icc_init,
+        "icc_nk": icc_nk,
+        "icc_init_x_nk": icc_ik,
     }
 
-    result = {
-        "metadata": metadata,
-        "cells": cells,
-        "by_eta": by_eta,
-        "by_init_seed": by_init_seed,
-        "by_nk_seed": by_nk_seed,
-        "interactions": interactions,
+
+def analyze_unit_slopes(eta_values: List[float], Y: np.ndarray) -> Dict[str, Any]:
+    """Calcule les pentes individuelles par unité (i, k) et leur dispersion."""
+    etas = np.asarray(eta_values, dtype=np.float64)
+    I, K, _ = Y.shape
+
+    def fit_slopes(mask: np.ndarray) -> Dict[str, Any]:
+        x = etas[mask]
+        xc = x - np.mean(x)
+        denom = float(np.sum(xc ** 2))
+        slopes = np.empty((I, K), dtype=np.float64)
+        r2_vals = np.empty((I, K), dtype=np.float64)
+        for i in range(I):
+            for k in range(K):
+                y = Y[i, k, mask]
+                yc = y - np.mean(y)
+                b = float(np.sum(xc * yc)) / denom if denom > 0 else 0.0
+                slopes[i, k] = b
+                ss_tot = float(np.sum(yc ** 2))
+                ss_res = float(np.sum((yc - b * xc) ** 2))
+                r2_vals[i, k] = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 1.0
+
+        flat = slopes.ravel()
+        n = flat.size
+        mean_b = float(np.mean(flat))
+        sd_b = float(np.std(flat, ddof=1)) if n > 1 else 0.0
+        se_b = sd_b / np.sqrt(n) if n > 0 else 0.0
+        t_crit = float(stats.t.ppf(0.975, df=max(1, n - 1)))
+
+        grand_b = np.mean(slopes)
+        ss_tot_b = float(np.sum((slopes - grand_b) ** 2))
+        ss_i_b = float(np.sum((np.mean(slopes, axis=1, keepdims=True) - grand_b) ** 2))
+        ss_k_b = float(np.sum((np.mean(slopes, axis=0, keepdims=True) - grand_b) ** 2))
+        ss_ik_b = ss_tot_b - ss_i_b - ss_k_b
+
+        return {
+            "n_units": n,
+            "mean_slope": mean_b,
+            "sd_slope": sd_b,
+            "ci95_low": mean_b - t_crit * se_b,
+            "ci95_high": mean_b + t_crit * se_b,
+            "min_slope": float(np.min(flat)),
+            "max_slope": float(np.max(flat)),
+            "mean_r2": float(np.mean(r2_vals)),
+            "pct_var_slope_init": 100.0 * ss_i_b / ss_tot_b if ss_tot_b > 0 else 0.0,
+            "pct_var_slope_nk": 100.0 * ss_k_b / ss_tot_b if ss_tot_b > 0 else 0.0,
+            "pct_var_slope_inter": 100.0 * ss_ik_b / ss_tot_b if ss_tot_b > 0 else 0.0,
+        }
+
+    return {
+        "full_grid": fit_slopes(np.ones_like(etas, dtype=bool)),
+        "low_eta_le_025": fit_slopes(etas <= 0.25 + 1e-12),
     }
 
-    return result
-
-
-# ================================================================
-# 11. POINT D'ENTRÉE
-# ================================================================
 
 def main() -> None:
-    args = parse_arguments()
-
-    result = run_factorial_audit(args)
-
-    print_eta_summary(result["by_eta"])
-
-    print_seed_summary(
-        "EFFET MARGINAL DES GRAINES INITIALES",
-        result["by_init_seed"],
-        "init_seed",
+    parser = argparse.ArgumentParser(
+        description="Analyse hiérarchique post-hoc auto-adaptative sur res_factoriel_22500.json"
     )
+    parser.add_argument("--json-in", type=str, default="res_factoriel_22500.json")
+    parser.add_argument("--json-out", type=str, default="res_analyse_hierarchique.json")
+    args = parser.parse_args()
 
-    print_seed_summary(
-        "EFFET MARGINAL DES GRAINES NK",
-        result["by_nk_seed"],
-        "nk_seed",
-    )
+    design, init_seeds, nk_seeds, eta_values, tensors = load_factorial_tensor(args.json_in)
 
-    print_interaction_summary(
-        result["interactions"]
-    )
-
-    print()
-    print("=" * 100)
-    print("BILAN DU PLAN FACTORIEL")
-    print("=" * 100)
-
+    print("=" * 118)
     print(
-        f"Cellules calculées             : "
-        f"{len(result['cells'])}"
+        f"ANALYSE HIÉRARCHIQUE POST-HOC — {design['n_units']} UNITÉS CROISÉES "
+        f"({len(init_seeds)} init × {len(nk_seeds)} nk) × {len(eta_values)} RÉGIMES DE ETA"
     )
+    print("=" * 118)
+    print(f"Source : {args.json_in}")
+    print(f"Grilles : init={init_seeds} | nk={nk_seeds} | eta={eta_values}")
 
-    print(
-        f"Comparaisons de paires         : "
-        f"{sum(row['n_samples'] for row in result['cells'])}"
-    )
+    inv = verify_structural_nk_invariance(tensors)
+    print("\n" + "-" * 118)
+    print("1. INVARIANCE STRUCTURELLE VIS-À-VIS DE nk_seed (ÉCART MAX ENTRE PAYSAGES)")
+    print("-" * 118)
+    for k, v in inv.items():
+        print(f"  {k:<22} : max_ptp_across_nk = {v:.3e}")
 
-    print("Invariants structurels : contrôlés dans chaque cellule.")
-
-    if args.json_out:
-        export_json(
-            output_path=args.json_out,
-            metadata=result["metadata"],
-            cells=result["cells"],
-            by_eta=result["by_eta"],
-            by_init_seed=result["by_init_seed"],
-            by_nk_seed=result["by_nk_seed"],
-            interactions=result["interactions"],
+    print("\n" + "-" * 118)
+    print("2. MODÈLE MIXTE CROISÉ (init_seed & nk_seed ALÉATOIRES, eta FIXE RÉPÉTÉ)")
+    print("-" * 118)
+    mixed_summary: Dict[str, Any] = {}
+    for key, label in [
+        ("mean_delta_w", "Norme ||Δw||2"),
+        ("max_delta_w", "Max |Δw|"),
+        ("frac_nonzero_delta_w", "Fraction Δw≠0"),
+        ("total_crossings", "Désaccords D_T"),
+    ]:
+        res = mixed_two_way_random_repeated_anova(tensors[key])
+        mixed_summary[key] = res
+        print(f"\n  >>> Observable : {label}")
+        print(
+            f"      Effet fixe eta     : F({res['df_e']}, {res['df2_eta']:.2f}) = {res['F_eta']:.3f} "
+            f"(p = {res['p_eta']:.3e})"
+        )
+        print(
+            f"      Effet aléat. init  : F({res['df_i']}, {res['df_ik']}) = {res['F_init']:.3f} "
+            f"(p = {res['p_init']:.3e}) | Var = {res['var_init']:.6e} (ICC_init = {res['icc_init']*100:.2f}%)"
+        )
+        print(
+            f"      Effet aléat. nk    : F({res['df_k']}, {res['df_ik']}) = {res['F_nk']:.3f} "
+            f"(p = {res['p_nk']:.3e}) | Var = {res['var_nk']:.6e} (ICC_nk = {res['icc_nk']*100:.2f}%)"
+        )
+        print(
+            f"      Interaction init×nk: F({res['df_ik']}, {res['df_ike']}) = {res['F_init_x_nk']:.3f} "
+            f"(p = {res['p_init_x_nk']:.3e}) | Var = {res['var_init_x_nk']:.6e} (ICC_ik = {res['icc_init_x_nk']*100:.2f}%)"
+        )
+        print(
+            f"      Inter. eta×init    : F({res['df_ie']}, {res['df_ike']}) = {res['F_eta_x_init']:.3f} "
+            f"(p = {res['p_eta_x_init']:.3e}) | Var = {res['var_eta_x_init']:.6e}"
+        )
+        print(
+            f"      Inter. eta×nk      : F({res['df_ke']}, {res['df_ike']}) = {res['F_eta_x_nk']:.3f} "
+            f"(p = {res['p_eta_x_nk']:.3e}) | Var = {res['var_eta_x_nk']:.6e}"
         )
 
-    print()
-    print("AUDIT FACTORIEL TERMINÉ.")
+    print("\n" + "-" * 118)
+    print("3. DISTRIBUTION DES PENTES INDIVIDUELLES PAR UNITÉ (i, k)")
+    print("-" * 118)
+    slopes_summary: Dict[str, Any] = {}
+    for key, label in [
+        ("mean_gap_fro", "Écart ||JA-JB||F"),
+        ("mean_delta_A", "Norme ||ΔA||2"),
+        ("mean_delta_w", "Norme ||Δw||2"),
+        ("total_crossings", "Désaccords D_T"),
+    ]:
+        sl = analyze_unit_slopes(eta_values, tensors[key])
+        slopes_summary[key] = sl
+        fg = sl["full_grid"]
+        lo = sl["low_eta_le_025"]
+        print(f"\n  >>> {label}")
+        print(
+            f"      Grille complète  : pente = {fg['mean_slope']:.5f} ± {fg['sd_slope']:.5f} "
+            f"(IC95% [{fg['ci95_low']:.5f}, {fg['ci95_high']:.5f}]) | R² moy = {fg['mean_r2']:.4f} | "
+            f"Var(pente): init={fg['pct_var_slope_init']:.1f}%, nk={fg['pct_var_slope_nk']:.1f}%, inter={fg['pct_var_slope_inter']:.1f}%"
+        )
+        print(
+            f"      Régime eta<=0.25 : pente = {lo['mean_slope']:.5f} ± {lo['sd_slope']:.5f} "
+            f"(IC95% [{lo['ci95_low']:.5f}, {lo['ci95_high']:.5f}]) | R² moy = {lo['mean_r2']:.4f} | "
+            f"Var(pente): init={lo['pct_var_slope_init']:.1f}%, nk={lo['pct_var_slope_nk']:.1f}%, inter={lo['pct_var_slope_inter']:.1f}%"
+        )
+
+    print("\n" + "=" * 118)
+
+    out_payload = {
+        "source_json": args.json_in,
+        "design": design,
+        "structural_nk_invariance": inv,
+        "mixed_model_25_units": mixed_summary,
+        "unit_slopes_25_units": slopes_summary,
+    }
+    Path(args.json_out).write_text(json.dumps(out_payload, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-
-    except KeyboardInterrupt:
-        print()
-        print("Audit interrompu par l'utilisateur.")
-
-    except Exception as exc:
-        print()
-        print("ÉCHEC DE L'AUDIT FACTORIEL")
-        print(f"{type(exc).__name__} : {exc}")
-        raise
+    main()
