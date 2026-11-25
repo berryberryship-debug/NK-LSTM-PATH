@@ -241,18 +241,17 @@ class NKLandscape:
             self.tables = rng.uniform(0.0, 1.0, size=(n_int, 1 << (k_int + 1)))
 
     def local_contribution(self, X: np.ndarray, i: int) -> float:
-        Xv = _validate_state(X)
-        if Xv.size != self.N:
-            raise ValueError(f"Taille de X incompatible : {Xv.size} != {self.N}.")
+        x_int = _validate_state(X)
+        if x_int.size != self.N:
+            raise ValueError(f"Taille de X incompatible : {x_int.size} != {self.N}.")
         if not (0 <= i < self.N):
-            raise IndexError(f"Indice i hors limites : {i}.")
+            raise IndexError(f"Indice de site hors limites : {i}.")
 
         if self._backend is not None:
-            x_int = np.where(Xv >= 0.0, 1, -1).astype(np.int8)
             return float(self._backend.site_contributions(x_int)[i])
 
         indices = np.concatenate(([i], self.neighbors[i]))
-        bits = ((Xv[indices] + 1.0) / 2.0).astype(np.int8)
+        bits = ((x_int[indices] + 1.0) / 2.0).astype(np.int8)
         index = 0
         for bit in bits:
             index = (index << 1) | int(bit)
@@ -263,16 +262,14 @@ class NKLandscape:
         if Xv.size != self.N:
             raise ValueError(f"Taille de X incompatible : {Xv.size} != {self.N}.")
         if self._backend is not None:
-            x_int = np.where(Xv >= 0.0, 1, -1).astype(np.int8)
-            return self._backend.fitness(x_int)
+            return float(self._backend.fitness(Xv))
         total = sum(self.local_contribution(Xv, i) for i in range(self.N))
         return float(total / self.N)
 
     def delta_fitness_flip(self, X: np.ndarray, k: int) -> float:
         Xv = _validate_state(X)
         if self._backend is not None:
-            x_int = np.where(Xv >= 0.0, 1, -1).astype(np.int8)
-            return self._backend.delta_fitness_flip(x_int, int(k))
+            return float(self._backend.delta_fitness_flip(Xv, node_k=int(k)))
         X_next = Xv.copy()
         X_next[k] *= -1.0
         return float(self.fitness(X_next) - self.fitness(Xv))
@@ -339,8 +336,7 @@ def delta_fitness_k(
     if isinstance(fnk_fn, NKLandscape):
         delta_nk = fnk_fn.delta_fitness_flip(X, k)
     elif _CanonicalNKLandscape is not None and isinstance(fnk_fn, _CanonicalNKLandscape):
-        x_int = np.where(X >= 0.0, 1, -1).astype(np.int8)
-        delta_nk = fnk_fn.delta_fitness_flip(x_int, int(k))
+        delta_nk = float(fnk_fn.delta_fitness_flip(X, node_k=int(k)))
     else:
         X_next = X.copy()
         X_next[k] *= -1.0
