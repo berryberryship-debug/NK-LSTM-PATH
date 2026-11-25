@@ -1,4 +1,3 @@
-```
 """
 tests/test_trajectories.py
 Projet : NK-LSTM-PATH
@@ -40,48 +39,23 @@ Suite de validation de `src/trajectories.py` :
      générateur contrôlé lorsque les premiers canaux ont un taux nul.
 """
 
-```
 from __future__ import annotations
 
-```
 import os
-
-```
 import sys
-
-```
 from typing import Sequence
-
-```
 import unittest
-
-```
 import numpy as np
 
-```
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-```
-
-```
 SRC_DIR = os.path.join(REPO_ROOT, "src")
-```
-
-```
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-```
-
-```
 import fiber_bundle as fb  # noqa: E402
-
-```
 import trajectories as traj  # noqa: E402
 
 
-```
-
-```
 class _ControlledZeroU2Generator:
     """
     Générateur déterministe minimaliste reproduisant l'interface `uniform(low, high)`
@@ -99,9 +73,6 @@ class _ControlledZeroU2Generator:
         return self._u2_value
 
 
-```
-
-```
 def _mc_permutation_test_1d(
     u_samples: np.ndarray,
     v_samples: np.ndarray,
@@ -148,9 +119,6 @@ def _mc_permutation_test_1d(
     return w1_obs, p_value
 
 
-```
-
-```
 def _bootstrap_percentile_ucb95_1d(
     u_samples: np.ndarray,
     v_samples: np.ndarray,
@@ -175,9 +143,6 @@ def _bootstrap_percentile_ucb95_1d(
     return float(np.quantile(boot_stats, 0.95))
 
 
-```
-
-```
 def _mc_permutation_sliced_w1(
     U: np.ndarray,
     V: np.ndarray,
@@ -232,9 +197,6 @@ def _mc_permutation_sliced_w1(
     return sw1_obs, p_value
 
 
-```
-
-```
 def _bootstrap_percentile_ucb95_sliced_w1(
     U: np.ndarray,
     V: np.ndarray,
@@ -256,9 +218,6 @@ def _bootstrap_percentile_ucb95_sliced_w1(
     return float(np.quantile(boot_stats, 0.95))
 
 
-```
-
-```
 def _mc_permutation_energy_blocked(
     U: np.ndarray,
     V: np.ndarray,
@@ -352,9 +311,6 @@ def _mc_permutation_energy_blocked(
     return ed_obs, p_value
 
 
-```
-
-```
 def _bootstrap_percentile_ucb95_energy_blocked(
     U: np.ndarray,
     V: np.ndarray,
@@ -362,7 +318,15 @@ def _bootstrap_percentile_ucb95_energy_blocked(
     block_size: int = 128,
     seed: int = 2026,
 ) -> float:
-    """Borne supérieure bootstrap percentile q_0.95(D_E^*) (couverture nominale 95 %)."""
+    """
+    DEPRECATED — conservée pour compatibilité descendante.
+
+    Borne supérieure bootstrap percentile q_0.95(D_E^*) via
+    `traj.energy_distance` recalculée à chaque réplication bootstrap.
+
+    Préférer `_bootstrap_percentile_ucb95_energy_cached` : ~20x plus rapide
+    grâce au pré-calcul des matrices de distances D_uu, D_uv, D_vv.
+    """
     n_u = U.shape[0]
     n_v = V.shape[0]
     rng = np.random.default_rng(seed)
@@ -374,9 +338,86 @@ def _bootstrap_percentile_ucb95_energy_blocked(
     return float(np.quantile(boot_stats, 0.95))
 
 
-```
+def _bootstrap_percentile_ucb95_energy_cached(
+    U: np.ndarray,
+    V: np.ndarray,
+    n_bootstrap: int = 20000,
+    seed: int = 2026,
+) -> float:
+    """
+    Bootstrap percentile q_0.95 de la distance d'énergie V-statistique.
 
-```
+    Les matrices de distances euclidiennes D_uu, D_uv, D_vv sont précalculées
+    une seule fois (via ``scipy.spatial.distance.cdist``). Chaque réplication
+    bootstrap se réduit alors à trois produits matrice-vecteur (via
+    ``bincount``), au lieu de recalculer les n_u * n_v + n_u^2 + n_v^2
+    distances euclidiennes à chaque tirage.
+
+    Rééchantillonnage indépendant entre U et V (au niveau des trajectoires).
+
+    Convention statistique
+    ----------------------
+    Le rééchantillonnage d'un échantillon de taille n_u *avec remise* produit
+    des multiplicités cu (somme = n_u). Le calcul ``cu @ D_uu @ cu / n_u^2``
+    correspond exactement au V-statistique bootstrappé de E[||U - U'||],
+    cohérent avec ``traj.energy_distance`` et ``_mc_permutation_energy_blocked``.
+
+    Parameters
+    ----------
+    U, V : ndarray, shape (n, d)
+        Échantillons de trajectoires (d caractéristiques jointes).
+    n_bootstrap : int, optional
+        Nombre de réplications bootstrap (20000 par défaut).
+    seed : int, optional
+        Graine du générateur (2026 par défaut).
+
+    Returns
+    -------
+    float
+        Quantile 0.95 des statistiques bootstrap (couverture nominale 95 %).
+    """
+    from scipy.spatial.distance import cdist
+
+    U = np.asarray(U, dtype=np.float64)
+    V = np.asarray(V, dtype=np.float64)
+
+    if U.ndim != 2 or V.ndim != 2:
+        raise ValueError("U et V doivent être bidimensionnels.")
+    if U.shape[1] != V.shape[1]:
+        raise ValueError("Dimensions incompatibles.")
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap doit être positif.")
+
+    n_u = U.shape[0]
+    n_v = V.shape[0]
+    if n_u == 0 or n_v == 0:
+        raise ValueError("Les deux échantillons doivent être non vides.")
+
+    # Pré-calcul unique des distances (coût O(n_u^2 + n_u n_v + n_v^2))
+    D_uu = cdist(U, U, metric="euclidean")
+    D_uv = cdist(U, V, metric="euclidean")
+    D_vv = cdist(V, V, metric="euclidean")
+
+    rng = np.random.default_rng(seed)
+    boot_stats = np.empty(n_bootstrap, dtype=np.float64)
+
+    for b in range(n_bootstrap):
+        iu = rng.integers(0, n_u, size=n_u)
+        iv = rng.integers(0, n_v, size=n_v)
+
+        cu = np.bincount(iu, minlength=n_u).astype(np.float64)
+        cv = np.bincount(iv, minlength=n_v).astype(np.float64)
+
+        cross = float(cu @ (D_uv @ cv)) / (n_u * n_v)
+        within_u = float(cu @ (D_uu @ cu)) / (n_u * n_u)
+        within_v = float(cv @ (D_vv @ cv)) / (n_v * n_v)
+
+        ed2 = 2.0 * cross - within_u - within_v
+        boot_stats[b] = np.sqrt(max(0.0, ed2))
+
+    return float(np.quantile(boot_stats, 0.95))
+
+
 def _mc_permutation_cov_fro(
     U: np.ndarray,
     V: np.ndarray,
@@ -408,9 +449,6 @@ def _mc_permutation_cov_fro(
     return cov_obs, p_value
 
 
-```
-
-```
 def _bootstrap_percentile_ucb95_cov_fro(
     U: np.ndarray,
     V: np.ndarray,
@@ -431,9 +469,6 @@ def _bootstrap_percentile_ucb95_cov_fro(
     return float(np.quantile(boot_stats, 0.95))
 
 
-```
-
-```
 class TestTrajectories(unittest.TestCase):
     """Validation du simulateur joint et du contrôle analytique par morceaux."""
 
@@ -938,8 +973,10 @@ class TestTrajectories(unittest.TestCase):
         ed_obs, ed_p = _mc_permutation_energy_blocked(
             Z_og, Z_ex, n_permutations=n_perm, block_size=64, perm_batch_size=250
         )
-        ed_ucb95 = _bootstrap_percentile_ucb95_energy_blocked(
-            Z_og, Z_ex, n_bootstrap=1000, block_size=128
+        # Version cached : pré-calcul unique des distances euclidiennes,
+        # ~20x plus rapide que la version blocked pour n_bootstrap=20000.
+        ed_ucb95 = _bootstrap_percentile_ucb95_energy_cached(
+            Z_og, Z_ex, n_bootstrap=20000, seed=2026
         )
         self.assertGreater(ed_p, alpha_level, msg=f"EnergyDist rejetée : {ed_obs:.5f} (p={ed_p:.5f})")
         self.assertLess(
@@ -1061,8 +1098,5 @@ class TestTrajectories(unittest.TestCase):
         self.assertEqual(res_ex_pos.events[0].node, 2)
 
 
-```
-
-```
 if __name__ == "__main__":
     unittest.main(verbosity=2)
