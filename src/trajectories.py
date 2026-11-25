@@ -1,80 +1,381 @@
+"""Moteur de trajectoires pour NK-LSTM-PATH.
+
+Ce module centralise :
+- l'interface de compatibilite NKLandscape (ancienne et nouvelle signatures) ;
+- fitness et taux de transition de Metropolis ;
+- dissipation analytique de la fibre ;
+- simulation par amincissement d'Ogata ;
+- simulation exacte par morceaux lorsque lambda = 0 ;
+- resolution robuste des franchissements de seuil ;
+- distances statistiques utilisees par les tests de validation.
+
+Le generateur NK canonique est nk_landscape.NKLandscape.generate lorsque le
+module racine est disponible. Un repli local reproduit le meme ordre de tirage
+aleatoire si le module canonique n'est pas importable.
 """
-trajectories.py
-Projet : NK-LSTM-PATH
-
-Trajectoires adaptatives sur l'espace d'états couplé :
-
-    X in {-1, +1}^N
-    J in Sym_0(N)
-
-Le paysage NK fournit la composante combinatoire de la fitness.
-La matrice J porte les couplages géométriques évolutifs.
-
-Chaîne dynamique :
-
-    (X, J)
-       -> mutation de X
-       -> transport local post-flip de J
-       -> accessibilité A(J)
-       -> taux de transition w(X, J)
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, log, sqrt
-import os
+import math
 import sys
-from typing import Any, Callable, Sequence
+from pathlib import Path
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_SRC_DIR, ".."))
-for _path in (_SRC_DIR, _REPO_ROOT):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+# ---------------------------------------------------------------------------
+# Imports locaux et generateur NK canonique
+# ---------------------------------------------------------------------------
 
-from fiber_bundle import (  # noqa: E402
-    PsiFn,
-    _validate_J,
-    _validate_state,
-    accessibility_A,
-    mutate_postflip,
-    psi_sym,
-)
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    from nk_landscape import NKLandscape as _CanonicalNKLandscape  # noqa: E402
-except ImportError:  # pragma: no cover
+    from fiber_bundle import (  # type: ignore
+        _validate_state as _fb_validate_state,
+        _validate_J as _fb_validate_J,
+        accessibility_A,
+        mutate_postflip,
+        psi_sym,
+    )
+except ImportError:  # Permet aussi l'import lorsque le module est lance seul.
+    def _fb_validate_state(X: np.ndarray, atol: float = 1e-12) -> np.ndarray:
+        x = np.asarray(X, dtype=np.float64)
+        if x.ndim != 1 or x.size < 2 or not np.all(np.isfinite(x)):
+            raise ValueError("X doit etre un vecteur fini de dimension >= 2.")
+        if not np.all(np.isclose(np.abs(x), 1.0, atol=atol)):
+            raise ValueError("Les spins doivent appartenir a {-1, +1}.")
+        return np.where(x >= 0.0, 1.0, -1.0)
+
+    def _fb_validate_J(J: np.ndarray, atol: float = 1e-12) -> np.ndarray:
+        j = np.asarray(J, dtype=np.float64)
+        if j.ndim != 2 or j.shape[0] != j.shape[1] or j.shape[0] < 2:
+            raise ValueError("J doit etre une matrice carree de dimension >= 2.")
+        if not np.all(np.isfinite(j)):
+            raise ValueError("J contient des valeurs non finies.")
+        if not np.allclose(j, j.T, atol=atol):
+            raise ValueError("J doit etre symetrique.")
+        if not np.allclose(np.diag(j), 0.0, atol=atol):
+            raise ValueError("La diagonale de J doit etre nulle.")
+        out = 0.5 * (j + j.T)
+        np.fill_diagonal(out, 0.0)
+        return out
+
+    def accessibility_A(J: np.ndarray) -> np.ndarray:
+        j = _fb_validate_J(J)
+        return np.sum(j * j, axis=1)
+
+    def psi_sym(X: np.ndarray, J: np.ndarray) -> np.ndarray:
+        x = _fb_validate_state(X)
+        j = _fb_validate_J(J)
+        if j.shape[0] != x.size:
+            raise ValueError("Dimensions incompatibles entre X et J.")
+        field = j @ x
+        p = 0.5 * (field[:, None] + field[None, :] - j * (x[:, None] + x[None, :]))
+        p = 0.5 * (p + p.T)
+        np.fill_diagonal(p, 0.0)
+        return p
+
+    def mutate_postflip(
+        X: np.ndarray, J: np.ndarray, k: int, eta: float,
+        psi_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] = psi_sym,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        x = _fb_validate_state(X)
+        j = _fb_validate_J(J)
+        if j.shape[0] != x.size:
+            raise ValueError("Dimensions incompatibles entre X et J.")
+        if not (0 <= int(k) < x.size):
+            raise IndexError("Indice de mutation hors limites.")
+        if not np.isfinite(eta):
+            raise ValueError("eta doit etre fini.")
+        x_next = x.copy()
+        x_next[int(k)] *= -1.0
+        p = np.asarray(psi_fn(x_next, j), dtype=np.float64)
+        if p.shape != j.shape or not np.all(np.isfinite(p)):
+            raise ValueError("psi_fn doit retourner une matrice finie de meme dimension.")
+        j_next = j.copy()
+        row = j[int(k), :] + float(eta) * p[int(k), :]
+        j_next[int(k), :] = row
+        j_next[:, int(k)] = row
+        np.fill_diagonal(j_next, 0.0)
+        return x_next, j_next
+
+try:
+    from nk_landscape import NKLandscape as _CanonicalNKLandscape  # type: ignore
+except ImportError:
     _CanonicalNKLandscape = None
 
+
+class _FallbackNKLandscape:
+    """Repli local reproduisant l'algorithme de nk_landscape.NKLandscape."""
+
+    def __init__(self, n_spins: int, k_epistasis: int, neighbors: np.ndarray,
+                 tables: np.ndarray, seed: int = 2026) -> None:
+        self.n_spins = int(n_spins)
+        self.k_epistasis = int(k_epistasis)
+        self.neighbors = np.asarray(neighbors, dtype=np.int64)
+        self.tables = np.asarray(tables, dtype=np.float64)
+        self.seed = int(seed)
+        if self.n_spins < 1 or not (0 <= self.k_epistasis < self.n_spins):
+            raise ValueError("Parametres NK invalides : N >= 1 et 0 <= K < N requis.")
+        if self.neighbors.shape != (self.n_spins, self.k_epistasis):
+            raise ValueError("Forme invalide pour neighbors.")
+        if self.tables.shape != (self.n_spins, 1 << (self.k_epistasis + 1)):
+            raise ValueError("Forme invalide pour tables.")
+        if not np.all(np.isfinite(self.tables)):
+            raise ValueError("Tables NK non finies.")
+        self._affected_sites: List[np.ndarray] = []
+        for k in range(self.n_spins):
+            dep = [k]
+            for i in range(self.n_spins):
+                if k in self.neighbors[i]:
+                    dep.append(i)
+            self._affected_sites.append(np.asarray(sorted(set(dep)), dtype=np.int64))
+
+    @classmethod
+    def generate(cls, n_spins: int, k_epistasis: int, seed: int = 2026,
+                 neighbor_mode: str = "random") -> "_FallbackNKLandscape":
+        rng = np.random.default_rng(seed)
+        neighbors = np.zeros((n_spins, k_epistasis), dtype=np.int64)
+        if neighbor_mode == "random":
+            for i in range(n_spins):
+                candidates = [idx for idx in range(n_spins) if idx != i]
+                if k_epistasis > 0:
+                    chosen = rng.choice(candidates, size=k_epistasis, replace=False)
+                    neighbors[i] = np.sort(chosen)
+        elif neighbor_mode == "adjacent":
+            for i in range(n_spins):
+                if k_epistasis > 0:
+                    neighbors[i] = np.asarray(
+                        [(i + off) % n_spins for off in range(1, k_epistasis + 1)],
+                        dtype=np.int64,
+                    )
+        else:
+            raise ValueError(f"neighbor_mode inconnu : {neighbor_mode}")
+        tables = rng.uniform(0.0, 1.0, size=(n_spins, 1 << (k_epistasis + 1)))
+        return cls(n_spins, k_epistasis, neighbors, tables, seed)
+
+    @staticmethod
+    def _bits(X: Sequence[float] | np.ndarray) -> np.ndarray:
+        x = _fb_validate_state(np.asarray(X, dtype=np.float64))
+        return (x > 0.0).astype(np.int64)
+
+    def _entry_index(self, site_i: int, bits: np.ndarray) -> int:
+        idx = int(bits[site_i])
+        for nb in self.neighbors[site_i]:
+            idx = (idx << 1) | int(bits[nb])
+        return idx
+
+    def fitness(self, X: Sequence[float] | np.ndarray) -> float:
+        bits = self._bits(X)
+        if bits.shape != (self.n_spins,):
+            raise ValueError("Dimension X incompatible avec le paysage NK.")
+        return float(sum(self.tables[i, self._entry_index(i, bits)]
+                         for i in range(self.n_spins)) / self.n_spins)
+
+    def delta_fitness_flip(self, X: Sequence[float] | np.ndarray, node_k: int) -> float:
+        if not (0 <= int(node_k) < self.n_spins):
+            raise IndexError("node_k hors limites.")
+        bits = self._bits(X)
+        affected = self._affected_sites[int(node_k)]
+        before = sum(self.tables[i, self._entry_index(int(i), bits)] for i in affected)
+        bits[int(node_k)] ^= 1
+        after = sum(self.tables[i, self._entry_index(int(i), bits)] for i in affected)
+        return float((after - before) / self.n_spins)
+
+    def __call__(self, X: Sequence[float] | np.ndarray) -> float:
+        return self.fitness(X)
+
+
+class NKLandscape:
+    """Adaptateur compatible avec les interfaces historiques et canoniques.
+
+    Formes acceptees : NKLandscape(N, K, seed=...),
+    NKLandscape(n=N, k=K, seed=...), NKLandscape(N=N, K=K, seed=...),
+    NKLandscape(n_spins=N, k_epistasis=K, seed=...) et generate(...).
+
+    La realisation effective est deleguee au generateur canonique a la racine
+    du depot, lorsqu'il est disponible.
+    """
+
+    def __init__(self, N: Optional[int] = None, K: Optional[int] = None,
+                 seed: int = 2026, neighbor_mode: str = "random", *,
+                 n: Optional[int] = None, k: Optional[int] = None,
+                 n_spins: Optional[int] = None,
+                 k_epistasis: Optional[int] = None) -> None:
+        n_values = [v for v in (N, n, n_spins) if v is not None]
+        k_values = [v for v in (K, k, k_epistasis) if v is not None]
+        if not n_values or not k_values:
+            raise TypeError("Fournir N/n/n_spins et K/k/k_epistasis.")
+        if any(int(v) != int(n_values[0]) for v in n_values):
+            raise ValueError("Valeurs contradictoires pour N.")
+        if any(int(v) != int(k_values[0]) for v in k_values):
+            raise ValueError("Valeurs contradictoires pour K.")
+        n_int, k_int = int(n_values[0]), int(k_values[0])
+        if _CanonicalNKLandscape is not None:
+            self._impl = _CanonicalNKLandscape.generate(
+                n_spins=n_int,
+                k_epistasis=k_int,
+                seed=int(seed),
+                neighbor_mode=neighbor_mode,
+            )
+        else:
+            self._impl = _FallbackNKLandscape.generate(
+                n_spins=n_int,
+                k_epistasis=k_int,
+                seed=int(seed),
+                neighbor_mode=neighbor_mode,
+            )
+        self.N = n_int
+        self.K = k_int
+        self.seed = int(seed)
+        self.neighbor_mode = neighbor_mode
+
+    @classmethod
+    def generate(cls, n_spins: int, k_epistasis: int, seed: int = 2026,
+                 neighbor_mode: str = "random") -> "NKLandscape":
+        return cls(n_spins=n_spins, k_epistasis=k_epistasis,
+                   seed=seed, neighbor_mode=neighbor_mode)
+
+    def __getattr__(self, name: str):
+        return getattr(self._impl, name)
+
+    def fitness(self, X: Sequence[float] | np.ndarray) -> float:
+        return float(self._impl.fitness(X))
+
+    def delta_fitness_flip(self, X: Sequence[float] | np.ndarray, node_k: int) -> float:
+        return float(self._impl.delta_fitness_flip(X, node_k))
+
+    def __call__(self, X: Sequence[float] | np.ndarray) -> float:
+        return self.fitness(X)
+
+
+# ---------------------------------------------------------------------------
+# Fitness et taux de transition
+# ---------------------------------------------------------------------------
 
 FitnessFn = Callable[[np.ndarray], float]
 
 
-# ============================================================
-# 0. STRUCTURES DE RÉSULTATS ET VALIDATION
-# ============================================================
+def zero_fnk(X: np.ndarray) -> float:
+    """Fitness NK nulle, utile pour les tests et controles sans paysage."""
+    _fb_validate_state(X)
+    return 0.0
 
-@dataclass(frozen=True)
-class TrajectoryEvent:
-    """Événement de saut accepté le long d'une trajectoire."""
 
+def _finite_scalar(name: str, value: float) -> float:
+    val = float(value)
+    if not np.isfinite(val):
+        raise ValueError(f"{name} doit etre fini.")
+    return val
+
+
+def extended_fitness(X: np.ndarray, J: np.ndarray, lam: float = 0.0,
+                     fnk_fn: Optional[FitnessFn] = None) -> float:
+    x = _fb_validate_state(X)
+    j = _fb_validate_J(J)
+    if j.shape[0] != x.size:
+        raise ValueError("Dimensions incompatibles entre X et J.")
+    coupling = _finite_scalar("lam", lam)
+    fn = zero_fnk if fnk_fn is None else fnk_fn
+    native = _finite_scalar("F_NK", fn(x.copy()))
+    return float(native + 0.5 * coupling * (x @ j @ x))
+
+
+def delta_fitness_k(X: np.ndarray, J: np.ndarray, k: int,
+                    lam: float = 0.0,
+                    fnk_fn: Optional[FitnessFn] = None) -> float:
+    x = _fb_validate_state(X)
+    j = _fb_validate_J(J)
+    if j.shape[0] != x.size:
+        raise ValueError("Dimensions incompatibles entre X et J.")
+    node = int(k)
+    if not (0 <= node < x.size):
+        raise IndexError(f"Indice k={node} hors limites.")
+    coupling = _finite_scalar("lam", lam)
+    fn = zero_fnk if fnk_fn is None else fnk_fn
+
+    # Si la fonction provient d'un objet NK qui expose le calcul local,
+    # utiliser sa mise a jour O(K). Cela couvre NKLandscape comme objet
+    # appelable et NKLandscape.fitness comme methode liee.
+    nk_owner = getattr(fn, "__self__", None)
+    nk_candidate = nk_owner if nk_owner is not None else fn
+    local_delta = getattr(nk_candidate, "delta_fitness_flip", None)
+    if callable(local_delta):
+        delta_native = _finite_scalar("Delta F_NK", local_delta(x, node))
+    else:
+        # Repli generique pour toute fonction de fitness arbitraire.
+        x_flip = x.copy()
+        x_flip[node] *= -1.0
+        delta_native = _finite_scalar("Delta F_NK", fn(x_flip) - fn(x))
+    delta_coupling = -2.0 * coupling * x[node] * float(j[node] @ x)
+    return float(delta_native + delta_coupling)
+
+
+def transition_rates(X: np.ndarray, J: np.ndarray, mu: float,
+                     beta: float, theta_A: float, lam: float,
+                     fnk_fn: Optional[FitnessFn] = None) -> np.ndarray:
+    x = _fb_validate_state(X)
+    j = _fb_validate_J(J)
+    if j.shape[0] != x.size:
+        raise ValueError("Dimensions incompatibles entre X et J.")
+    mu_v = _finite_scalar("mu", mu)
+    beta_v = _finite_scalar("beta", beta)
+    theta_v = _finite_scalar("theta_A", theta_A)
+    lam_v = _finite_scalar("lam", lam)
+    if mu_v < 0.0:
+        raise ValueError("mu doit etre >= 0.")
+    rates = np.zeros(x.size, dtype=np.float64)
+    if mu_v == 0.0:
+        return rates
+    active = accessibility_A(j) > theta_v
+    fn = zero_fnk if fnk_fn is None else fnk_fn
+    for k in range(x.size):
+        if not active[k]:
+            continue
+        exponent = beta_v * delta_fitness_k(x, j, k, lam=lam_v, fnk_fn=fn)
+        # min(1, exp(exponent)) sans debordement exponentiel positif.
+        acceptance = 1.0 if exponent >= 0.0 else float(np.exp(exponent))
+        rates[k] = mu_v * acceptance
+    return rates
+
+
+# ---------------------------------------------------------------------------
+# Dissipation et resultats de simulation
+# ---------------------------------------------------------------------------
+
+
+def dissipate_J(J_t: np.ndarray, J_anchor: np.ndarray, gamma: float,
+                dt: float) -> np.ndarray:
+    j = _fb_validate_J(J_t)
+    anchor = _fb_validate_J(J_anchor)
+    if j.shape != anchor.shape:
+        raise ValueError("J_t et J_anchor doivent avoir la meme forme.")
+    g = _finite_scalar("gamma", gamma)
+    delta_t = _finite_scalar("dt", dt)
+    if g < 0.0 or delta_t < 0.0:
+        raise ValueError("gamma et dt doivent etre >= 0.")
+    out = anchor + (j - anchor) * float(np.exp(-g * delta_t))
+    out = 0.5 * (out + out.T)
+    np.fill_diagonal(out, 0.0)
+    return out
+
+
+@dataclass
+class SimulationEvent:
     time: float
     node: int
     X: np.ndarray
     J: np.ndarray
-    rates: np.ndarray
 
 
-@dataclass(frozen=True)
+@dataclass
 class SimulationResult:
-    """Résultat complet d'une simulation de trajectoire."""
-
-    events: list[TrajectoryEvent]
     X_final: np.ndarray
     J_final: np.ndarray
+    events: List[SimulationEvent]
     t_final: float
 
     @property
@@ -82,962 +383,465 @@ class SimulationResult:
         return len(self.events)
 
 
-@dataclass(frozen=True)
-class ThresholdCrossingInfo:
-    """Racines de traversée de seuil sur [0, 1]."""
-
-    interior_z: np.ndarray
-    boundary_z: np.ndarray
-    events: list[tuple[float, int, str]]
-
-
-def _finite_scalar(name: str, value: float) -> float:
-    """Convertit un scalaire en float et refuse NaN/inf."""
-    value = float(value)
+def _rng_uniform(rng, low: float = 0.0, high: float = 1.0) -> float:
+    value = float(rng.uniform(low, high))
     if not np.isfinite(value):
-        raise ValueError(f"{name} doit être un réel fini.")
+        raise ValueError("Le generateur aleatoire a retourne une valeur non finie.")
+    if value < low or value > high:
+        raise ValueError("Le generateur aleatoire a retourne une valeur hors intervalle.")
     return value
 
 
-def _evaluate_fitness(fnk_fn: FitnessFn, X: np.ndarray) -> float:
-    """Évalue une fitness NK et vérifie que le résultat est fini."""
-    return _finite_scalar("La fitness", fnk_fn(X))
-
-
-def _validate_pair(
-    X: np.ndarray,
-    J: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Valide conjointement X et J."""
-    Xv = _validate_state(X)
-    Jv = _validate_J(J)
-    if Jv.shape != (Xv.size, Xv.size):
-        raise ValueError(
-            f"Dimensions incompatibles : X a {Xv.size} sites, "
-            f"J a la forme {Jv.shape}."
-        )
-    return Xv, Jv
-
-
-def _draw_unit_uniform(rng: Any) -> float:
-    """Tire u in [0, 1) via l'interface `uniform(0.0, 1.0)`."""
-    if hasattr(rng, "uniform"):
-        u = float(rng.uniform(0.0, 1.0))
-    elif hasattr(rng, "random"):
-        u = float(rng.random())
-    else:  # pragma: no cover
-        raise TypeError("rng doit exposer `uniform(0.0, 1.0)` ou `random()`.")
-    return min(max(u, 0.0), 1.0 - np.finfo(np.float64).eps)
-
-
-def _draw_exponential(rng: Any, rate: float) -> float:
-    """Tire un temps d'attente Exp(rate) à partir de `uniform(0.0, 1.0)`."""
-    u = _draw_unit_uniform(rng)
-    return float(-log(1.0 - u) / rate)
-
-
-def _select_channel_from_rates(rng: Any, rates: np.ndarray, total_rate: float) -> int:
-    """Sélectionne un canal k selon rates / total_rate avec `side='right'`."""
-    u2 = _draw_unit_uniform(rng)
-    cdf = np.cumsum(rates, dtype=np.float64) / float(total_rate)
-    cdf[-1] = 1.0
-    idx = int(np.searchsorted(cdf, u2, side="right"))
-    return min(idx, rates.size - 1)
-
-
-# ============================================================
-# 1. PAYSAGE NK UNIFIÉ (DÉLÉGUÉ AU MOTEUR CANONIQUE O(K))
-# ============================================================
-
-class NKLandscape:
-    """
-    Interface unifiée du paysage NK de Kauffman.
-
-    Accepte indistinctement les arguments `(N, K)` ou `(n, k)` et délègue
-    au moteur canonique `nk_landscape.NKLandscape.generate` lorsqu'il est
-    disponible.
-    """
-
-    def __init__(
-        self,
-        N: int | None = None,
-        K: int | None = None,
-        seed: int | None = None,
-        *,
-        n: int | None = None,
-        k: int | None = None,
-        neighbor_mode: str = "random",
-    ) -> None:
-        n_val = N if N is not None else n
-        k_val = K if K is not None else k
-
-        if n_val is None or k_val is None:
-            raise ValueError("Spécifier (N, K) ou (n, k) pour construire NKLandscape.")
-
-        n_int = int(n_val)
-        k_int = int(k_val)
-
-        if n_int < 2:
-            raise ValueError("N doit être >= 2.")
-        if not (0 <= k_int < n_int):
-            raise ValueError("K doit satisfaire 0 <= K < N.")
-
-        self.N = n_int
-        self.K = k_int
-        self.n_spins = n_int
-        self.k_epistasis = k_int
-        self.seed = seed
-        self.neighbor_mode = neighbor_mode
-
-        if _CanonicalNKLandscape is not None:
-            canon_seed = 2026 if seed is None else int(seed)
-            self._backend = _CanonicalNKLandscape.generate(
-                n_spins=n_int,
-                k_epistasis=k_int,
-                seed=canon_seed,
-                neighbor_mode=neighbor_mode,
-            )
-            self.neighbors = self._backend.neighbors
-            self.tables = self._backend.fitness_tables
-        else:  # pragma: no cover
-            self._backend = None
-            rng = np.random.default_rng(seed)
-            self.neighbors = np.empty((n_int, k_int), dtype=np.int64)
-            for i in range(n_int):
-                candidates = np.array([j for j in range(n_int) if j != i], dtype=np.int64)
-                if k_int > 0:
-                    self.neighbors[i] = np.sort(rng.choice(candidates, size=k_int, replace=False))
-            self.tables = rng.uniform(0.0, 1.0, size=(n_int, 1 << (k_int + 1)))
-
-    def local_contribution(self, X: np.ndarray, i: int) -> float:
-        Xv = _validate_state(X)
-        if Xv.size != self.N:
-            raise ValueError(f"Taille de X incompatible : {Xv.size} != {self.N}.")
-        if not (0 <= i < self.N):
-            raise IndexError(f"Indice i hors limites : {i}.")
-
-        if self._backend is not None:
-            x_int = np.where(Xv >= 0.0, 1, -1).astype(np.int8)
-            return self._backend.local_fitness(x_int, i)
-
-        indices = np.concatenate(([i], self.neighbors[i]))
-        bits = ((Xv[indices] + 1.0) / 2.0).astype(np.int8)
-        index = 0
-        for bit in bits:
-            index = (index << 1) | int(bit)
-        return float(self.tables[i, index])
-
-    def fitness(self, X: np.ndarray) -> float:
-        Xv = _validate_state(X)
-        if Xv.size != self.N:
-            raise ValueError(f"Taille de X incompatible : {Xv.size} != {self.N}.")
-        if self._backend is not None:
-            x_int = np.where(Xv >= 0.0, 1, -1).astype(np.int8)
-            return self._backend.fitness(x_int)
-        total = sum(self.local_contribution(Xv, i) for i in range(self.N))
-        return float(total / self.N)
-
-    def delta_fitness_flip(self, X: np.ndarray, k: int) -> float:
-        Xv = _validate_state(X)
-        if self._backend is not None:
-            x_int = np.where(Xv >= 0.0, 1, -1).astype(np.int8)
-            return self._backend.delta_fitness_flip(x_int, int(k))
-        X_next = Xv.copy()
-        X_next[k] *= -1.0
-        return float(self.fitness(X_next) - self.fitness(Xv))
-
-    __call__ = fitness
-
-
-# ============================================================
-# 2. FITNESS NK NULLE
-# ============================================================
-
-def zero_fnk(X: np.ndarray) -> float:
-    """Fitness NK nulle, utile pour isoler le terme de couplage."""
-    _validate_state(X)
-    return 0.0
-
-
-# ============================================================
-# 3. FITNESS ÉTENDUE F(X, J)
-# ============================================================
-
-def extended_fitness(
-    X: np.ndarray,
-    J: np.ndarray,
-    lam: float,
-    fnk_fn: FitnessFn = zero_fnk,
-) -> float:
-    r"""
-    Fitness étendue :
-
-        F(X, J) = F_NK(X) + (lambda/2) X^T J X
-    """
-    X, J = _validate_pair(X, J)
-    lam = _finite_scalar("lam", lam)
-    f_nk = _evaluate_fitness(fnk_fn, X)
-    coupling = 0.5 * float(X @ J @ X)
-    return float(f_nk + lam * coupling)
-
-
-# ============================================================
-# 4. VARIATION DE FITNESS POUR UN FLIP
-# ============================================================
-
-def delta_fitness_k(
-    X: np.ndarray,
-    J: np.ndarray,
-    k: int,
-    lam: float,
-    fnk_fn: FitnessFn = zero_fnk,
-) -> float:
-    r"""
-    Variation de fitness lors du flip du site k,
-    J étant maintenu fixe :
-
-        Delta F_k =
-            Delta F_NK - 2 * lambda * X_k * sum_j(J_kj X_j)
-    """
-    X, J = _validate_pair(X, J)
-    N = X.size
-    if not (0 <= k < N):
-        raise IndexError(f"Indice k hors limites : {k}.")
-    lam = _finite_scalar("lam", lam)
-
-    if isinstance(fnk_fn, NKLandscape):
-        delta_nk = fnk_fn.delta_fitness_flip(X, k)
-    elif _CanonicalNKLandscape is not None and isinstance(fnk_fn, _CanonicalNKLandscape):
-        x_int = np.where(X >= 0.0, 1, -1).astype(np.int8)
-        delta_nk = fnk_fn.delta_fitness_flip(x_int, int(k))
-    else:
-        X_next = X.copy()
-        X_next[k] *= -1.0
-        delta_nk = _evaluate_fitness(fnk_fn, X_next) - _evaluate_fitness(fnk_fn, X)
-
-    local_field = float(np.dot(J[k], X))
-    delta_J = -2.0 * lam * float(X[k]) * local_field
-    return float(delta_nk + delta_J)
-
-
-# ============================================================
-# 5. TAUX DE TRANSITION
-# ============================================================
-
-def transition_rates(
-    X: np.ndarray,
-    J: np.ndarray,
-    mu: float,
-    beta: float,
-    theta_A: float,
-    lam: float,
-    fnk_fn: FitnessFn = zero_fnk,
-) -> np.ndarray:
-    r"""
-    Calcule les taux :
-
-        w_k(X, J) =
-            mu * 1_{A_k(J) > theta_A}
-            * min(1, exp(beta * Delta F_k))
-    """
-    X, J = _validate_pair(X, J)
-    mu = _finite_scalar("mu", mu)
-    beta = _finite_scalar("beta", beta)
-    theta_A = _finite_scalar("theta_A", theta_A)
-    lam = _finite_scalar("lam", lam)
-
-    if mu < 0.0:
-        raise ValueError("mu doit être >= 0.")
-
-    rates = np.zeros(X.size, dtype=np.float64)
-    if mu == 0.0:
-        return rates
-
-    A = accessibility_A(J)
-    active = A > theta_A
-
-    for k in range(X.size):
-        if not active[k]:
-            continue
-        delta = delta_fitness_k(X=X, J=J, k=k, lam=lam, fnk_fn=fnk_fn)
-        exponent = beta * delta
-        boltzmann = 1.0 if exponent >= 0.0 else float(np.exp(exponent))
-        rates[k] = mu * boltzmann
-
-    return rates
-
-
-# ============================================================
-# 6. DISSIPATION EXPONENTIELLE DE J
-# ============================================================
-
-def dissipate_J(
-    J: np.ndarray,
-    J_anchor: np.ndarray,
-    dt: float,
-    gamma: float,
-) -> np.ndarray:
-    r"""
-    Dissipation exponentielle vers la matrice d'ancrage :
-
-        J(t + dt) =
-            J_anchor + (J(t) - J_anchor) * exp(-gamma * dt)
-    """
-    J = _validate_J(J)
-    J_anchor = _validate_J(J_anchor)
-
-    if J.shape != J_anchor.shape:
-        raise ValueError("J et J_anchor doivent avoir la même forme.")
-
-    dt = _finite_scalar("dt", dt)
-    gamma = _finite_scalar("gamma", gamma)
-
-    if dt < 0.0:
-        raise ValueError("dt doit être >= 0.")
-    if gamma < 0.0:
-        raise ValueError("gamma doit être >= 0.")
-
-    if dt == 0.0 or gamma == 0.0:
-        return J.copy()
-
-    decay = float(np.exp(-gamma * dt))
-    J_next = J_anchor + (J - J_anchor) * decay
-    return _validate_J(J_next)
-
-
-# ============================================================
-# 7. RACINES RÉELLES D'UN POLYNÔME QUADRATIQUE
-# ============================================================
-
-def _stable_quadratic_real_roots(
-    a: float,
-    b: float,
-    c: float,
-    atol: float = 1e-14,
-) -> list[float]:
-    """
-    Résout a*z^2 + b*z + c = 0 avec mise à l'échelle relative.
-    Conserve le degré 2 tant que |a| / S ne sous-déborde pas en binary64.
-    """
-    a = _finite_scalar("a", a)
-    b = _finite_scalar("b", b)
-    c = _finite_scalar("c", c)
-    atol = _finite_scalar("atol", atol)
-
-    if atol < 0.0:
-        raise ValueError("atol doit être >= 0.")
-
-    scale = max(abs(a), abs(b), abs(c))
-    if scale == 0.0:
-        return []
-
-    a_s = a / scale
-    b_s = b / scale
-    c_s = c / scale
-
-    tiny_quad = np.finfo(np.float64).tiny
-    if abs(a_s) <= tiny_quad:
-        if abs(b_s) <= tiny_quad:
-            return []
-        return [float(-c_s / b_s)]
-
-    discriminant = b_s * b_s - 4.0 * a_s * c_s
-    disc_scale = abs(b_s * b_s) + abs(4.0 * a_s * c_s) + 1.0
-
-    if discriminant < 0.0:
-        if abs(discriminant) <= atol * disc_scale:
-            discriminant = 0.0
-        else:
-            return []
-
-    sqrt_disc = sqrt(max(0.0, discriminant))
-    if sqrt_disc == 0.0:
-        return [float(-b_s / (2.0 * a_s))]
-
-    q = -0.5 * (b_s + np.copysign(sqrt_disc, b_s))
-    roots = [float(q / a_s)]
-    if abs(q) > tiny_quad:
-        roots.append(float(c_s / q))
-
-    roots = sorted(r for r in roots if np.isfinite(r))
-    unique: list[float] = []
-    for r in roots:
-        if not unique or not np.isclose(r, unique[-1], rtol=0.0, atol=atol):
-            unique.append(r)
-
-    return unique
-
-
-# ============================================================
-# 8. RÉSOLUTION ET CLASSIFICATION DES TRAVERSÉES DE SEUIL
-# ============================================================
-
-def _compute_threshold_events_z(
-    J0: np.ndarray,
-    J_anchor: np.ndarray,
-    z0: float = 1.0,
-    z1: float = 0.0,
-    theta_A: float = 0.0,
-    atol: float = 1e-12,
-) -> tuple[list[tuple[float, int, str]], np.ndarray]:
-    """
-    Calcule les événements de traversée et les racines frontières {z1, z0}
-    pour A_k(z) = theta_A avec J(z) = J_anchor + (J0 - J_anchor) * z.
-    """
-    J0 = _validate_J(J0)
-    J_anchor = _validate_J(J_anchor)
-
-    if J0.shape != J_anchor.shape:
-        raise ValueError("J0 et J_anchor doivent avoir la même forme.")
-
-    z0 = _finite_scalar("z0", z0)
-    z1 = _finite_scalar("z1", z1)
-    theta_A = _finite_scalar("theta_A", theta_A)
-    atol = _finite_scalar("atol", atol)
-
-    if z0 < z1:
-        raise ValueError("z0 doit être >= z1.")
-    if z1 < 0.0:
-        raise ValueError("z1 doit être >= 0.")
-    if atol <= 0.0:
-        raise ValueError("atol doit être strictement positif.")
-
-    D = J0 - J_anchor
-    interior_events: list[tuple[float, int, str]] = []
-    boundary_roots: list[float] = []
-
-    for k in range(J0.shape[0]):
-        row_anchor = J_anchor[k]
-        row_delta = D[k]
-
-        a = float(np.dot(row_delta, row_delta))
-        b = float(2.0 * np.dot(row_anchor, row_delta))
-        c = float(np.dot(row_anchor, row_anchor) - theta_A)
-
-        roots = _stable_quadratic_real_roots(a, b, c, atol=1e-15)
-
-        for root in roots:
-            if root < z1 - atol or root > z0 + atol:
-                continue
-
-            if abs(root - z0) <= atol:
-                boundary_roots.append(float(z0))
-                continue
-            if abs(root - z1) <= atol:
-                boundary_roots.append(float(z1))
-                continue
-
-            z = float(min(z0, max(z1, root)))
-            eps = min(max(1e-9, 10.0 * atol), max((z0 - z1) * 0.25, 1e-15))
-            zl = max(z1, z - eps)
-            zr = min(z0, z + eps)
-
-            poly_l = a * zl * zl + b * zl + c
-            poly_r = a * zr * zr + b * zr + c
-
-            if poly_l < 0.0 and poly_r > 0.0:
-                kind = "up"
-            elif poly_l > 0.0 and poly_r < 0.0:
-                kind = "down"
-            else:
-                kind = "touch"
-
-            interior_events.append((z, k, kind))
-
-    interior_events.sort(key=lambda item: (-item[0], item[1]))
-    unique_events: list[tuple[float, int, str]] = []
-    for event in interior_events:
-        z, k, _kind = event
-        if not any(k == pk and abs(z - pz) <= atol for pz, pk, _ in unique_events):
-            unique_events.append(event)
-
-    boundary_sorted = sorted(set(boundary_roots), reverse=True)
-    unique_bounds: list[float] = []
-    for zb in boundary_sorted:
-        if not unique_bounds or abs(zb - unique_bounds[-1]) > atol:
-            unique_bounds.append(zb)
-
-    return unique_events, np.asarray(unique_bounds, dtype=np.float64)
-
-
-def classify_threshold_crossings_z(
-    J0: np.ndarray,
-    J_anchor: np.ndarray,
-    theta_A: float,
-    z0: float = 1.0,
-    z1: float = 0.0,
-    atol: float = 1e-12,
-) -> ThresholdCrossingInfo:
-    """
-    Classe les racines de A_k(z) = theta_A sur [z1, z0] en racines intérieures
-    strictes (z1 < z < z0) et racines frontières {z0, z1}.
-    """
-    events, boundary_z = _compute_threshold_events_z(
-        J0=J0,
-        J_anchor=J_anchor,
-        z0=z0,
-        z1=z1,
-        theta_A=theta_A,
-        atol=atol,
-    )
-    interior_vals: list[float] = []
-    for z, _k, _kind in events:
-        if not interior_vals or abs(z - interior_vals[-1]) > atol:
-            interior_vals.append(float(z))
-
-    return ThresholdCrossingInfo(
-        interior_z=np.asarray(interior_vals, dtype=np.float64),
-        boundary_z=boundary_z,
+def _exp_wait_from_unit_uniform(u: float, rate: float) -> float:
+    if rate <= 0.0:
+        return math.inf
+    # numpy.random.Generator.uniform peut produire 0 ; on borne alors le tirage
+    # au plus petit flottant strictement positif de binary64.
+    u_safe = max(float(u), float(np.nextafter(0.0, 1.0)))
+    return float(-math.log(u_safe) / rate)
+
+
+def _select_channel(rates: np.ndarray, rng) -> int:
+    total = float(np.sum(rates))
+    if total <= 0.0:
+        raise ValueError("Impossible de selectionner un canal de taux total nul.")
+    # Le tirage est exprime dans l'unite du taux. side='right' saute les
+    # intervalles cumules de longueur nulle lorsque u2 == 0.
+    u2 = _rng_uniform(rng, 0.0, total)
+    cumulative = np.cumsum(rates, dtype=np.float64)
+    node = int(np.searchsorted(cumulative, u2, side="right"))
+    if node >= rates.size:
+        positive = np.flatnonzero(rates > 0.0)
+        if positive.size == 0:
+            raise RuntimeError("Aucun canal strictement positif apres sommation positive.")
+        node = int(positive[-1])
+    if rates[node] <= 0.0:
+        # Protection contre un eventuel arrondi en limite d'intervalle.
+        positive = np.flatnonzero((rates > 0.0) & (cumulative > u2))
+        if positive.size == 0:
+            positive = np.flatnonzero(rates > 0.0)
+        node = int(positive[0])
+    return node
+
+
+def _make_result(X: np.ndarray, J: np.ndarray, events: List[SimulationEvent],
+                 t_final: float) -> SimulationResult:
+    return SimulationResult(
+        X_final=np.asarray(X, dtype=np.float64).copy(),
+        J_final=np.asarray(J, dtype=np.float64).copy(),
         events=events,
+        t_final=float(t_final),
     )
 
-
-def solve_threshold_crossings_z(
-    J0: np.ndarray,
-    J_anchor: np.ndarray,
-    theta_A: float,
-    z0: float = 1.0,
-    z1: float = 0.0,
-    atol: float = 1e-12,
-) -> np.ndarray:
-    r"""
-    Résout A_k(z) = theta_A sur l'intérieur strict (z1, z0) pour :
-
-        J(z) = J_anchor + (J0 - J_anchor) * z
-
-    Retourne les racines intérieures triées par z décroissant.
-    """
-    info = classify_threshold_crossings_z(
-        J0=J0,
-        J_anchor=J_anchor,
-        theta_A=theta_A,
-        z0=z0,
-        z1=z1,
-        atol=atol,
-    )
-    return info.interior_z
-
-
-# ============================================================
-# 9. SIMULATION PAR THINNING D'OGATA
-# ============================================================
 
 def simulate_ogata_thinning(
     X0: np.ndarray,
     J0: np.ndarray,
     t_max: float,
     mu: float,
+    gamma: float,
     beta: float,
-    theta_A: float,
     lam: float = 0.0,
-    fnk_fn: FitnessFn = zero_fnk,
-    rng: Any = None,
     eta: float = 0.0,
-    gamma: float = 0.0,
-    J_anchor: np.ndarray | None = None,
-    max_events: int = 100000,
-    psi_fn: PsiFn = psi_sym,
+    theta_A: float = 0.0,
+    J_anchor: Optional[np.ndarray] = None,
+    fnk_fn: Optional[FitnessFn] = None,
+    psi_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] = psi_sym,
+    rng=None,
 ) -> SimulationResult:
-    """Simulation stochastique exacte par rejet d'Ogata."""
-    X = _validate_state(X0).copy()
-    J = _validate_J(J0).copy()
+    """Simule les mutations avec taux variables et amincissement d'Ogata.
 
-    if J.shape != (X.size, X.size):
+    La borne uniforme est Lambda_max = N * mu. Les temps de proposition sont
+    tires via rng.uniform(0, 1), puis le test d'acceptation et le canal utilisent
+    des tirages exprimes dans leurs intervalles de taux.
+    """
+    x = _fb_validate_state(X0)
+    j = _fb_validate_J(J0)
+    if j.shape[0] != x.size:
         raise ValueError("Dimensions incompatibles entre X0 et J0.")
-
-    t_max = _finite_scalar("t_max", t_max)
-    mu = _finite_scalar("mu", mu)
-    beta = _finite_scalar("beta", beta)
-    theta_A = _finite_scalar("theta_A", theta_A)
-    lam = _finite_scalar("lam", lam)
-    eta = _finite_scalar("eta", eta)
-    gamma = _finite_scalar("gamma", gamma)
-
-    if t_max < 0.0 or mu < 0.0 or gamma < 0.0 or max_events < 0:
-        raise ValueError("Les paramètres de taux, temps et compteurs doivent être positifs.")
-
-    if J_anchor is None:
-        J_anchor = J.copy()
-    else:
-        J_anchor = _validate_J(J_anchor)
-
-    if J_anchor.shape != J.shape:
-        raise ValueError("J_anchor doit avoir la même forme que J0.")
-
+    anchor = j.copy() if J_anchor is None else _fb_validate_J(J_anchor)
+    if anchor.shape != j.shape:
+        raise ValueError("J_anchor doit avoir la meme forme que J0.")
+    t_end = _finite_scalar("t_max", t_max)
+    mu_v = _finite_scalar("mu", mu)
+    gamma_v = _finite_scalar("gamma", gamma)
+    beta_v = _finite_scalar("beta", beta)
+    lam_v = _finite_scalar("lam", lam)
+    eta_v = _finite_scalar("eta", eta)
+    theta_v = _finite_scalar("theta_A", theta_A)
+    if t_end < 0.0 or mu_v < 0.0 or gamma_v < 0.0:
+        raise ValueError("t_max, mu et gamma doivent etre >= 0.")
     if rng is None:
         rng = np.random.default_rng()
-
-    events: list[TrajectoryEvent] = []
+    fn = zero_fnk if fnk_fn is None else fnk_fn
+    n = x.size
+    lambda_max = float(n * mu_v)
+    events: List[SimulationEvent] = []
     t = 0.0
-    majorant = float(X.size * mu)
+    if t_end == 0.0 or lambda_max == 0.0:
+        return _make_result(x, j, events, t_end)
 
-    if majorant == 0.0 or t_max == 0.0 or max_events == 0:
-        J_end = dissipate_J(J, J_anchor, dt=t_max, gamma=gamma)
-        return SimulationResult(events=events, X_final=X, J_final=J_end, t_final=t_max)
-
-    for _ in range(max_events):
-        waiting = _draw_exponential(rng, majorant)
-        t_candidate = t + waiting
-
-        if t_candidate > t_max:
-            J = dissipate_J(J, J_anchor, dt=t_max - t, gamma=gamma)
-            t = t_max
+    # Boucle de propositions ; les propositions rejetees ne changent pas X.
+    while t < t_end:
+        u1 = _rng_uniform(rng, 0.0, 1.0)
+        dt_prop = _exp_wait_from_unit_uniform(u1, lambda_max)
+        if not np.isfinite(dt_prop) or t + dt_prop >= t_end:
+            j = dissipate_J(j, anchor, gamma_v, t_end - t)
+            t = t_end
             break
 
-        J_candidate = dissipate_J(J, J_anchor, dt=waiting, gamma=gamma)
+        j = dissipate_J(j, anchor, gamma_v, dt_prop)
+        t += dt_prop
         rates = transition_rates(
-            X=X,
-            J=J_candidate,
-            mu=mu,
-            beta=beta,
-            theta_A=theta_A,
-            lam=lam,
-            fnk_fn=fnk_fn,
+            x, j, mu=mu_v, beta=beta_v, theta_A=theta_v,
+            lam=lam_v, fnk_fn=fn,
         )
-        total_rate = float(np.sum(rates))
-        acceptance = min(1.0, max(0.0, total_rate / majorant))
+        total = float(np.sum(rates))
+        if total <= 0.0:
+            continue
 
-        u_acc = _draw_unit_uniform(rng)
-        if total_rate > 0.0 and u_acc < acceptance:
-            k = _select_channel_from_rates(rng, rates, total_rate)
-            X_after, J_after = mutate_postflip(
-                X,
-                J_candidate,
-                k=k,
-                eta=eta,
-                psi_fn=psi_fn,
-            )
-            X = X_after
-            J = J_after
-            t = t_candidate
-            events.append(
-                TrajectoryEvent(
-                    time=t,
-                    node=k,
-                    X=X.copy(),
-                    J=J.copy(),
-                    rates=rates.copy(),
-                )
-            )
-        else:
-            J = J_candidate
-            t = t_candidate
+        # Uniformite dans [0, Lambda_max) pour l'acceptation du candidat.
+        u_accept = _rng_uniform(rng, 0.0, lambda_max)
+        if u_accept >= total:
+            continue
 
-    return SimulationResult(events=events, X_final=X, J_final=J, t_final=t)
+        node = _select_channel(rates, rng)
+        x, j = mutate_postflip(x, j, node, eta_v, psi_fn=psi_fn)
+        events.append(SimulationEvent(t, node, x.copy(), j.copy()))
+
+    return _make_result(x, j, events, t)
 
 
-# ============================================================
-# 10. SOLVEUR EXACT PAR MORCEAUX POUR lambda = 0
-# ============================================================
+# ---------------------------------------------------------------------------
+# Solveur de racines et changements de masque sous dissipation
+# ---------------------------------------------------------------------------
+
+
+def _stable_quadratic_real_roots(c2: float, c1: float, c0: float) -> List[float]:
+    """Racines reelles de c2*x^2+c1*x+c0 avec mise a l'echelle relative.
+
+    Le degre quadratique n'est reduit que si le coefficient mis a l'echelle
+    est exactement nul. Le discriminant legerement negatif, dans une tolerance
+    de 32 eps multipliee par son echelle naturelle, est traite comme une tangence.
+    """
+    a0 = _finite_scalar("c2", c2)
+    b0 = _finite_scalar("c1", c1)
+    c0v = _finite_scalar("c0", c0)
+    scale = max(abs(a0), abs(b0), abs(c0v))
+    if scale == 0.0:
+        return []
+    a, b, c = a0 / scale, b0 / scale, c0v / scale
+    if a == 0.0:
+        if b == 0.0:
+            return []
+        return [float(-c / b)]
+
+    four_ac = 4.0 * a * c
+    disc = b * b - four_ac
+    disc_scale = b * b + abs(four_ac)
+    disc_tol = 32.0 * np.finfo(np.float64).eps * max(disc_scale, np.finfo(np.float64).tiny)
+    if disc < -disc_tol:
+        return []
+    if disc < 0.0:
+        disc = 0.0
+    sqrt_disc = math.sqrt(disc)
+    if sqrt_disc == 0.0:
+        return [float(-b / (2.0 * a))]
+
+    q = -0.5 * (b + math.copysign(sqrt_disc, b))
+    if q == 0.0:
+        roots = [-b / (2.0 * a)]
+    else:
+        roots = [q / a, c / q]
+    roots = [float(r) for r in roots if np.isfinite(r)]
+    roots.sort()
+    if len(roots) == 2 and roots[0] == roots[1]:
+        return [roots[0]]
+    return roots
+
+
+@dataclass
+class ThresholdCrossingInfo:
+    interior_z: np.ndarray
+    boundary_z: np.ndarray
+
+
+def classify_threshold_crossings_z(
+    J_curr: np.ndarray,
+    J_anchor: np.ndarray,
+    theta_A: float,
+    boundary_tol: float = 1e-12,
+) -> ThresholdCrossingInfo:
+    """Classifie les racines des scores A_k(J(z)) = theta_A.
+
+    J(z) = J_anchor + z * (J_curr - J_anchor), z in [0, 1].
+    Les racines strictement interieures sont renvoyees dans l'ordre decroissant
+    de z ; les racines numeriquement confondues avec 0 ou 1 sont separees.
+    """
+    j = _fb_validate_J(J_curr)
+    anchor = _fb_validate_J(J_anchor)
+    if j.shape != anchor.shape:
+        raise ValueError("J_curr et J_anchor doivent avoir la meme forme.")
+    theta = _finite_scalar("theta_A", theta_A)
+    tol = _finite_scalar("boundary_tol", boundary_tol)
+    if tol < 0.0:
+        raise ValueError("boundary_tol doit etre >= 0.")
+
+    d = j - anchor
+    roots_all: List[float] = []
+    for k in range(j.shape[0]):
+        a = float(np.dot(d[k], d[k]))
+        b = float(2.0 * np.dot(anchor[k], d[k]))
+        c = float(np.dot(anchor[k], anchor[k]) - theta)
+        roots_all.extend(_stable_quadratic_real_roots(a, b, c))
+
+    roots_all.sort(reverse=True)
+    interior: List[float] = []
+    boundary: List[float] = []
+    for root in roots_all:
+        if root < -tol or root > 1.0 + tol:
+            continue
+        if abs(root) <= tol:
+            boundary.append(0.0)
+        elif abs(root - 1.0) <= tol:
+            boundary.append(1.0)
+        elif 0.0 < root < 1.0:
+            # Deduplication des franchissements simultanes de plusieurs sites.
+            if not interior or abs(root - interior[-1]) > max(1e-13, tol):
+                interior.append(float(root))
+
+    boundary_unique: List[float] = []
+    for root in boundary:
+        if root not in boundary_unique:
+            boundary_unique.append(root)
+    return ThresholdCrossingInfo(
+        interior_z=np.asarray(interior, dtype=np.float64),
+        boundary_z=np.asarray(boundary_unique, dtype=np.float64),
+    )
+
+
+def solve_threshold_crossings_z(
+    J_curr: np.ndarray,
+    J_anchor: np.ndarray,
+    theta_A: float,
+    boundary_tol: float = 1e-12,
+) -> np.ndarray:
+    """Retourne uniquement les racines strictement interieures a (0, 1)."""
+    return classify_threshold_crossings_z(
+        J_curr, J_anchor, theta_A, boundary_tol=boundary_tol
+    ).interior_z.copy()
+
+
+def _next_threshold_interval(J: np.ndarray, anchor: np.ndarray,
+                             gamma: float, theta_A: float) -> float:
+    """Temps jusqu'au prochain changement potentiel de masque (lambda=0)."""
+    if gamma <= 0.0:
+        return math.inf
+    roots = solve_threshold_crossings_z(J, anchor, theta_A)
+    if roots.size == 0:
+        return math.inf
+    # z decroit de 1 vers 0 ; les racines z decroissantes sont des temps croissants.
+    times = -np.log(roots) / gamma
+    positive = times[times > 1e-14]
+    return float(np.min(positive)) if positive.size else math.inf
+
 
 def simulate_exact_piecewise_lambda0(
     X0: np.ndarray,
     J0: np.ndarray,
     t_max: float,
     mu: float,
+    gamma: float,
     beta: float,
+    eta: float,
     theta_A: float,
-    eta: float = 0.0,
-    gamma: float = 0.0,
-    J_anchor: np.ndarray | None = None,
-    rng: Any = None,
-    max_events: int = 100000,
-    fnk_fn: FitnessFn = zero_fnk,
-    psi_fn: PsiFn = psi_sym,
+    J_anchor: Optional[np.ndarray] = None,
+    fnk_fn: Optional[FitnessFn] = None,
+    psi_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] = psi_sym,
+    rng=None,
 ) -> SimulationResult:
-    r"""
-    Simulation exacte par morceaux pour lambda = 0.
+    """Simulation exacte par morceaux lorsque lambda=0.
 
-    Entre deux mutations, J(t) dissipe vers J_anchor.
-    Le masque d'accessibilité est constant par morceaux
-    en z = exp(-gamma * Delta t).
+    Entre deux mutations, X est constant et la fitness NK ne depend pas de J.
+    Les taux sont donc constants sur chaque intervalle ou le masque A_k(J)>
+    theta_A ne change pas. Les bornes des intervalles sont calculees en resolvant
+    les equations quadratiques exactes du mouvement de dissipation.
     """
-    X = _validate_state(X0).copy()
-    J = _validate_J(J0).copy()
-
-    if J.shape != (X.size, X.size):
+    x = _fb_validate_state(X0)
+    j = _fb_validate_J(J0)
+    if j.shape[0] != x.size:
         raise ValueError("Dimensions incompatibles entre X0 et J0.")
-
-    t_max = _finite_scalar("t_max", t_max)
-    mu = _finite_scalar("mu", mu)
-    beta = _finite_scalar("beta", beta)
-    theta_A = _finite_scalar("theta_A", theta_A)
-    eta = _finite_scalar("eta", eta)
-    gamma = _finite_scalar("gamma", gamma)
-
-    if t_max < 0.0 or mu < 0.0 or gamma < 0.0 or max_events < 0:
-        raise ValueError("Paramètres non valides.")
-
-    if J_anchor is None:
-        J_anchor = J.copy()
-    else:
-        J_anchor = _validate_J(J_anchor)
-
-    if J_anchor.shape != J.shape:
-        raise ValueError("J_anchor doit avoir la même forme que J0.")
-
+    anchor = j.copy() if J_anchor is None else _fb_validate_J(J_anchor)
+    if anchor.shape != j.shape:
+        raise ValueError("J_anchor doit avoir la meme forme que J0.")
+    t_end = _finite_scalar("t_max", t_max)
+    mu_v = _finite_scalar("mu", mu)
+    gamma_v = _finite_scalar("gamma", gamma)
+    beta_v = _finite_scalar("beta", beta)
+    eta_v = _finite_scalar("eta", eta)
+    theta_v = _finite_scalar("theta_A", theta_A)
+    if t_end < 0.0 or mu_v < 0.0 or gamma_v < 0.0:
+        raise ValueError("t_max, mu et gamma doivent etre >= 0.")
     if rng is None:
         rng = np.random.default_rng()
-
-    events: list[TrajectoryEvent] = []
+    fn = zero_fnk if fnk_fn is None else fnk_fn
+    events: List[SimulationEvent] = []
     t = 0.0
+    if t_end == 0.0 or mu_v == 0.0:
+        return _make_result(x, j, events, t_end)
 
-    if t_max == 0.0 or mu == 0.0 or max_events == 0:
-        J_end = dissipate_J(J, J_anchor, dt=t_max, gamma=gamma)
-        return SimulationResult(events=events, X_final=X, J_final=J_end, t_final=t_max)
+    iteration_guard = 0
+    while t < t_end:
+        iteration_guard += 1
+        if iteration_guard > 2_000_000:
+            raise RuntimeError("Garde d'iterations depassee dans le simulateur exact.")
 
-    event_count = 0
+        remaining = t_end - t
+        dt_cross = _next_threshold_interval(j, anchor, gamma_v, theta_v)
+        interval = min(remaining, dt_cross)
+        if interval <= 0.0 or not np.isfinite(interval):
+            interval = remaining
 
-    while t < t_max and event_count < max_events:
-        remaining = t_max - t
-
-        # --------------------------------------------------------
-        # Cas non dissipatif
-        # --------------------------------------------------------
-        if gamma == 0.0:
-            rates = transition_rates(
-                X=X,
-                J=J,
-                mu=mu,
-                beta=beta,
-                theta_A=theta_A,
-                lam=0.0,
-                fnk_fn=fnk_fn,
-            )
-            total_rate = float(np.sum(rates))
-            if total_rate <= 0.0:
-                t = t_max
-                break
-
-            waiting = _draw_exponential(rng, total_rate)
-            if waiting >= remaining:
-                t = t_max
-                break
-
-            k = _select_channel_from_rates(rng, rates, total_rate)
-            X, J = mutate_postflip(X, J, k=k, eta=eta, psi_fn=psi_fn)
-            t += waiting
-            event_count += 1
-            events.append(
-                TrajectoryEvent(
-                    time=t,
-                    node=k,
-                    X=X.copy(),
-                    J=J.copy(),
-                    rates=rates.copy(),
-                )
-            )
-            continue
-
-        # --------------------------------------------------------
-        # Cas dissipatif : z = exp(-gamma * (tau - t))
-        # --------------------------------------------------------
-        z_start = 1.0
-        z_end = float(exp(-gamma * remaining))
-
-        crossings, _ = _compute_threshold_events_z(
-            J0=J,
-            J_anchor=J_anchor,
-            z0=z_start,
-            z1=z_end,
-            theta_A=theta_A,
+        # Evalue le masque a l'interieur de l'intervalle, pas exactement sur
+        # une frontiere ou la convention stricte '>' attribue le canal ferme.
+        probe_dt = 0.5 * interval if interval > 0.0 else 0.0
+        j_probe = dissipate_J(j, anchor, gamma_v, probe_dt)
+        rates = transition_rates(
+            x, j_probe, mu=mu_v, beta=beta_v,
+            theta_A=theta_v, lam=0.0, fnk_fn=fn,
         )
+        total = float(np.sum(rates))
 
-        boundaries = [z_start]
-        boundaries.extend(z for z, _, _ in crossings if z_end < z < z_start)
-        boundaries.append(z_end)
-        boundaries = sorted(set(boundaries), reverse=True)
+        if total > 0.0:
+            u_wait = _rng_uniform(rng, 0.0, 1.0)
+            dt_event = _exp_wait_from_unit_uniform(u_wait, total)
+        else:
+            dt_event = math.inf
 
-        mutation_occurred = False
-        J_ref = J.copy()
-        t_ref = t
+        if dt_event < interval:
+            j = dissipate_J(j, anchor, gamma_v, dt_event)
+            t += dt_event
+            node = _select_channel(rates, rng)
+            x, j = mutate_postflip(x, j, node, eta_v, psi_fn=psi_fn)
+            events.append(SimulationEvent(t, node, x.copy(), j.copy()))
+        else:
+            j = dissipate_J(j, anchor, gamma_v, interval)
+            t += interval
+            if t >= t_end:
+                break
+            # Recalcul au voisinage immediat de la frontiere : l'intervalle
+            # suivant sera evalue en son milieu au prochain tour.
 
-        for z_a, z_b in zip(boundaries[:-1], boundaries[1:]):
-            if z_a <= 0.0 or z_b <= 0.0:
-                continue
-
-            dt_segment = log(z_a / z_b) / gamma
-            if dt_segment <= 0.0:
-                continue
-
-            z_mid = 0.5 * (z_a + z_b)
-            J_mid = _validate_J(J_anchor + (J_ref - J_anchor) * z_mid)
-
-            rates = transition_rates(
-                X=X,
-                J=J_mid,
-                mu=mu,
-                beta=beta,
-                theta_A=theta_A,
-                lam=0.0,
-                fnk_fn=fnk_fn,
-            )
-            total_rate = float(np.sum(rates))
-
-            if total_rate > 0.0:
-                waiting = _draw_exponential(rng, total_rate)
-                if waiting < dt_segment:
-                    t_event = t + waiting
-                    tau = t_event - t_ref
-                    J_event = dissipate_J(J_ref, J_anchor, dt=tau, gamma=gamma)
-                    k = _select_channel_from_rates(rng, rates, total_rate)
-                    X, J = mutate_postflip(X, J_event, k=k, eta=eta, psi_fn=psi_fn)
-                    t = t_event
-                    event_count += 1
-                    mutation_occurred = True
-                    events.append(
-                        TrajectoryEvent(
-                            time=t,
-                            node=k,
-                            X=X.copy(),
-                            J=J.copy(),
-                            rates=rates.copy(),
-                        )
-                    )
-                    break
-
-            t += dt_segment
-            J = dissipate_J(J_ref, J_anchor, dt=t - t_ref, gamma=gamma)
-
-        if mutation_occurred:
-            continue
-
-        J = dissipate_J(J_ref, J_anchor, dt=t_max - t_ref, gamma=gamma)
-        t = t_max
-        break
-
-    return SimulationResult(events=events, X_final=X, J_final=J, t_final=t)
+    return _make_result(x, j, events, t)
 
 
-# ============================================================
-# 11. WASSERSTEIN-1 EMPIRIQUE EN DIMENSION 1
-# ============================================================
+# ---------------------------------------------------------------------------
+# Distances statistiques
+# ---------------------------------------------------------------------------
 
-def wasserstein_1d(
-    x: Sequence[float],
-    y: Sequence[float],
-) -> float:
-    r"""
-    Distance de Wasserstein-1 unidimensionnelle
-    sur deux échantillons empiriques.
-    """
-    x_arr = np.sort(np.asarray(x, dtype=np.float64).ravel())
-    y_arr = np.sort(np.asarray(y, dtype=np.float64).ravel())
 
-    if x_arr.size == 0 or y_arr.size == 0:
-        raise ValueError("Les deux échantillons doivent être non vides.")
-    if not np.all(np.isfinite(x_arr)) or not np.all(np.isfinite(y_arr)):
-        raise ValueError("Les échantillons doivent contenir des valeurs finies.")
+def wasserstein_1d(u_samples: np.ndarray, v_samples: np.ndarray) -> float:
+    """Distance de Wasserstein-1 exacte entre deux distributions empiriques 1D."""
+    x = np.sort(np.asarray(u_samples, dtype=np.float64).ravel())
+    y = np.sort(np.asarray(v_samples, dtype=np.float64).ravel())
+    if x.size == 0 or y.size == 0:
+        raise ValueError("Les deux echantillons doivent etre non vides.")
+    if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+        raise ValueError("Les echantillons doivent etre finis.")
 
-    i = 0
-    j = 0
-    mass_x = 1.0 / x_arr.size
-    mass_y = 1.0 / y_arr.size
-    remaining_x = mass_x
-    remaining_y = mass_y
+    i = j = 0
+    mass_x = 1.0 / x.size
+    mass_y = 1.0 / y.size
+    rem_x = mass_x
+    rem_y = mass_y
     distance = 0.0
+    eps = 16.0 * np.finfo(np.float64).eps
 
-    while i < x_arr.size and j < y_arr.size:
-        transported = min(remaining_x, remaining_y)
-        distance += transported * abs(x_arr[i] - y_arr[j])
-        remaining_x -= transported
-        remaining_y -= transported
-
-        if remaining_x <= 1e-15:
+    while i < x.size and j < y.size:
+        transported = min(rem_x, rem_y)
+        distance += transported * abs(float(x[i] - y[j]))
+        rem_x -= transported
+        rem_y -= transported
+        if rem_x <= eps * mass_x:
             i += 1
-            remaining_x = mass_x if i < x_arr.size else 0.0
-        if remaining_y <= 1e-15:
+            rem_x = mass_x if i < x.size else 0.0
+        if rem_y <= eps * mass_y:
             j += 1
-            remaining_y = mass_y if j < y_arr.size else 0.0
-
+            rem_y = mass_y if j < y.size else 0.0
     return float(distance)
 
 
-# ============================================================
-# 12. SLICED WASSERSTEIN-1
-# ============================================================
-
 def sliced_wasserstein_1(
-    X: np.ndarray,
-    Y: np.ndarray,
-    n_projections: int = 128,
-    rng: np.random.Generator | None = None,
-    seed: int | None = None,
+    U: np.ndarray,
+    V: np.ndarray,
+    n_projections: int = 32,
+    seed: Optional[int] = None,
 ) -> float:
-    """Distance Sliced Wasserstein-1 par projections aléatoires."""
-    X = np.asarray(X, dtype=np.float64)
-    Y = np.asarray(Y, dtype=np.float64)
-
-    if X.ndim != 2 or Y.ndim != 2:
-        raise ValueError("X et Y doivent être bidimensionnels.")
-    if X.shape[0] == 0 or Y.shape[0] == 0:
-        raise ValueError("X et Y doivent contenir au moins un point.")
-    if X.shape[1] != Y.shape[1]:
-        raise ValueError("X et Y doivent avoir la même dimension de caractéristiques.")
-    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(Y)):
-        raise ValueError("X et Y doivent contenir des valeurs finies.")
-    if n_projections < 1:
-        raise ValueError("n_projections doit être >= 1.")
-
-    if rng is None:
-        rng = np.random.default_rng(seed)
-
-    dimension = X.shape[1]
-    directions = rng.normal(size=(n_projections, dimension))
-    norms = np.linalg.norm(directions, axis=1, keepdims=True)
-    zero_rows = norms[:, 0] == 0.0
-
-    while np.any(zero_rows):
-        directions[zero_rows] = rng.normal(size=(int(np.sum(zero_rows)), dimension))
-        norms = np.linalg.norm(directions, axis=1, keepdims=True)
-        zero_rows = norms[:, 0] == 0.0
-
-    directions /= norms
-    distances = [wasserstein_1d(X @ direction, Y @ direction) for direction in directions]
+    """Sliced Wasserstein-1 empirique, moyenne sur des directions aleatoires."""
+    u = np.asarray(U, dtype=np.float64)
+    v = np.asarray(V, dtype=np.float64)
+    if u.ndim != 2 or v.ndim != 2 or u.shape[1] != v.shape[1]:
+        raise ValueError("U et V doivent etre des matrices 2D de meme dimension.")
+    if u.shape[0] == 0 or v.shape[0] == 0 or u.shape[1] == 0:
+        raise ValueError("U et V doivent contenir des observations et des dimensions.")
+    if not np.all(np.isfinite(u)) or not np.all(np.isfinite(v)):
+        raise ValueError("U et V doivent etre finis.")
+    n_proj = int(n_projections)
+    if n_proj < 1:
+        raise ValueError("n_projections doit etre >= 1.")
+    rng = np.random.default_rng(seed)
+    dirs = rng.normal(0.0, 1.0, size=(n_proj, u.shape[1]))
+    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+    dirs /= np.maximum(norms, 1e-15)
+    distances = [wasserstein_1d(u @ d, v @ d) for d in dirs]
     return float(np.mean(distances))
 
 
-# ============================================================
-# 13. ENERGY DISTANCE
-# ============================================================
+def energy_distance(U: np.ndarray, V: np.ndarray,
+                    block_size: Optional[int] = None) -> float:
+    """Distance d'energie empirique euclidienne, calculee par blocs.
 
-def energy_distance(
-    X: np.ndarray,
-    Y: np.ndarray,
-    block_size: int | None = None,
-) -> float:
-    r"""
-    Energy distance empirique entre deux distributions
-    multivariées (calcul par blocs mémoire).
+    Convention : racine carree de max(0, 2 E||U-V|| - E||U-U'|| - E||V-V'||),
+    les termes intra-echantillon utilisant les paires distinctes (la diagonale
+    nulle est incluse dans la somme puis divisee par n(n-1)).
     """
-    X = np.asarray(X, dtype=np.float64)
-    Y = np.asarray(Y, dtype=np.float64)
+    u = np.asarray(U, dtype=np.float64)
+    v = np.asarray(V, dtype=np.float64)
+    if u.ndim != 2 or v.ndim != 2 or u.shape[1] != v.shape[1]:
+        raise ValueError("U et V doivent etre des matrices 2D de meme dimension.")
+    if u.shape[0] == 0 or v.shape[0] == 0:
+        raise ValueError("Les echantillons doivent etre non vides.")
+    if u.shape[0] < 2 or v.shape[0] < 2:
+        raise ValueError("Chaque echantillon doit contenir au moins deux observations.")
+    if not np.all(np.isfinite(u)) or not np.all(np.isfinite(v)):
+        raise ValueError("U et V doivent etre finis.")
+    bsz = int(block_size) if block_size is not None else 256
+    if bsz < 1:
+        raise ValueError("block_size doit etre >= 1.")
 
-    if X.ndim != 2 or Y.ndim != 2:
-        raise ValueError("X et Y doivent être bidimensionnels.")
-    if X.shape[0] == 0 or Y.shape[0] == 0:
-        raise ValueError("X et Y doivent contenir au moins un point.")
-    if X.shape[1] != Y.shape[1]:
-        raise ValueError("Dimensions incompatibles entre X et Y.")
-    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(Y)):
-        raise ValueError("X et Y doivent contenir des valeurs finies.")
-    if block_size is not None and block_size < 1:
-        raise ValueError("block_size doit être >= 1.")
-
-    def mean_pairwise_dist(A: np.ndarray, B: np.ndarray) -> float:
-        n_a = A.shape[0]
-        n_b = B.shape[0]
-        step = n_a if block_size is None else min(int(block_size), n_a)
+    def sum_pairwise(A: np.ndarray, B: np.ndarray) -> float:
         total = 0.0
-        for i0 in range(0, n_a, step):
-            i1 = min(i0 + step, n_a)
-            diffs = A[i0:i1, None, :] - B[None, :, :]
-            total += float(np.sum(np.linalg.norm(diffs, axis=-1)))
-        return total / float(n_a * n_b)
+        for start in range(0, A.shape[0], bsz):
+            block = A[start:start + bsz]
+            diff = block[:, None, :] - B[None, :, :]
+            total += float(np.sum(np.linalg.norm(diff, axis=-1)))
+        return total
 
-    cross = mean_pairwise_dist(X, Y)
-    within_x = mean_pairwise_dist(X, X)
-    within_y = mean_pairwise_dist(Y, Y)
+    cross = sum_pairwise(u, v) / float(u.shape[0] * v.shape[0])
+    uu = sum_pairwise(u, u) / float(u.shape[0] * (u.shape[0] - 1))
+    vv = sum_pairwise(v, v) / float(v.shape[0] * (v.shape[0] - 1))
+    value = 2.0 * cross - uu - vv
+    # Le terme peut etre tres legerement negatif par arrondi pour des lois egales.
+    return float(math.sqrt(max(0.0, value)))
 
-    squared_dist = 2.0 * cross - within_x - within_y
-    return float(sqrt(max(0.0, squared_dist)))
+
+__all__ = [
+    "NKLandscape", "FitnessFn", "zero_fnk", "extended_fitness",
+    "delta_fitness_k", "transition_rates", "dissipate_J",
+    "SimulationEvent", "SimulationResult", "simulate_ogata_thinning",
+    "simulate_exact_piecewise_lambda0", "_stable_quadratic_real_roots",
+    "ThresholdCrossingInfo", "classify_threshold_crossings_z",
+    "solve_threshold_crossings_z", "wasserstein_1d",
+    "sliced_wasserstein_1", "energy_distance", "accessibility_A",
+    "mutate_postflip", "psi_sym",
+]
