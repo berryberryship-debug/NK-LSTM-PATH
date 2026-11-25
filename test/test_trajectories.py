@@ -227,26 +227,31 @@ def _mc_permutation_energy_blocked(
     seed: int = 2026,
 ) -> tuple[float, float]:
     """
-    Test de permutation Monte-Carlo à deux échantillons (n_perm = 9999,
-    correction de rang p = (1 + n_>=) / (1 + n_perm)) pour la distance d'énergie
-    D_E(U, V).
-    Les masques d'appartenance booléens `in_u` de dimension (n_perm, n_tot)
-    sont générés une seule fois par tranches de taille B_p = `perm_batch_size`
-    (avec libération explicite des temporaires `noise`, `perms`, `rows`,
-    `batch_mask`), puis réutilisés lors de l'unique parcours des blocs de
-    distances euclidiennes de taille B_r = `block_size`.
+    Test de permutation Monte-Carlo à deux échantillons pour la distance
+    d'énergie D_E(U, V), avec correction de rang :
+
+        p = (1 + n_>=) / (1 + n_permutations)
+
+    La statistique utilisée est la V-statistique, de façon cohérente
+    avec traj.energy_distance.
+
+    Les masques d'appartenance sont générés par lots, puis réutilisés
+    pendant un parcours bloqué des distances euclidiennes.
 
     Borne mémoire auxiliaire asymptotique (en nombre d'éléments) :
         O(n_perm * n_tot + B_p * n_tot + B_r * n_tot * d + B_r * n_tot + B_p * B_r + n_perm)
-    où :
-      - n_perm * n_tot (bool) : masque global `in_u` ;
-      - B_p * n_tot (float64 / intp) : temporaires simultanés `noise` (float64) et
-        `perms` (intp) au pic de génération, puis tampon `in_u_batch` (float64) ;
-      - B_r * n_tot * d (float64) : tenseur `diff` ;
-      - B_r * n_tot (float64) : bloc de distances `dist_block` et sommes `s_all` ;
-      - B_p * B_r (float64) : produits matriciels et vues `row_in_u`, `s_u`, `s_v` ;
-      - n_perm (float64) : accumulateurs `sum_uu`, `sum_uv`, `sum_vv` et `ed_perm`.
     """
+    U = np.asarray(U, dtype=np.float64)
+    V = np.asarray(V, dtype=np.float64)
+
+    if U.ndim != 2 or V.ndim != 2:
+        raise ValueError("U et V doivent être des matrices 2D.")
+    if U.shape[1] != V.shape[1]:
+        raise ValueError("U et V doivent avoir le même nombre de dimensions.")
+    if U.shape[0] < 1 or V.shape[0] < 1:
+        raise ValueError("Les deux échantillons doivent être non vides.")
+    if not np.all(np.isfinite(U)) or not np.all(np.isfinite(V)):
+        raise ValueError("U et V doivent contenir uniquement des valeurs finies.")
     if n_permutations < 1:
         raise ValueError("n_permutations doit être >= 1.")
     if block_size < 1 or perm_batch_size < 1:
@@ -275,7 +280,7 @@ def _mc_permutation_energy_blocked(
     sum_vv = np.zeros(n_permutations, dtype=np.float64)
     sum_uv = np.zeros(n_permutations, dtype=np.float64)
 
-    # Parcours unique des blocs de lignes de distances euclidiennes
+    # Parcours bloqué des distances euclidiennes
     for i0 in range(0, n_tot, block_size):
         i1 = min(i0 + block_size, n_tot)
         diff = pooled[i0:i1, None, :] - pooled[None, :, :]
@@ -295,9 +300,10 @@ def _mc_permutation_energy_blocked(
             sum_uv[p0:p1] += np.sum(row_in_u * s_v.T, axis=1)
             sum_vv[p0:p1] += np.sum(row_in_v * s_v.T, axis=1)
 
+    # V-statistique : convention identique à ed_obs
     e_xy = sum_uv / float(n_u * n_v)
-    e_xx = sum_uu / float(n_u * (n_u - 1))
-    e_yy = sum_vv / float(n_v * (n_v - 1))
+    e_xx = sum_uu / float(n_u * n_u)
+    e_yy = sum_vv / float(n_v * n_v)
     ed_perm = np.sqrt(np.maximum(0.0, 2.0 * e_xy - e_xx - e_yy))
 
     ge_count = int(np.sum(ed_perm >= ed_obs))
@@ -694,7 +700,7 @@ class TestTrajectories(unittest.TestCase):
             res_op = traj.simulate_exact_piecewise_lambda0(
                 X0=X0,
                 J0=J0_open,
-                J_anchor=J_anchor_open,
+                J_anchor_open=J_anchor_open,
                 t_max=t_obs,
                 mu=mu,
                 gamma=gamma,
