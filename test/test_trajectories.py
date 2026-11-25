@@ -1,3 +1,4 @@
+```
 """
 tests/test_trajectories.py
 Projet : NK-LSTM-PATH
@@ -39,23 +40,48 @@ Suite de validation de `src/trajectories.py` :
      générateur contrôlé lorsque les premiers canaux ont un taux nul.
 """
 
+```
 from __future__ import annotations
 
+```
 import os
+
+```
 import sys
+
+```
 from typing import Sequence
+
+```
 import unittest
+
+```
 import numpy as np
 
+```
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+```
+
+```
 SRC_DIR = os.path.join(REPO_ROOT, "src")
+```
+
+```
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+```
+
+```
 import fiber_bundle as fb  # noqa: E402
+
+```
 import trajectories as traj  # noqa: E402
 
 
+```
+
+```
 class _ControlledZeroU2Generator:
     """
     Générateur déterministe minimaliste reproduisant l'interface `uniform(low, high)`
@@ -73,6 +99,9 @@ class _ControlledZeroU2Generator:
         return self._u2_value
 
 
+```
+
+```
 def _mc_permutation_test_1d(
     u_samples: np.ndarray,
     v_samples: np.ndarray,
@@ -119,6 +148,9 @@ def _mc_permutation_test_1d(
     return w1_obs, p_value
 
 
+```
+
+```
 def _bootstrap_percentile_ucb95_1d(
     u_samples: np.ndarray,
     v_samples: np.ndarray,
@@ -143,6 +175,9 @@ def _bootstrap_percentile_ucb95_1d(
     return float(np.quantile(boot_stats, 0.95))
 
 
+```
+
+```
 def _mc_permutation_sliced_w1(
     U: np.ndarray,
     V: np.ndarray,
@@ -197,6 +232,9 @@ def _mc_permutation_sliced_w1(
     return sw1_obs, p_value
 
 
+```
+
+```
 def _bootstrap_percentile_ucb95_sliced_w1(
     U: np.ndarray,
     V: np.ndarray,
@@ -218,6 +256,9 @@ def _bootstrap_percentile_ucb95_sliced_w1(
     return float(np.quantile(boot_stats, 0.95))
 
 
+```
+
+```
 def _mc_permutation_energy_blocked(
     U: np.ndarray,
     V: np.ndarray,
@@ -311,6 +352,9 @@ def _mc_permutation_energy_blocked(
     return ed_obs, p_value
 
 
+```
+
+```
 def _bootstrap_percentile_ucb95_energy_blocked(
     U: np.ndarray,
     V: np.ndarray,
@@ -330,6 +374,9 @@ def _bootstrap_percentile_ucb95_energy_blocked(
     return float(np.quantile(boot_stats, 0.95))
 
 
+```
+
+```
 def _mc_permutation_cov_fro(
     U: np.ndarray,
     V: np.ndarray,
@@ -361,6 +408,9 @@ def _mc_permutation_cov_fro(
     return cov_obs, p_value
 
 
+```
+
+```
 def _bootstrap_percentile_ucb95_cov_fro(
     U: np.ndarray,
     V: np.ndarray,
@@ -381,6 +431,9 @@ def _bootstrap_percentile_ucb95_cov_fro(
     return float(np.quantile(boot_stats, 0.95))
 
 
+```
+
+```
 class TestTrajectories(unittest.TestCase):
     """Validation du simulateur joint et du contrôle analytique par morceaux."""
 
@@ -700,7 +753,7 @@ class TestTrajectories(unittest.TestCase):
             res_op = traj.simulate_exact_piecewise_lambda0(
                 X0=X0,
                 J0=J0_open,
-                J_anchor_open=J_anchor_open,
+                J_anchor=J_anchor_open,
                 t_max=t_obs,
                 mu=mu,
                 gamma=gamma,
@@ -1008,5 +1061,8 @@ class TestTrajectories(unittest.TestCase):
         self.assertEqual(res_ex_pos.events[0].node, 2)
 
 
+```
+
+```
 if __name__ == "__main__":
     unittest.main(verbosity=2)
