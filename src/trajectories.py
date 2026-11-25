@@ -249,7 +249,7 @@ class NKLandscape:
 
         if self._backend is not None:
             x_int = np.where(Xv >= 0.0, 1, -1).astype(np.int8)
-            return self._backend.local_fitness(x_int, i)
+            return float(self._backend.site_contributions(x_int)[i])
 
         indices = np.concatenate(([i], self.neighbors[i]))
         bits = ((Xv[indices] + 1.0) / 2.0).astype(np.int8)
