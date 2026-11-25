@@ -1,0 +1,294 @@
+"""
+generateur_trajectoires_nk_lstm.py
+Projet : NK-LSTM-PATH
+
+Générateur de trajectoires propres à NK-LSTM-PATH à partir de :
+    - nk_landscape.py
+    - fiber_bundle.py
+    - trajectories.py
+
+Entrées observées fournies au LSTM : histoire des spins X_{0:T} et paramètre eta.
+Cibles latentes à reconstruire : géométrie J_t, accessibilité A_t et taux w_t.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from fiber_bundle import accessibility_A, mutate_postflip
+from nk_landscape import NKLandscape
+from trajectories import transition_rates
+
+
+@dataclass(frozen=True)
+class TrajectoryGenConfig:
+    n_sites: int = 6
+    seq_len: int = 6
+    n_trajectories_per_seed: int = 10
+    scale_J: float = 0.2
+    init_seeds: Tuple[int, ...] = (7, 13, 21, 42, 99)
+    nk_seeds: Tuple[int, ...] = (7, 13, 21, 42, 99)
+    eta_values: Tuple[float, ...] = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
+    mu: float = 1.0
+    beta: float = 1.0
+    theta_A: float = 0.1
+    lam: float = 0.5
+    nk_K: int = 3
+    schedule_seed: int = 2026
+
+
+def sample_initial_spin_and_coupling(
+    n_sites: int,
+    rng: np.random.Generator,
+    scale_J: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    X0 = rng.choice(np.array([-1.0, 1.0], dtype=np.float64), size=(n_sites,))
+    raw_J = rng.normal(0.0, scale_J, size=(n_sites, n_sites))
+    J0 = 0.5 * (raw_J + raw_J.T)
+    np.fill_diagonal(J0, 0.0)
+    return X0, J0
+
+
+def build_spin_only_inputs(
+    X_seq: np.ndarray,
+    mutation_sites: Sequence[int],
+    eta: float,
+    include_site_onehot: bool = True,
+) -> np.ndarray:
+    """
+    Construit les séquences d'entrée contenant uniquement l'histoire des spins X_t
+    et le paramètre eta (jamais J_t, A_t ni w_t).
+    """
+    seq_len, n_sites = X_seq.shape
+    eta_col = np.full((seq_len, 1), float(eta), dtype=np.float64)
+    eta2_col = np.full((seq_len, 1), float(eta) ** 2, dtype=np.float64)
+
+    parts = [np.asarray(X_seq, dtype=np.float64), eta_col, eta2_col]
+    if include_site_onehot:
+        onehot = np.zeros((seq_len, n_sites), dtype=np.float64)
+        for t, site_k in enumerate(mutation_sites):
+            onehot[t, int(site_k)] = 1.0
+        parts.append(onehot)
+
+    return np.concatenate(parts, axis=-1)
+
+
+def simulate_single_trajectory(
+    X0: np.ndarray,
+    J0: np.ndarray,
+    mutation_sites: Sequence[int],
+    landscape: NKLandscape,
+    eta: float,
+    mu: float,
+    beta: float,
+    theta_A: float,
+    lam: float,
+) -> Dict[str, np.ndarray]:
+    """
+    Simule une trajectoire discrète de longueur T et retourne :
+      - X_seq : (T, n_sites)
+      - J_seq : (T, n_sites, n_sites)
+      - A_seq : (T, n_sites)
+      - w_seq : (T, n_sites)
+    """
+    X_curr = np.asarray(X0, dtype=np.float64).copy()
+    J_curr = np.asarray(J0, dtype=np.float64).copy()
+
+    seq_len = len(mutation_sites)
+    n_sites = X_curr.size
+
+    X_seq = np.empty((seq_len, n_sites), dtype=np.float64)
+    J_seq = np.empty((seq_len, n_sites, n_sites), dtype=np.float64)
+    A_seq = np.empty((seq_len, n_sites), dtype=np.float64)
+    w_seq = np.empty((seq_len, n_sites), dtype=np.float64)
+
+    for t, site_k in enumerate(mutation_sites):
+        X_next, J_next = mutate_postflip(X_curr, J_curr, int(site_k), float(eta))
+        X_curr = np.asarray(X_next, dtype=np.float64)
+        J_curr = np.asarray(J_next, dtype=np.float64)
+
+        A_curr = np.asarray(accessibility_A(J_curr), dtype=np.float64)
+        w_curr = np.asarray(
+            transition_rates(
+                X=X_curr,
+                J=J_curr,
+                mu=mu,
+                beta=beta,
+                theta_A=theta_A,
+                lam=lam,
+                fnk_fn=landscape,
+            ),
+            dtype=np.float64,
+        )
+
+        X_seq[t] = X_curr
+        J_seq[t] = J_curr
+        A_seq[t] = A_curr
+        w_seq[t] = w_curr
+
+    return {
+        "X_seq": X_seq,
+        "J_seq": J_seq,
+        "A_seq": A_seq,
+        "w_seq": w_seq,
+    }
+
+
+def generate_dataset(cfg: TrajectoryGenConfig) -> Dict[str, object]:
+    initial_by_seed: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {}
+    for s_init in cfg.init_seeds:
+        rng_init = np.random.default_rng(int(s_init))
+        initial_by_seed[int(s_init)] = [
+            sample_initial_spin_and_coupling(cfg.n_sites, rng_init, cfg.scale_J)
+            for _ in range(cfg.n_trajectories_per_seed)
+        ]
+
+    landscapes_by_seed: Dict[int, NKLandscape] = {
+        int(s_nk): NKLandscape.generate(
+            n_spins=cfg.n_sites,
+            k_epistasis=cfg.nk_K,
+            seed=int(s_nk),
+            neighbor_mode="random",
+        )
+        for s_nk in cfg.nk_seeds
+    }
+
+    rng_sched = np.random.default_rng(cfg.schedule_seed)
+    schedules: List[List[int]] = [
+        [int(k) for k in rng_sched.integers(0, cfg.n_sites, size=cfg.seq_len)]
+        for _ in range(cfg.n_trajectories_per_seed)
+    ]
+
+    inputs_list: List[np.ndarray] = []
+    J_targets_list: List[np.ndarray] = []
+    A_targets_list: List[np.ndarray] = []
+    w_targets_list: List[np.ndarray] = []
+    records: List[Dict[str, object]] = []
+
+    traj_counter = 0
+    for s_init in cfg.init_seeds:
+        init_list = initial_by_seed[int(s_init)]
+        for traj_idx, (X0, J0) in enumerate(init_list):
+            sched = schedules[traj_idx]
+            for s_nk in cfg.nk_seeds:
+                landscape = landscapes_by_seed[int(s_nk)]
+                for eta_val in cfg.eta_values:
+                    sim = simulate_single_trajectory(
+                        X0=X0,
+                        J0=J0,
+                        mutation_sites=sched,
+                        landscape=landscape,
+                        eta=float(eta_val),
+                        mu=cfg.mu,
+                        beta=cfg.beta,
+                        theta_A=cfg.theta_A,
+                        lam=cfg.lam,
+                    )
+                    x_in = build_spin_only_inputs(
+                        X_seq=sim["X_seq"],
+                        mutation_sites=sched,
+                        eta=float(eta_val),
+                        include_site_onehot=True,
+                    )
+                    inputs_list.append(x_in)
+                    J_targets_list.append(sim["J_seq"])
+                    A_targets_list.append(sim["A_seq"])
+                    w_targets_list.append(sim["w_seq"])
+
+                    trajectory_id = f"traj_{traj_counter:05d}_init{int(s_init)}_nk{int(s_nk)}_eta{float(eta_val):g}"
+                    records.append(
+                        {
+                            "trajectory_id": trajectory_id,
+                            "traj_index": int(traj_counter),
+                            "init_seed": int(s_init),
+                            "nk_seed": int(s_nk),
+                            "eta": float(eta_val),
+                            "mutation_sites": sched,
+                        }
+                    )
+                    traj_counter += 1
+
+    return {
+        "inputs": np.asarray(inputs_list, dtype=np.float64),
+        "targets_J": np.asarray(J_targets_list, dtype=np.float64),
+        "targets_A": np.asarray(A_targets_list, dtype=np.float64),
+        "targets_w": np.asarray(w_targets_list, dtype=np.float64),
+        "metadata": records,
+    }
+
+
+def save_dataset(dataset: Dict[str, object], cfg: TrajectoryGenConfig, out_prefix: str | Path) -> Tuple[Path, Path]:
+    prefix = Path(out_prefix)
+    npz_path = prefix.with_suffix(".npz")
+    json_path = Path(f"{prefix}_metadata.json")
+
+    np.savez_compressed(
+        npz_path,
+        inputs=dataset["inputs"],
+        targets_J=dataset["targets_J"],
+        targets_A=dataset["targets_A"],
+        targets_w=dataset["targets_w"],
+    )
+    meta_doc = {
+        "project": "NK-LSTM-PATH",
+        "input_policy": "spin_history_and_eta_only (J, A, w excluded from inputs)",
+        "config": asdict(cfg),
+        "shapes": {
+            "inputs": list(np.asarray(dataset["inputs"]).shape),
+            "targets_J": list(np.asarray(dataset["targets_J"]).shape),
+            "targets_A": list(np.asarray(dataset["targets_A"]).shape),
+            "targets_w": list(np.asarray(dataset["targets_w"]).shape),
+        },
+        "trajectories": dataset["metadata"],
+    }
+    json_path.write_text(json.dumps(meta_doc, indent=2), encoding="utf-8")
+    return npz_path, json_path
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Générateur propre de trajectoires NK-LSTM-PATH (entrées X_{0:T}, eta ; cibles J, A, w)"
+    )
+    parser.add_argument("--seq-len", type=int, default=6)
+    parser.add_argument("--n-trajectories", type=int, default=10)
+    parser.add_argument("--mu", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--theta-A", type=float, default=0.1)
+    parser.add_argument("--lam", type=float, default=0.5)
+    parser.add_argument("--nk-K", type=int, default=3)
+    parser.add_argument("--out-prefix", type=str, default="nk_lstm_path_trajectoires")
+    args = parser.parse_args(argv)
+
+    cfg = TrajectoryGenConfig(
+        n_sites=6,
+        seq_len=args.seq_len,
+        n_trajectories_per_seed=args.n_trajectories,
+        mu=args.mu,
+        beta=args.beta,
+        theta_A=args.theta_A,
+        lam=args.lam,
+        nk_K=args.nk_K,
+    )
+    dataset = generate_dataset(cfg)
+    npz_path, json_path = save_dataset(dataset, cfg, args.out_prefix)
+
+    print("=" * 82)
+    print("TRAJECTOIRES NK-LSTM-PATH GÉNÉRÉES (HISTOIRE X_{0:T} + ETA -> CIBLES J, A, w)")
+    print("=" * 82)
+    print(f"Entrées (N_traj, T, D_in) : {np.asarray(dataset['inputs']).shape}")
+    print(f"Cibles J_t                : {np.asarray(dataset['targets_J']).shape}")
+    print(f"Cibles A_t                : {np.asarray(dataset['targets_A']).shape}")
+    print(f"Cibles w_t                : {np.asarray(dataset['targets_w']).shape}")
+    print(f"Archive tenseurs          : {npz_path}")
+    print(f"Métadonnées trajectoires  : {json_path}")
+    print("=" * 82)
+
+
+if __name__ == "__main__":
+    main()
