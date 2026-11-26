@@ -32,6 +32,9 @@ Contraintes des sorties :
     - nouvelle graine initiale et nouveau paysage NK ;
     - régimes de eta.
 
+Les catégories de généralisation sont définies à partir des graines
+effectivement présentes dans l'ensemble d'entraînement.
+
 Les matrices J sont évaluées et entraînées sur leur triangle
 supérieur strict afin d'éviter le double comptage des arêtes.
 """
@@ -50,7 +53,80 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # ======================================================================
-# 1. DATASET
+# 1. VALIDATION DES VALEURS DE MÉTADONNÉES
+# ======================================================================
+
+def metadata_seed_to_int(
+    value: Any,
+    field_name: str,
+    index: int,
+) -> int:
+    """
+    Convertit une graine de métadonnées en entier sans troncature.
+
+    Accepte :
+        - les entiers ;
+        - les flottants représentant exactement un entier ;
+        - les chaînes contenant un entier.
+
+    Refuse :
+        - les booléens ;
+        - les valeurs non finies ;
+        - les flottants non entiers ;
+        - les valeurs non convertibles.
+    """
+
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(
+            f"{field_name} doit être un entier, "
+            f"pas un booléen, à l'indice {index}."
+        )
+
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+
+    if isinstance(value, (float, np.floating)):
+
+        numeric_value = float(value)
+
+        if not np.isfinite(numeric_value):
+            raise ValueError(
+                f"{field_name} n'est pas fini à l'indice {index}."
+            )
+
+        if not numeric_value.is_integer():
+            raise ValueError(
+                f"{field_name} doit être entier à l'indice {index}. "
+                f"Valeur observée : {numeric_value}."
+            )
+
+        return int(numeric_value)
+
+    if isinstance(value, str):
+
+        stripped = value.strip()
+
+        if not stripped:
+            raise ValueError(
+                f"{field_name} est une chaîne vide à l'indice {index}."
+            )
+
+        try:
+            return int(stripped, 10)
+        except ValueError as exc:
+            raise ValueError(
+                f"{field_name} doit contenir un entier à l'indice {index}. "
+                f"Valeur observée : {value!r}."
+            ) from exc
+
+    raise TypeError(
+        f"Type invalide pour {field_name} à l'indice {index} : "
+        f"{type(value).__name__}."
+    )
+
+
+# ======================================================================
+# 2. DATASET
 # ======================================================================
 
 class TrajectoryReconstructionDataset(Dataset):
@@ -106,7 +182,7 @@ class TrajectoryReconstructionDataset(Dataset):
 
 
 # ======================================================================
-# 2. PROJECTION GÉOMÉTRIQUE DE J
+# 3. PROJECTION GÉOMÉTRIQUE DE J
 # ======================================================================
 
 def project_symmetric_zero_diag(
@@ -145,7 +221,7 @@ def project_symmetric_zero_diag(
 
 
 # ======================================================================
-# 3. ARCHITECTURE LSTM
+# 4. ARCHITECTURE LSTM
 # ======================================================================
 
 class LatentGeometryPathLSTM(nn.Module):
@@ -196,13 +272,14 @@ class LatentGeometryPathLSTM(nn.Module):
                 "mu_max doit être fini et >= 0."
             )
 
-        if not (0.0 <= dropout < 1.0):
+        if not np.isfinite(dropout) or not (0.0 <= dropout < 1.0):
             raise ValueError(
                 "dropout doit appartenir à [0, 1)."
             )
 
         self.n_sites = int(n_sites)
         self.mu_max = float(mu_max)
+        self.input_dim = int(input_dim)
 
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -241,6 +318,18 @@ class LatentGeometryPathLSTM(nn.Module):
         torch.Tensor,
     ]:
 
+        if x.ndim != 3:
+            raise ValueError(
+                "Les entrées LSTM doivent avoir la forme "
+                "(batch, séquence, dimension)."
+            )
+
+        if x.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"Dimension d'entrée incorrecte : "
+                f"{x.shape[-1]} au lieu de {self.input_dim}."
+            )
+
         out, _ = self.lstm(x)
 
         batch_size, seq_len, _ = out.shape
@@ -268,7 +357,7 @@ class LatentGeometryPathLSTM(nn.Module):
 
 
 # ======================================================================
-# 4. SÉPARATION PAR GRAINES DISJOINTES
+# 5. SÉPARATION PAR GRAINES DISJOINTES
 # ======================================================================
 
 def split_by_disjoint_seeds(
@@ -291,13 +380,13 @@ def split_by_disjoint_seeds(
     test_indices: List[int] = []
 
     init_set = {
-        int(seed)
-        for seed in test_init_seeds
+        metadata_seed_to_int(seed, "test_init_seed", i)
+        for i, seed in enumerate(test_init_seeds)
     }
 
     nk_set = {
-        int(seed)
-        for seed in test_nk_seeds
+        metadata_seed_to_int(seed, "test_nk_seed", i)
+        for i, seed in enumerate(test_nk_seeds)
     }
 
     if not init_set and not nk_set:
@@ -307,13 +396,28 @@ def split_by_disjoint_seeds(
 
     for idx, item in enumerate(metadata):
 
+        if not isinstance(item, dict):
+            raise TypeError(
+                f"Les métadonnées de l'indice {idx} "
+                "doivent être un objet."
+            )
+
         if "init_seed" not in item or "nk_seed" not in item:
             raise KeyError(
                 f"Métadonnées incomplètes à l'indice {idx}."
             )
 
-        s_init = int(item["init_seed"])
-        s_nk = int(item["nk_seed"])
+        s_init = metadata_seed_to_int(
+            item["init_seed"],
+            "init_seed",
+            idx,
+        )
+
+        s_nk = metadata_seed_to_int(
+            item["nk_seed"],
+            "nk_seed",
+            idx,
+        )
 
         if s_init in init_set or s_nk in nk_set:
             test_indices.append(idx)
@@ -327,7 +431,7 @@ def split_by_disjoint_seeds(
 
 
 # ======================================================================
-# 5. MÉTRIQUES
+# 6. MÉTRIQUES
 # ======================================================================
 
 def compute_metrics(
@@ -340,6 +444,21 @@ def compute_metrics(
         raise ValueError(
             f"Dimensions métriques incompatibles : "
             f"{y_true.shape} != {y_pred.shape}."
+        )
+
+    if y_true.numel() == 0:
+        raise ValueError(
+            "Impossible de calculer des métriques sur un tenseur vide."
+        )
+
+    if not torch.isfinite(y_true).all().item():
+        raise ValueError(
+            "Les valeurs de référence contiennent des valeurs non finies."
+        )
+
+    if not torch.isfinite(y_pred).all().item():
+        raise ValueError(
+            "Les prédictions contiennent des valeurs non finies."
         )
 
     mse = torch.mean(
@@ -388,12 +507,22 @@ def compute_J_metrics(
             "Dimensions de J incompatibles."
         )
 
+    if y_true.ndim < 2:
+        raise ValueError(
+            "Les tenseurs J doivent avoir au moins deux dimensions."
+        )
+
     if y_true.shape[-1] != y_true.shape[-2]:
         raise ValueError(
             "Les matrices J doivent être carrées."
         )
 
     n_sites = y_true.shape[-1]
+
+    if n_sites < 2:
+        raise ValueError(
+            "Au moins deux sites sont nécessaires pour évaluer J."
+        )
 
     upper = torch.triu_indices(
         n_sites,
@@ -461,7 +590,7 @@ def compute_all_metrics(
 
 
 # ======================================================================
-# 6. VÉRIFICATION DES DONNÉES
+# 7. VÉRIFICATION DES DONNÉES
 # ======================================================================
 
 def validate_dataset_arrays(
@@ -473,6 +602,11 @@ def validate_dataset_arrays(
     mu_max: float,
 ) -> None:
     """Vérifie les dimensions, valeurs et contraintes des cibles."""
+
+    if not np.isfinite(mu_max) or mu_max < 0.0:
+        raise ValueError(
+            "mu_max doit être fini et non négatif."
+        )
 
     arrays = {
         "inputs": inputs,
@@ -491,6 +625,12 @@ def validate_dataset_arrays(
         if not np.issubdtype(array.dtype, np.number):
             raise TypeError(
                 f"{name} doit contenir des valeurs numériques."
+            )
+
+        if np.issubdtype(array.dtype, np.complexfloating):
+            raise TypeError(
+                f"{name} doit contenir des valeurs réelles, "
+                "pas complexes."
             )
 
         if not np.all(np.isfinite(array)):
@@ -525,6 +665,21 @@ def validate_dataset_arrays(
             "Le jeu de données est vide."
         )
 
+    if inputs.shape[1] < 2:
+        raise ValueError(
+            "La séquence d'entrée doit contenir au moins X0 et X1."
+        )
+
+    if inputs.shape[2] < 1:
+        raise ValueError(
+            "La dimension d'entrée doit être strictement positive."
+        )
+
+    if not isinstance(metadata, list):
+        raise TypeError(
+            "Les métadonnées doivent être une liste de trajectoires."
+        )
+
     if not (
         len(targets_J)
         == len(targets_A)
@@ -540,15 +695,20 @@ def validate_dataset_arrays(
     seq_len = targets_w.shape[1]
     n_sites = targets_w.shape[2]
 
+    if seq_len < 1:
+        raise ValueError(
+            "Les cibles doivent contenir au moins un pas temporel."
+        )
+
+    if n_sites < 2:
+        raise ValueError(
+            "Le nombre de sites doit être >= 2."
+        )
+
     if inputs.shape[1] != seq_len + 1:
         raise ValueError(
             "Décalage temporel incorrect : les entrées doivent "
             "contenir T+1 états et les cibles T états."
-        )
-
-    if inputs.shape[1] < 2:
-        raise ValueError(
-            "La séquence d'entrée doit contenir au moins X0 et X1."
         )
 
     if inputs.shape[2] < n_sites:
@@ -618,6 +778,12 @@ def validate_dataset_arrays(
 
     for idx, item in enumerate(metadata):
 
+        if not isinstance(item, dict):
+            raise TypeError(
+                f"Les métadonnées de la trajectoire {idx} "
+                "doivent être un objet."
+            )
+
         required = (
             "init_seed",
             "nk_seed",
@@ -631,7 +797,24 @@ def validate_dataset_arrays(
                     f"de la trajectoire {idx}."
                 )
 
-        eta_value = float(item["eta"])
+        metadata_seed_to_int(
+            item["init_seed"],
+            "init_seed",
+            idx,
+        )
+
+        metadata_seed_to_int(
+            item["nk_seed"],
+            "nk_seed",
+            idx,
+        )
+
+        try:
+            eta_value = float(item["eta"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Valeur eta non numérique pour la trajectoire {idx}."
+            ) from exc
 
         if not np.isfinite(eta_value):
             raise ValueError(
@@ -645,9 +828,14 @@ def validate_metadata_schema(
     targets_w: np.ndarray,
 ) -> float:
     """
-    Vérifie que le jeu de données correspond au générateur V2.
+    Vérifie les déclarations du jeu de données correspondant au générateur V2.
 
     Retourne mu, utilisé comme borne supérieure de w.
+
+    Attention :
+    les marqueurs input_policy attestent de la déclaration du générateur.
+    Ils ne permettent pas, à eux seuls, de vérifier l'ordre effectif
+    des caractéristiques dans chaque vecteur d'entrée.
     """
 
     if not isinstance(meta_payload, dict):
@@ -655,9 +843,12 @@ def validate_metadata_schema(
             "La racine du fichier JSON doit être un objet."
         )
 
-    input_policy = str(
-        meta_payload.get("input_policy", "")
-    )
+    input_policy = meta_payload.get("input_policy")
+
+    if not isinstance(input_policy, str):
+        raise TypeError(
+            "input_policy doit être une chaîne de caractères."
+        )
 
     if "X_0_to_X_T" not in input_policy:
         raise ValueError(
@@ -686,7 +877,17 @@ def validate_metadata_schema(
             "Le paramètre mu est absent de la configuration."
         )
 
-    mu_max = float(config["mu"])
+    if isinstance(config["mu"], bool):
+        raise TypeError(
+            "Le paramètre mu doit être numérique, pas booléen."
+        )
+
+    try:
+        mu_max = float(config["mu"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Le paramètre mu doit être numérique."
+        ) from exc
 
     if not np.isfinite(mu_max) or mu_max < 0.0:
         raise ValueError(
@@ -694,7 +895,20 @@ def validate_metadata_schema(
         )
 
     if "input_dim" in meta_payload:
-        declared_dim = int(meta_payload["input_dim"])
+
+        declared_dim = meta_payload["input_dim"]
+
+        if isinstance(declared_dim, bool):
+            raise TypeError(
+                "input_dim dans les métadonnées doit être un entier."
+            )
+
+        try:
+            declared_dim = int(declared_dim)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "input_dim dans les métadonnées n'est pas valide."
+            ) from exc
 
         if declared_dim != inputs.shape[-1]:
             raise ValueError(
@@ -704,8 +918,31 @@ def validate_metadata_schema(
 
     shapes = meta_payload.get("shapes", {})
 
+    if shapes is not None and not isinstance(shapes, dict):
+        raise TypeError(
+            "Le champ shapes des métadonnées doit être un objet."
+        )
+
     if isinstance(shapes, dict) and "targets_w" in shapes:
-        if list(shapes["targets_w"]) != list(targets_w.shape):
+
+        declared_shape = shapes["targets_w"]
+
+        if not isinstance(declared_shape, (list, tuple)):
+            raise TypeError(
+                "La forme déclarée de targets_w doit être une liste."
+            )
+
+        try:
+            declared_shape = tuple(
+                int(value)
+                for value in declared_shape
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "La forme déclarée de targets_w est invalide."
+            ) from exc
+
+        if list(declared_shape) != list(targets_w.shape):
             raise ValueError(
                 "La forme de targets_w dans les métadonnées "
                 "ne correspond pas à l'archive NPZ."
@@ -715,7 +952,144 @@ def validate_metadata_schema(
 
 
 # ======================================================================
-# 7. ENTRAÎNEMENT D'UNE ÉPOQUE
+# 8. CONSTRUCTION DES CATÉGORIES DE GÉNÉRALISATION
+# ======================================================================
+
+def build_generalization_masks(
+    train_metadata: List[Dict[str, Any]],
+    test_metadata: List[Dict[str, Any]],
+) -> Dict[str, np.ndarray]:
+    """
+    Classe les trajectoires de test selon les graines réellement
+    présentes dans l'ensemble d'entraînement.
+
+    new_initial_seed_only :
+        graine initiale absente du train ;
+        graine NK présente dans le train.
+
+    new_NK_seed_only :
+        graine initiale présente dans le train ;
+        graine NK absente du train.
+
+    new_initial_and_NK_seeds :
+        graine initiale absente du train ;
+        graine NK absente du train.
+
+    Cette définition évite de considérer automatiquement une graine
+    comme connue simplement parce qu'elle n'est pas celle qui a été
+    explicitement réservée.
+    """
+
+    if len(train_metadata) == 0:
+        raise ValueError(
+            "Impossible de classifier la généralisation : "
+            "les métadonnées d'entraînement sont vides."
+        )
+
+    if len(test_metadata) == 0:
+        raise ValueError(
+            "Impossible de classifier la généralisation : "
+            "les métadonnées de test sont vides."
+        )
+
+    train_init_seeds = {
+        metadata_seed_to_int(
+            item["init_seed"],
+            "init_seed",
+            idx,
+        )
+        for idx, item in enumerate(train_metadata)
+    }
+
+    train_nk_seeds = {
+        metadata_seed_to_int(
+            item["nk_seed"],
+            "nk_seed",
+            idx,
+        )
+        for idx, item in enumerate(train_metadata)
+    }
+
+    init_seeds = np.asarray(
+        [
+            metadata_seed_to_int(
+                item["init_seed"],
+                "init_seed",
+                idx,
+            )
+            for idx, item in enumerate(test_metadata)
+        ],
+        dtype=np.int64,
+    )
+
+    nk_seeds = np.asarray(
+        [
+            metadata_seed_to_int(
+                item["nk_seed"],
+                "nk_seed",
+                idx,
+            )
+            for idx, item in enumerate(test_metadata)
+        ],
+        dtype=np.int64,
+    )
+
+    etas = np.asarray(
+        [
+            float(item["eta"])
+            for item in test_metadata
+        ],
+        dtype=np.float64,
+    )
+
+    init_seen_in_train = np.asarray(
+        [
+            seed in train_init_seeds
+            for seed in init_seeds
+        ],
+        dtype=bool,
+    )
+
+    nk_seen_in_train = np.asarray(
+        [
+            seed in train_nk_seeds
+            for seed in nk_seeds
+        ],
+        dtype=bool,
+    )
+
+    masks = {
+        "global": np.ones(
+            len(test_metadata),
+            dtype=bool,
+        ),
+
+        "new_initial_seed_only": (
+            ~init_seen_in_train & nk_seen_in_train
+        ),
+
+        "new_NK_seed_only": (
+            init_seen_in_train & ~nk_seen_in_train
+        ),
+
+        "new_initial_and_NK_seeds": (
+            ~init_seen_in_train & ~nk_seen_in_train
+        ),
+
+        "eta_le_0.25": (
+            etas <= 0.25
+        ),
+
+        "eta_gt_0.25": (
+            etas > 0.25
+        ),
+    }
+
+    return masks
+
+
+# ======================================================================
+# 9. ENTRAÎNEMENT D'UNE ÉPOQUE
 # ======================================================================
 
 def train_one_epoch(
@@ -779,7 +1153,7 @@ def train_one_epoch(
             n_sites,
             n_sites,
             offset=1,
-            device=device,
+            device=p_J.device,
         )
 
         # Chaque arête de J est comptée une seule fois.
@@ -803,6 +1177,11 @@ def train_one_epoch(
             + lambda_A * l_A
             + lambda_w * l_w
         )
+
+        if not torch.isfinite(loss).item():
+            raise FloatingPointError(
+                "La fonction de perte est devenue non finie."
+            )
 
         loss.backward()
 
@@ -836,16 +1215,15 @@ def train_one_epoch(
 
 
 # ======================================================================
-# 8. ÉVALUATION STRATIFIÉE
+# 10. ÉVALUATION STRATIFIÉE
 # ======================================================================
 
 def evaluate_stratified(
     model: LatentGeometryPathLSTM,
+    train_metadata: List[Dict[str, Any]],
     test_dataset: TrajectoryReconstructionDataset,
     test_metadata: List[Dict[str, Any]],
     device: str,
-    test_init_seed: int,
-    test_nk_seed: int,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Évalue séparément :
@@ -854,13 +1232,15 @@ def evaluate_stratified(
             toutes les trajectoires réservées au test ;
 
         new_initial_seed_only :
-            nouvelle graine initiale, paysage déjà rencontré ;
+            graine initiale absente du train,
+            graine NK présente dans le train ;
 
         new_NK_seed_only :
-            nouveau paysage NK, graine initiale déjà rencontrée ;
+            graine initiale présente dans le train,
+            graine NK absente du train ;
 
         new_initial_and_NK_seeds :
-            nouvelle graine initiale et nouveau paysage NK ;
+            graines initiale et NK absentes du train ;
 
         eta_le_0.25 :
             régime eta <= 0.25 ;
@@ -878,6 +1258,11 @@ def evaluate_stratified(
         raise ValueError(
             "Les métadonnées de test ne correspondent pas au dataset."
         )
+
+    masks = build_generalization_masks(
+        train_metadata=train_metadata,
+        test_metadata=test_metadata,
+    )
 
     model.eval()
 
@@ -931,56 +1316,6 @@ def evaluate_stratified(
     t_A = test_dataset.targets_A
     t_w = test_dataset.targets_w
 
-    etas = np.asarray(
-        [
-            float(item["eta"])
-            for item in test_metadata
-        ],
-        dtype=np.float64,
-    )
-
-    init_seeds = np.asarray(
-        [
-            int(item["init_seed"])
-            for item in test_metadata
-        ],
-        dtype=np.int64,
-    )
-
-    nk_seeds = np.asarray(
-        [
-            int(item["nk_seed"])
-            for item in test_metadata
-        ],
-        dtype=np.int64,
-    )
-
-    is_new_init = init_seeds == int(test_init_seed)
-    is_new_nk = nk_seeds == int(test_nk_seed)
-
-    masks = {
-        "global": np.ones(
-            len(etas),
-            dtype=bool,
-        ),
-
-        "new_initial_seed_only": (
-            is_new_init & ~is_new_nk
-        ),
-
-        "new_NK_seed_only": (
-            ~is_new_init & is_new_nk
-        ),
-
-        "new_initial_and_NK_seeds": (
-            is_new_init & is_new_nk
-        ),
-
-        "eta_le_0.25": etas <= 0.25,
-
-        "eta_gt_0.25": etas > 0.25,
-    }
-
     report: Dict[str, Dict[str, Any]] = {}
 
     for name, mask in masks.items():
@@ -1011,7 +1346,7 @@ def evaluate_stratified(
 
 
 # ======================================================================
-# 9. LECTURE DES MÉTADONNÉES
+# 11. LECTURE DES MÉTADONNÉES
 # ======================================================================
 
 def load_records(
@@ -1036,7 +1371,7 @@ def load_records(
 
 
 # ======================================================================
-# 10. AFFICHAGE DES MÉTRIQUES
+# 12. AFFICHAGE DES MÉTRIQUES
 # ======================================================================
 
 def print_evaluation_report(
@@ -1076,7 +1411,7 @@ def print_evaluation_report(
 
 
 # ======================================================================
-# 11. PROGRAMME PRINCIPAL
+# 13. PROGRAMME PRINCIPAL
 # ======================================================================
 
 def main() -> None:
@@ -1204,6 +1539,11 @@ def main() -> None:
             "num-layers doit être >= 1."
         )
 
+    if not np.isfinite(args.dropout):
+        raise ValueError(
+            "dropout doit être fini."
+        )
+
     if not (0.0 <= args.dropout < 1.0):
         raise ValueError(
             "dropout doit appartenir à [0, 1)."
@@ -1214,21 +1554,25 @@ def main() -> None:
             "lr doit être strictement positif et fini."
         )
 
-    if min(
-        args.lambda_J,
-        args.lambda_A,
-        args.lambda_w,
-    ) < 0:
-        raise ValueError(
-            "Les coefficients de perte doivent être >= 0."
-        )
+    loss_weights = {
+        "lambda_J": args.lambda_J,
+        "lambda_A": args.lambda_A,
+        "lambda_w": args.lambda_w,
+    }
 
-    if (
-        args.lambda_J
-        + args.lambda_A
-        + args.lambda_w
-        <= 0
-    ):
+    for name, value in loss_weights.items():
+
+        if not np.isfinite(value):
+            raise ValueError(
+                f"{name} doit être fini."
+            )
+
+        if value < 0:
+            raise ValueError(
+                f"{name} doit être >= 0."
+            )
+
+    if sum(loss_weights.values()) <= 0:
         raise ValueError(
             "Au moins un coefficient de perte doit être positif."
         )
@@ -1358,49 +1702,75 @@ def main() -> None:
         targets_w[test_idx],
     )
 
+    train_meta = [
+        metadata[int(i)]
+        for i in train_idx
+    ]
+
     test_meta = [
         metadata[int(i)]
         for i in test_idx
     ]
 
     # --------------------------------------------------------------
+    # Vérification du découpage des graines
+    # --------------------------------------------------------------
+
+    train_init_values = {
+        metadata_seed_to_int(
+            item["init_seed"],
+            "init_seed",
+            idx,
+        )
+        for idx, item in enumerate(train_meta)
+    }
+
+    train_nk_values = {
+        metadata_seed_to_int(
+            item["nk_seed"],
+            "nk_seed",
+            idx,
+        )
+        for idx, item in enumerate(train_meta)
+    }
+
+    if args.test_init_seed in train_init_values:
+        raise RuntimeError(
+            "Fuite détectée : la graine initiale réservée "
+            "est présente dans l'entraînement."
+        )
+
+    if args.test_nk_seed in train_nk_values:
+        raise RuntimeError(
+            "Fuite détectée : la graine NK réservée "
+            "est présente dans l'entraînement."
+        )
+
+    # --------------------------------------------------------------
     # Comptage des catégories de généralisation
     # --------------------------------------------------------------
 
-    test_init_values = np.asarray(
-        [
-            int(item["init_seed"])
-            for item in test_meta
-        ],
-        dtype=np.int64,
-    )
-
-    test_nk_values = np.asarray(
-        [
-            int(item["nk_seed"])
-            for item in test_meta
-        ],
-        dtype=np.int64,
-    )
-
-    init_is_new = (
-        test_init_values == args.test_init_seed
-    )
-
-    nk_is_new = (
-        test_nk_values == args.test_nk_seed
+    generalization_masks = build_generalization_masks(
+        train_metadata=train_meta,
+        test_metadata=test_meta,
     )
 
     count_new_init_only = int(
-        np.sum(init_is_new & ~nk_is_new)
+        np.sum(
+            generalization_masks["new_initial_seed_only"]
+        )
     )
 
     count_new_nk_only = int(
-        np.sum(~init_is_new & nk_is_new)
+        np.sum(
+            generalization_masks["new_NK_seed_only"]
+        )
     )
 
     count_new_both = int(
-        np.sum(init_is_new & nk_is_new)
+        np.sum(
+            generalization_masks["new_initial_and_NK_seeds"]
+        )
     )
 
     # --------------------------------------------------------------
@@ -1583,11 +1953,10 @@ def main() -> None:
 
     results = evaluate_stratified(
         model=model,
+        train_metadata=train_meta,
         test_dataset=test_set,
         test_metadata=test_meta,
         device=device,
-        test_init_seed=args.test_init_seed,
-        test_nk_seed=args.test_nk_seed,
     )
 
     print_evaluation_report(
@@ -1618,12 +1987,16 @@ def main() -> None:
                 "num_layers": args.num_layers,
                 "dropout": args.dropout,
                 "mu_max": mu_max,
+                "seed": args.seed,
+                "test_init_seed": args.test_init_seed,
+                "test_nk_seed": args.test_nk_seed,
                 "input_policy": (
                     "X_0:T + eta + J0 + NK_landscape"
                 ),
                 "target_alignment": (
                     "J_1:T + A_1:T + w_1:T"
                 ),
+                "loss_weights": loss_weights,
             },
             model_path,
         )
