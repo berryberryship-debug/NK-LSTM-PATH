@@ -2,82 +2,320 @@
 generateur_trajectoires_nk_lstm.py
 Projet : NK-LSTM-PATH
 
-Générateur de trajectoires propres à NK-LSTM-PATH à partir de :
-    - nk_landscape.py
-    - fiber_bundle.py
-    - trajectories.py
+Génération de trajectoires pour la reconstruction séquence-à-séquence.
 
-Entrées observées fournies au LSTM : histoire des spins X_{0:T} et paramètre eta.
-Cibles latentes à reconstruire : géométrie J_t, accessibilité A_t et taux w_t.
+Entrées du LSTM :
+    - histoire complète des spins X_0, ..., X_T ;
+    - paramètre eta ;
+    - géométrie initiale J_0 ;
+    - représentation explicite du paysage NK :
+        * matrice des voisinages ;
+        * tables de contributions locales.
+
+Cibles :
+    - J_1, ..., J_T ;
+    - A_1, ..., A_T ;
+    - w_1, ..., w_T.
+
+Le site muté n'est pas transmis sous forme de one-hot.
+La séquence des spins permet d'observer les changements d'état.
+
+Les cibles sont alignées sur les états post-mutation.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
 import json
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from fiber_bundle import accessibility_A, mutate_postflip
+
+# ----------------------------------------------------------------------
+# Résolution des modules du dépôt
+# ----------------------------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from fiber_bundle import accessibility_A, mutate_postflip, pack_J
 from nk_landscape import NKLandscape
 from trajectories import transition_rates
 
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class TrajectoryGenConfig:
     n_sites: int = 6
     seq_len: int = 6
     n_trajectories_per_seed: int = 10
+
     scale_J: float = 0.2
+
     init_seeds: Tuple[int, ...] = (7, 13, 21, 42, 99)
     nk_seeds: Tuple[int, ...] = (7, 13, 21, 42, 99)
-    eta_values: Tuple[float, ...] = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
+
+    eta_values: Tuple[float, ...] = (
+        0.0,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+    )
+
     mu: float = 1.0
     beta: float = 1.0
     theta_A: float = 0.1
     lam: float = 0.5
+
     nk_K: int = 3
     schedule_seed: int = 2026
 
+
+# ----------------------------------------------------------------------
+# Validation
+# ----------------------------------------------------------------------
+
+def validate_config(cfg: TrajectoryGenConfig) -> None:
+    if cfg.n_sites < 2:
+        raise ValueError("n_sites doit être >= 2.")
+
+    if cfg.seq_len < 1:
+        raise ValueError("seq_len doit être >= 1.")
+
+    if cfg.n_trajectories_per_seed < 1:
+        raise ValueError("n_trajectories_per_seed doit être >= 1.")
+
+    if not (0 <= cfg.nk_K < cfg.n_sites):
+        raise ValueError("nk_K doit vérifier 0 <= K < n_sites.")
+
+    if cfg.scale_J < 0:
+        raise ValueError("scale_J doit être >= 0.")
+
+    if cfg.mu < 0:
+        raise ValueError("mu doit être >= 0.")
+
+    if not np.isfinite(cfg.beta):
+        raise ValueError("beta doit être fini.")
+
+    if not np.isfinite(cfg.theta_A):
+        raise ValueError("theta_A doit être fini.")
+
+    if not np.isfinite(cfg.lam):
+        raise ValueError("lam doit être fini.")
+
+    if not cfg.init_seeds or not cfg.nk_seeds:
+        raise ValueError("Les listes de graines ne peuvent pas être vides.")
+
+    if not cfg.eta_values:
+        raise ValueError("eta_values ne peut pas être vide.")
+
+    if not all(np.isfinite(float(x)) for x in cfg.eta_values):
+        raise ValueError("Toutes les valeurs de eta doivent être finies.")
+
+
+# ----------------------------------------------------------------------
+# Configurations initiales
+# ----------------------------------------------------------------------
 
 def sample_initial_spin_and_coupling(
     n_sites: int,
     rng: np.random.Generator,
     scale_J: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    X0 = rng.choice(np.array([-1.0, 1.0], dtype=np.float64), size=(n_sites,))
-    raw_J = rng.normal(0.0, scale_J, size=(n_sites, n_sites))
+
+    X0 = rng.choice(
+        np.array([-1.0, 1.0], dtype=np.float64),
+        size=n_sites,
+    )
+
+    raw_J = rng.normal(
+        loc=0.0,
+        scale=scale_J,
+        size=(n_sites, n_sites),
+    )
+
     J0 = 0.5 * (raw_J + raw_J.T)
     np.fill_diagonal(J0, 0.0)
+
     return X0, J0
 
 
-def build_spin_only_inputs(
-    X_seq: np.ndarray,
-    mutation_sites: Sequence[int],
-    eta: float,
-    include_site_onehot: bool = True,
+# ----------------------------------------------------------------------
+# Encodage explicite du paysage NK
+# ----------------------------------------------------------------------
+
+def encode_nk_landscape(
+    landscape: NKLandscape,
+    n_sites: int,
+    nk_K: int,
 ) -> np.ndarray:
     """
-    Construit les séquences d'entrée contenant uniquement l'histoire des spins X_t
-    et le paramètre eta (jamais J_t, A_t ni w_t).
+    Représentation complète des deux structures du paysage NK.
+
+    Voisinages :
+        neighbors.shape = (N, K)
+
+    Encodage :
+        one-hot des indices de voisinage, forme (N, K, N).
+
+    Tables :
+        tables.shape = (N, 2**(K+1))
+
+    Le vecteur final contient :
+        - voisinages encodés ;
+        - tables de contributions ;
+        - K normalisé.
+
+    Aucun attribut non présent dans NKLandscape n'est utilisé.
     """
-    seq_len, n_sites = X_seq.shape
-    eta_col = np.full((seq_len, 1), float(eta), dtype=np.float64)
-    eta2_col = np.full((seq_len, 1), float(eta) ** 2, dtype=np.float64)
 
-    parts = [np.asarray(X_seq, dtype=np.float64), eta_col, eta2_col]
-    if include_site_onehot:
-        onehot = np.zeros((seq_len, n_sites), dtype=np.float64)
-        for t, site_k in enumerate(mutation_sites):
-            onehot[t, int(site_k)] = 1.0
-        parts.append(onehot)
+    neighbors = np.asarray(
+        landscape.neighbors,
+        dtype=np.int64,
+    )
 
-    return np.concatenate(parts, axis=-1)
+    tables = np.asarray(
+        landscape.tables,
+        dtype=np.float64,
+    )
 
+    expected_neighbors = (n_sites, nk_K)
+    expected_tables = (n_sites, 2 ** (nk_K + 1))
+
+    if neighbors.shape != expected_neighbors:
+        raise ValueError(
+            f"Forme de neighbors incorrecte : "
+            f"{neighbors.shape}, attendue : {expected_neighbors}."
+        )
+
+    if tables.shape != expected_tables:
+        raise ValueError(
+            f"Forme de tables incorrecte : "
+            f"{tables.shape}, attendue : {expected_tables}."
+        )
+
+    if not np.all(np.isfinite(tables)):
+        raise ValueError("Les tables NK contiennent des valeurs non finies.")
+
+    if np.any(neighbors < 0) or np.any(neighbors >= n_sites):
+        raise ValueError("Les indices des voisinages NK sont invalides.")
+
+    # Encodage one-hot des indices des voisins.
+    neighbor_onehot = np.eye(
+        n_sites,
+        dtype=np.float64,
+    )[neighbors]
+
+    neighbor_features = neighbor_onehot.reshape(-1)
+
+    table_features = tables.reshape(-1)
+
+    k_feature = np.array(
+        [nk_K / max(1, n_sites - 1)],
+        dtype=np.float64,
+    )
+
+    encoded = np.concatenate(
+        [
+            neighbor_features,
+            table_features,
+            k_feature,
+        ]
+    )
+
+    return encoded.astype(np.float64)
+
+
+# ----------------------------------------------------------------------
+# Construction des entrées temporelles
+# ----------------------------------------------------------------------
+
+def build_inputs(
+    X_full: np.ndarray,
+    eta: float,
+    J0: np.ndarray,
+    nk_features: np.ndarray,
+) -> np.ndarray:
+    """
+    Construit les entrées de longueur T+1.
+
+    À chaque pas :
+        [X_t, eta, pack(J0), représentation NK]
+
+    X_full contient X0, X1, ..., XT.
+
+    J0 et le paysage NK sont répétés à chaque pas afin de fournir
+    le contexte statique au LSTM.
+
+    Aucun site muté one-hot n'est ajouté.
+    """
+
+    X_full = np.asarray(X_full, dtype=np.float64)
+    J0 = np.asarray(J0, dtype=np.float64)
+    nk_features = np.asarray(nk_features, dtype=np.float64)
+
+    if X_full.ndim != 2:
+        raise ValueError("X_full doit être une matrice (T+1, N).")
+
+    seq_len, n_sites = X_full.shape
+
+    if J0.shape != (n_sites, n_sites):
+        raise ValueError("J0 et X_full ont des dimensions incompatibles.")
+
+    if nk_features.ndim != 1:
+        raise ValueError("nk_features doit être un vecteur.")
+
+    J0_features = pack_J(J0)
+
+    eta_column = np.full(
+        (seq_len, 1),
+        float(eta),
+        dtype=np.float64,
+    )
+
+    J0_repeated = np.repeat(
+        J0_features[None, :],
+        seq_len,
+        axis=0,
+    )
+
+    nk_repeated = np.repeat(
+        nk_features[None, :],
+        seq_len,
+        axis=0,
+    )
+
+    inputs = np.concatenate(
+        [
+            X_full,
+            eta_column,
+            J0_repeated,
+            nk_repeated,
+        ],
+        axis=1,
+    )
+
+    if not np.all(np.isfinite(inputs)):
+        raise ValueError("Les entrées contiennent des valeurs non finies.")
+
+    return inputs
+
+
+# ----------------------------------------------------------------------
+# Simulation d'une trajectoire
+# ----------------------------------------------------------------------
 
 def simulate_single_trajectory(
     X0: np.ndarray,
@@ -90,30 +328,57 @@ def simulate_single_trajectory(
     theta_A: float,
     lam: float,
 ) -> Dict[str, np.ndarray]:
-    """
-    Simule une trajectoire discrète de longueur T et retourne :
-      - X_seq : (T, n_sites)
-      - J_seq : (T, n_sites, n_sites)
-      - A_seq : (T, n_sites)
-      - w_seq : (T, n_sites)
-    """
+
     X_curr = np.asarray(X0, dtype=np.float64).copy()
     J_curr = np.asarray(J0, dtype=np.float64).copy()
 
     seq_len = len(mutation_sites)
     n_sites = X_curr.size
 
-    X_seq = np.empty((seq_len, n_sites), dtype=np.float64)
-    J_seq = np.empty((seq_len, n_sites, n_sites), dtype=np.float64)
-    A_seq = np.empty((seq_len, n_sites), dtype=np.float64)
-    w_seq = np.empty((seq_len, n_sites), dtype=np.float64)
+    X_seq = np.empty(
+        (seq_len, n_sites),
+        dtype=np.float64,
+    )
+
+    J_seq = np.empty(
+        (seq_len, n_sites, n_sites),
+        dtype=np.float64,
+    )
+
+    A_seq = np.empty(
+        (seq_len, n_sites),
+        dtype=np.float64,
+    )
+
+    w_seq = np.empty(
+        (seq_len, n_sites),
+        dtype=np.float64,
+    )
 
     for t, site_k in enumerate(mutation_sites):
-        X_next, J_next = mutate_postflip(X_curr, J_curr, int(site_k), float(eta))
-        X_curr = np.asarray(X_next, dtype=np.float64)
-        J_curr = np.asarray(J_next, dtype=np.float64)
 
-        A_curr = np.asarray(accessibility_A(J_curr), dtype=np.float64)
+        X_next, J_next = mutate_postflip(
+            X_curr,
+            J_curr,
+            int(site_k),
+            float(eta),
+        )
+
+        X_curr = np.asarray(
+            X_next,
+            dtype=np.float64,
+        )
+
+        J_curr = np.asarray(
+            J_next,
+            dtype=np.float64,
+        )
+
+        A_curr = np.asarray(
+            accessibility_A(J_curr),
+            dtype=np.float64,
+        )
+
         w_curr = np.asarray(
             transition_rates(
                 X=X_curr,
@@ -140,28 +405,67 @@ def simulate_single_trajectory(
     }
 
 
-def generate_dataset(cfg: TrajectoryGenConfig) -> Dict[str, object]:
-    initial_by_seed: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {}
+# ----------------------------------------------------------------------
+# Génération du jeu de données
+# ----------------------------------------------------------------------
+
+def generate_dataset(
+    cfg: TrajectoryGenConfig,
+) -> Dict[str, object]:
+
+    validate_config(cfg)
+
+    initial_by_seed: Dict[
+        int,
+        List[Tuple[np.ndarray, np.ndarray]]
+    ] = {}
+
     for s_init in cfg.init_seeds:
+
         rng_init = np.random.default_rng(int(s_init))
+
         initial_by_seed[int(s_init)] = [
-            sample_initial_spin_and_coupling(cfg.n_sites, rng_init, cfg.scale_J)
+            sample_initial_spin_and_coupling(
+                cfg.n_sites,
+                rng_init,
+                cfg.scale_J,
+            )
             for _ in range(cfg.n_trajectories_per_seed)
         ]
 
-    landscapes_by_seed: Dict[int, NKLandscape] = {
-        int(s_nk): NKLandscape.generate(
+    landscapes_by_seed: Dict[int, NKLandscape] = {}
+
+    nk_features_by_seed: Dict[int, np.ndarray] = {}
+
+    for s_nk in cfg.nk_seeds:
+
+        landscape = NKLandscape.generate(
             n_spins=cfg.n_sites,
             k_epistasis=cfg.nk_K,
             seed=int(s_nk),
             neighbor_mode="random",
         )
-        for s_nk in cfg.nk_seeds
-    }
 
+        landscapes_by_seed[int(s_nk)] = landscape
+
+        nk_features_by_seed[int(s_nk)] = encode_nk_landscape(
+            landscape=landscape,
+            n_sites=cfg.n_sites,
+            nk_K=cfg.nk_K,
+        )
+
+    # Les calendriers sont communs aux graines initiales et NK.
     rng_sched = np.random.default_rng(cfg.schedule_seed)
+
     schedules: List[List[int]] = [
-        [int(k) for k in rng_sched.integers(0, cfg.n_sites, size=cfg.seq_len)]
+        [
+            int(k)
+            for k in rng_sched.integers(
+                0,
+                cfg.n_sites,
+                size=cfg.seq_len,
+            )
+        ]
         for _ in range(cfg.n_trajectories_per_seed)
     ]
 
@@ -169,64 +473,133 @@ def generate_dataset(cfg: TrajectoryGenConfig) -> Dict[str, object]:
     J_targets_list: List[np.ndarray] = []
     A_targets_list: List[np.ndarray] = []
     w_targets_list: List[np.ndarray] = []
+
     records: List[Dict[str, object]] = []
 
     traj_counter = 0
+
     for s_init in cfg.init_seeds:
+
         init_list = initial_by_seed[int(s_init)]
+
         for traj_idx, (X0, J0) in enumerate(init_list):
-            sched = schedules[traj_idx]
+
+            schedule = schedules[traj_idx]
+
             for s_nk in cfg.nk_seeds:
+
                 landscape = landscapes_by_seed[int(s_nk)]
-                for eta_val in cfg.eta_values:
+                nk_features = nk_features_by_seed[int(s_nk)]
+
+                for eta_value in cfg.eta_values:
+
                     sim = simulate_single_trajectory(
                         X0=X0,
                         J0=J0,
-                        mutation_sites=sched,
+                        mutation_sites=schedule,
                         landscape=landscape,
-                        eta=float(eta_val),
+                        eta=float(eta_value),
                         mu=cfg.mu,
                         beta=cfg.beta,
                         theta_A=cfg.theta_A,
                         lam=cfg.lam,
                     )
-                    x_in = build_spin_only_inputs(
-                        X_seq=sim["X_seq"],
-                        mutation_sites=sched,
-                        eta=float(eta_val),
-                        include_site_onehot=True,
+
+                    # X0 est explicitement conservé.
+                    X_full = np.vstack(
+                        [
+                            np.asarray(X0, dtype=np.float64)[None, :],
+                            sim["X_seq"],
+                        ]
                     )
+
+                    x_in = build_inputs(
+                        X_full=X_full,
+                        eta=float(eta_value),
+                        J0=J0,
+                        nk_features=nk_features,
+                    )
+
                     inputs_list.append(x_in)
+
                     J_targets_list.append(sim["J_seq"])
                     A_targets_list.append(sim["A_seq"])
                     w_targets_list.append(sim["w_seq"])
 
-                    trajectory_id = f"traj_{traj_counter:05d}_init{int(s_init)}_nk{int(s_nk)}_eta{float(eta_val):g}"
+                    trajectory_id = (
+                        f"traj_{traj_counter:05d}"
+                        f"_init{int(s_init)}"
+                        f"_nk{int(s_nk)}"
+                        f"_eta{float(eta_value):g}"
+                    )
+
                     records.append(
                         {
                             "trajectory_id": trajectory_id,
                             "traj_index": int(traj_counter),
                             "init_seed": int(s_init),
                             "nk_seed": int(s_nk),
-                            "eta": float(eta_val),
-                            "mutation_sites": sched,
+                            "eta": float(eta_value),
+                            "mutation_sites": [
+                                int(k) for k in schedule
+                            ],
                         }
                     )
+
                     traj_counter += 1
 
-    return {
-        "inputs": np.asarray(inputs_list, dtype=np.float64),
-        "targets_J": np.asarray(J_targets_list, dtype=np.float64),
-        "targets_A": np.asarray(A_targets_list, dtype=np.float64),
-        "targets_w": np.asarray(w_targets_list, dtype=np.float64),
+    dataset = {
+        "inputs": np.asarray(inputs_list, dtype=np.float32),
+        "targets_J": np.asarray(J_targets_list, dtype=np.float32),
+        "targets_A": np.asarray(A_targets_list, dtype=np.float32),
+        "targets_w": np.asarray(w_targets_list, dtype=np.float32),
         "metadata": records,
     }
 
+    # Contrôle des dimensions avant sauvegarde.
+    if dataset["inputs"].shape[1] != cfg.seq_len + 1:
+        raise RuntimeError("Longueur temporelle des entrées incorrecte.")
 
-def save_dataset(dataset: Dict[str, object], cfg: TrajectoryGenConfig, out_prefix: str | Path) -> Tuple[Path, Path]:
+    if dataset["targets_J"].shape[1] != cfg.seq_len:
+        raise RuntimeError("Longueur temporelle de J incorrecte.")
+
+    if dataset["targets_A"].shape[1] != cfg.seq_len:
+        raise RuntimeError("Longueur temporelle de A incorrecte.")
+
+    if dataset["targets_w"].shape[1] != cfg.seq_len:
+        raise RuntimeError("Longueur temporelle de w incorrecte.")
+
+    if not (
+        len(dataset["inputs"])
+        == len(dataset["targets_J"])
+        == len(dataset["targets_A"])
+        == len(dataset["targets_w"])
+        == len(records)
+    ):
+        raise RuntimeError("Les nombres de trajectoires ne correspondent pas.")
+
+    return dataset
+
+
+# ----------------------------------------------------------------------
+# Sauvegarde
+# ----------------------------------------------------------------------
+
+def save_dataset(
+    dataset: Dict[str, object],
+    cfg: TrajectoryGenConfig,
+    out_prefix: str | Path,
+) -> Tuple[Path, Path]:
+
     prefix = Path(out_prefix)
+
     npz_path = prefix.with_suffix(".npz")
     json_path = Path(f"{prefix}_metadata.json")
+
+    npz_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     np.savez_compressed(
         npz_path,
@@ -235,9 +608,31 @@ def save_dataset(dataset: Dict[str, object], cfg: TrajectoryGenConfig, out_prefi
         targets_A=dataset["targets_A"],
         targets_w=dataset["targets_w"],
     )
+
+    input_dim = int(
+        np.asarray(dataset["inputs"]).shape[-1]
+    )
+
     meta_doc = {
         "project": "NK-LSTM-PATH",
-        "input_policy": "spin_history_and_eta_only (J, A, w excluded from inputs)",
+        "version": "0.5",
+        "input_policy": (
+            "X_0_to_X_T + eta + packed_J0 + "
+            "NK_neighbors_onehot + NK_local_tables"
+        ),
+        "target_alignment": (
+            "J_1_to_J_T, A_1_to_A_T, w_1_to_w_T; "
+            "targets correspond to post-mutation states"
+        ),
+        "nk_representation": {
+            "neighbors": "one-hot encoded neighbor indices",
+            "tables": "flattened local contribution tables",
+            "K": "normalized scalar",
+        },
+        "initial_geometry": (
+            "J0 packed using the strict upper triangle "
+            "in lexicographic order"
+        ),
         "config": asdict(cfg),
         "shapes": {
             "inputs": list(np.asarray(dataset["inputs"]).shape),
@@ -245,24 +640,49 @@ def save_dataset(dataset: Dict[str, object], cfg: TrajectoryGenConfig, out_prefi
             "targets_A": list(np.asarray(dataset["targets_A"]).shape),
             "targets_w": list(np.asarray(dataset["targets_w"]).shape),
         },
+        "input_dim": input_dim,
         "trajectories": dataset["metadata"],
     }
-    json_path.write_text(json.dumps(meta_doc, indent=2), encoding="utf-8")
+
+    json_path.write_text(
+        json.dumps(meta_doc, indent=2),
+        encoding="utf-8",
+    )
+
     return npz_path, json_path
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+# ----------------------------------------------------------------------
+# Programme principal
+# ----------------------------------------------------------------------
+
+def main(
+    argv: Optional[Sequence[str]] = None,
+) -> None:
+
     parser = argparse.ArgumentParser(
-        description="Générateur propre de trajectoires NK-LSTM-PATH (entrées X_{0:T}, eta ; cibles J, A, w)"
+        description=(
+            "Générateur NK-LSTM-PATH : "
+            "X_0:T, eta, J0 et paysage NK vers J, A, w."
+        )
     )
+
     parser.add_argument("--seq-len", type=int, default=6)
     parser.add_argument("--n-trajectories", type=int, default=10)
+
     parser.add_argument("--mu", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--theta-A", type=float, default=0.1)
     parser.add_argument("--lam", type=float, default=0.5)
+
     parser.add_argument("--nk-K", type=int, default=3)
-    parser.add_argument("--out-prefix", type=str, default="nk_lstm_path_trajectoires")
+
+    parser.add_argument(
+        "--out-prefix",
+        type=str,
+        default="nk_lstm_path_trajectoires_v2",
+    )
+
     args = parser.parse_args(argv)
 
     cfg = TrajectoryGenConfig(
@@ -275,18 +695,42 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         lam=args.lam,
         nk_K=args.nk_K,
     )
+
     dataset = generate_dataset(cfg)
-    npz_path, json_path = save_dataset(dataset, cfg, args.out_prefix)
+
+    npz_path, json_path = save_dataset(
+        dataset,
+        cfg,
+        args.out_prefix,
+    )
 
     print("=" * 82)
-    print("TRAJECTOIRES NK-LSTM-PATH GÉNÉRÉES (HISTOIRE X_{0:T} + ETA -> CIBLES J, A, w)")
+    print("GÉNÉRATION NK-LSTM-PATH — V2")
     print("=" * 82)
-    print(f"Entrées (N_traj, T, D_in) : {np.asarray(dataset['inputs']).shape}")
-    print(f"Cibles J_t                : {np.asarray(dataset['targets_J']).shape}")
-    print(f"Cibles A_t                : {np.asarray(dataset['targets_A']).shape}")
-    print(f"Cibles w_t                : {np.asarray(dataset['targets_w']).shape}")
-    print(f"Archive tenseurs          : {npz_path}")
-    print(f"Métadonnées trajectoires  : {json_path}")
+
+    print("Entrées : X_0:T + eta + J0 + représentation NK")
+    print("Cibles  : J_1:T + A_1:T + w_1:T")
+    print("One-hot des sites mutés : absent")
+
+    print(
+        f"Inputs    : {np.asarray(dataset['inputs']).shape}"
+    )
+
+    print(
+        f"Targets J : {np.asarray(dataset['targets_J']).shape}"
+    )
+
+    print(
+        f"Targets A : {np.asarray(dataset['targets_A']).shape}"
+    )
+
+    print(
+        f"Targets w : {np.asarray(dataset['targets_w']).shape}"
+    )
+
+    print(f"Archive   : {npz_path}")
+    print(f"Métadonnées : {json_path}")
+
     print("=" * 82)
 
 
