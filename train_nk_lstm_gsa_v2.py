@@ -2,119 +2,93 @@
 """
 train_nk_lstm_gsa_v2.py
 
-NK-LSTM-GSA V2 : architecture unifiée temporelle (LSTM) et géométrique (GSA).
+Entraînement et ablation de l'architecture hybride NK-LSTM-GSA V2,
+directement adossée au noyau géométrique `gsa_v1_core.py`.
 
-Périmètre V2 :
-- Entraînement sur les données NK existantes.
-- Prédiction terminale.
-- Prédiction du chemin / action suivante.
-- Dépendance à l'ordre temporel.
-- Régularisation de la GSA.
-
-Périmètre V3, implémenté mais désactivé :
-- Fermeture / retour au départ.
-- Métrique riemannienne.
-- Potentiel d'obstacle.
-- Supervision de transition.
-- Environnement hypercube.
-
-Le script ne fabrique pas de cibles spatiales artificielles.
+Invariants préservés :
+- Entrées exactes sur l'hypercube {-1, +1}^N : (x_seq, act_idx, j0, pad_mask).
+- Action géométrique observée S_obs[b, i, j] = sum_{t=j}^{i-1} c_theta(x[t], act[t]).
+- Antisymétrie exacte Omega_hat(a, b) = -Omega_hat(b, a) via `predict_path_pair`.
+- Découpage groupé par `initial_state_id` via `split_indices_by_initial_state`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-import os
 import random
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Literal
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+
+from gsa_v1_core import (
+    ForcedPairDataset,
+    GSAConfig,
+    GSAPathModel,
+    GeometryMode,
+    TransportMode,
+    build_forced_pair_dataset,
+    closure_metrics,
+    paired_gsa_loss,
+    predict_path_pair,
+    split_indices_by_initial_state,
+)
+
+ArchMode = Literal["lstm_only", "gsa_only", "hybrid_concat", "hybrid_gated"]
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-@dataclass
-class V2Config:
-    # Données
-    data_path: str = "data/nk_sequences.npz"
-    obs_key: str = "observations"
-    action_key: str = "actions"
-    target_key: str = "targets"
-    lengths_key: str = "lengths"
-    val_fraction: float = 0.15
-    test_fraction: float = 0.10
-
-    # Architecture
-    obs_dim: int = 64
-    action_dim: int = 8
-    target_dim: int = 64
-    d_model: int = 128
-    lstm_layers: int = 2
-    lstm_dropout: float = 0.10
-    gsa_layers: int = 1
+@dataclass(frozen=True)
+class TrainV2Config:
+    # Architecture et ablations
+    arch_mode: ArchMode = "hybrid_concat"
+    geometry_mode: GeometryMode = "learned"
+    n_sites: int = 6
+    d_model: int = 64
     n_heads: int = 4
-    ffn_dim: int = 256
-    dropout: float = 0.10
-    fusion: str = "concat"  # "concat" ou "gated"
-    causal_attention: bool = True
+    gsa_layers: int = 2
+    lstm_layers: int = 2
+    ff_mult: int = 4
+    dropout: float = 0.0
+    beta_action: float = 1.0
+    max_len: int = 32
+    edge_eps: float = 1e-4
 
-    # GSA
-    beta_init: float = 0.5
-    learn_beta: bool = True
-    action_bias_dim: int = 32
+    # Données et physique NK
+    transport_mode: TransportMode = "symmetric"
+    n_initial_states: int = 64
+    eta: float = 0.25
+    scale_j: float = 0.5
+    dataset_npz: str | None = None
+    synthetic_smoke: bool = False
+    train_fraction: float = 0.60
+    validation_fraction: float = 0.20
 
-    # Entraînement
-    batch_size: int = 64
-    epochs: int = 100
-    lr: float = 3e-4
+    # Optimisation et pertes
+    batch_size: int = 32
+    epochs: int = 60
+    lr: float = 1e-3
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
-    scheduler: str = "cosine"
-    warmup_epochs: int = 3
-    early_stopping_patience: int = 12
-    min_delta: float = 1e-4
+    lambda_omega: float = 1.0
+    lambda_geometry: float = 1e-3
+    early_stopping_patience: int = 15
+    min_delta: float = 1e-6
 
-    # Pertes V2
-    lambda_terminal: float = 1.0
-    lambda_path: float = 1.0
-    lambda_order: float = 0.25
-    lambda_gsa_reg: float = 1e-3
-    epsilon: float = 1e-3
-
-    # Pertes V3 : désactivées en V2
-    use_closure_loss: bool = False
-    use_metric_loss: bool = False
-    use_potential_loss: bool = False
-    use_transition_supervision: bool = False
-    use_navigation_env: bool = False
-
-    lambda_closure: float = 0.0
-    lambda_metric: float = 0.0
-    lambda_potential: float = 0.0
-    lambda_transition: float = 0.0
-
-    # Reproductibilité et sortie
-    seed: int = 1337
-    num_workers: int = 2
+    # Reproductibilité et sorties
+    seed: int = 7
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     output_dir: str = "runs/nk_lstm_gsa_v2"
-    save_every_epoch: bool = True
-    amp: bool = False
 
-
-# ---------------------------------------------------------------------------
-# Reproductibilité
-# ---------------------------------------------------------------------------
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -124,959 +98,618 @@ def set_seed(seed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dataset NK
+# Modèle hybride : voie temporelle (LSTM) + voie géométrique (GSAPathModel)
 # ---------------------------------------------------------------------------
 
-class NKSequenceDataset(Dataset):
-    """
-    Format attendu dans le fichier .npz :
+class HybridPathModel(nn.Module):
+    """Encodeur de chemin unifié compatible avec `predict_path_pair` et `paired_gsa_loss`."""
 
-    observations : (N, T, obs_dim), float32
-    actions      : (N, T, action_dim), float32 ou int64
-    targets      : (N, target_dim), float32
-    lengths      : (N,), int64
+    def __init__(self, gsa_config: GSAConfig, arch_mode: ArchMode = "hybrid_concat", lstm_layers: int = 2) -> None:
+        super().__init__()
+        if arch_mode not in ("lstm_only", "gsa_only", "hybrid_concat", "hybrid_gated"):
+            raise ValueError(f"arch_mode invalide : {arch_mode}")
+        if lstm_layers < 1:
+            raise ValueError("lstm_layers doit être >= 1.")
 
-    Les séquences sont paddées à droite. Les positions >= length[b]
-    sont ignorées par les masques et les pertes.
-    """
+        self.config = gsa_config
+        self.arch_mode: ArchMode = arch_mode
+        self.lstm_layers = int(lstm_layers)
 
-    def __init__(
-        self,
-        observations: np.ndarray,
-        actions: np.ndarray,
-        targets: np.ndarray,
-        lengths: np.ndarray,
-    ):
-        self.observations = torch.as_tensor(observations, dtype=torch.float32)
-        self.targets = torch.as_tensor(targets, dtype=torch.float32)
-        self.lengths = torch.as_tensor(lengths, dtype=torch.long)
+        # Réutilisation directe des projections, embeddings et blocs GSA de gsa_v1_core
+        self.gsa = GSAPathModel(gsa_config)
+        d_model = gsa_config.d_model
 
-        if actions.dtype in (np.int64, np.int32, int):
-            self.actions = torch.as_tensor(actions, dtype=torch.long)
-            self.actions_are_indices = True
+        self.use_lstm = arch_mode in ("lstm_only", "hybrid_concat", "hybrid_gated")
+        self.use_gsa = arch_mode in ("gsa_only", "hybrid_concat", "hybrid_gated")
+
+        if self.use_lstm:
+            self.lstm = nn.LSTM(
+                input_size=d_model,
+                hidden_size=d_model,
+                num_layers=self.lstm_layers,
+                batch_first=True,
+                dropout=gsa_config.dropout if self.lstm_layers > 1 else 0.0,
+            )
+            self.lstm_norm = nn.LayerNorm(d_model)
         else:
-            self.actions = torch.as_tensor(actions, dtype=torch.float32)
-            self.actions_are_indices = False
+            self.lstm = None
+            self.lstm_norm = None
 
-        assert self.observations.ndim == 3
-        assert self.actions.ndim == 3
-        assert self.targets.ndim == 2
-        assert self.lengths.ndim == 1
+        if arch_mode == "hybrid_concat":
+            self.fusion = nn.Sequential(
+                nn.Linear(2 * d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.fusion_gate = None
+        elif arch_mode == "hybrid_gated":
+            self.fusion_gate = nn.Linear(2 * d_model, d_model)
+            self.fusion = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.fusion = None
+            self.fusion_gate = None
 
-        self.max_length = int(self.lengths.max().item())
-        assert self.observations.shape[1] >= self.max_length
-        assert self.actions.shape[1] >= self.max_length
+    @property
+    def d_J(self) -> int:
+        return self.gsa.d_J
+
+    def geometry_regularizer(self) -> torch.Tensor:
+        if not self.use_gsa:
+            return next(self.parameters()).new_zeros(())
+        return self.gsa.geometry_regularizer()
+
+    def shortest_path_matrix(self) -> torch.Tensor | None:
+        if not self.use_gsa:
+            return None
+        return self.gsa.shortest_path_matrix()
+
+    def _embed_inputs(
+        self,
+        x_seq: torch.Tensor,
+        act_idx: torch.Tensor,
+        j0: torch.Tensor,
+        pos: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if x_seq.ndim != 3:
+            raise ValueError("x_seq doit avoir la forme (B, L, N).")
+        batch, length, n_sites = x_seq.shape
+        if n_sites != self.config.n_sites:
+            raise ValueError(f"N attendu={self.config.n_sites}, reçu={n_sites}.")
+        if length < 2 or length > self.config.max_len:
+            raise ValueError("La longueur L doit appartenir à [2, max_len].")
+        if act_idx.shape != (batch, length - 1):
+            raise ValueError("act_idx doit avoir la forme (B, L-1).")
+        if j0.shape != (batch, self.d_J):
+            raise ValueError(f"j0 doit avoir la forme (B, {self.d_J}).")
+        if not torch.is_floating_point(x_seq) or not torch.is_floating_point(j0):
+            raise TypeError("x_seq et j0 doivent être des tenseurs flottants.")
+
+        if pos is None:
+            pos = torch.arange(length, device=x_seq.device).expand(batch, length)
+        if pos.shape != (batch, length) or pos.dtype != torch.long:
+            raise ValueError("pos doit être long et de forme (B, L).")
+        if torch.any(pos < 0) or torch.any(pos >= self.config.max_len):
+            raise ValueError("pos contient un indice hors de [0, max_len).")
+
+        if pad_mask is None:
+            pad_mask = torch.zeros((batch, length), device=x_seq.device, dtype=torch.bool)
+        elif pad_mask.shape != (batch, length) or pad_mask.dtype != torch.bool:
+            raise ValueError("pad_mask doit être booléen et de forme (B, L).")
+        if torch.any(pad_mask.all(dim=1)):
+            raise ValueError("Chaque séquence doit contenir au moins un état non rembourré.")
+        if length > 1 and torch.any(pad_mask[:, :-1] & ~pad_mask[:, 1:]):
+            raise ValueError("pad_mask doit utiliser un remplissage à droite.")
+        if torch.any((x_seq != 1.0) & (x_seq != -1.0)):
+            raise ValueError("x_seq doit contenir uniquement -1 et +1.")
+
+        action_tokens = torch.full(
+            (batch, length), self.config.n_sites, device=x_seq.device, dtype=torch.long
+        )
+        valid_actions = (~pad_mask[:, :-1]) & (~pad_mask[:, 1:])
+        safe_actions = act_idx.clamp(min=0, max=self.config.n_sites - 1)
+        action_tokens[:, :-1] = torch.where(
+            valid_actions, safe_actions, torch.full_like(safe_actions, self.config.n_sites)
+        )
+        action_tokens = action_tokens.masked_fill(pad_mask, self.config.n_sites)
+
+        hidden = (
+            self.gsa.x_proj(x_seq)
+            + self.gsa.action_embedding(action_tokens)
+            + self.gsa.position_embedding(pos)
+            + self.gsa.j0_proj(j0).unsqueeze(1)
+        )
+        hidden = self.gsa.input_norm(hidden)
+        hidden = hidden.masked_fill(pad_mask[:, :, None], 0.0)
+        return hidden, pad_mask
+
+    def forward(
+        self,
+        x_seq: torch.Tensor,
+        act_idx: torch.Tensor,
+        j0: torch.Tensor,
+        pos: torch.Tensor | None = None,
+        pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        embedded, pad_mask = self._embed_inputs(x_seq, act_idx, j0, pos, pad_mask)
+        batch, length, _ = embedded.shape
+        lengths = (~pad_mask).sum(dim=1)
+        last_valid = lengths - 1
+        batch_idx = torch.arange(batch, device=x_seq.device)
+
+        h_temp = None
+        if self.use_lstm:
+            assert self.lstm is not None and self.lstm_norm is not None
+            packed = nn.utils.rnn.pack_padded_sequence(
+                embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            packed_out, _ = self.lstm(packed)
+            seq_temp, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_out, batch_first=True, total_length=length
+            )
+            seq_temp = self.lstm_norm(seq_temp)
+            h_temp = seq_temp[batch_idx, last_valid]
+
+        h_geom = None
+        if self.use_gsa:
+            action_bias = self.gsa.path_action_bias(x_seq, act_idx, pad_mask)
+            seq_geom = embedded
+            for block in self.gsa.blocks:
+                seq_geom = block(seq_geom, action_bias, pad_mask, self.config.beta_action)
+            seq_geom = self.gsa.final_norm(seq_geom)
+            h_geom = seq_geom[batch_idx, last_valid]
+
+        if self.arch_mode == "lstm_only":
+            assert h_temp is not None
+            fused = h_temp
+        elif self.arch_mode == "gsa_only":
+            assert h_geom is not None
+            fused = h_geom
+        elif self.arch_mode == "hybrid_concat":
+            assert h_temp is not None and h_geom is not None and self.fusion is not None
+            fused = self.fusion(torch.cat([h_temp, h_geom], dim=-1))
+        else:
+            assert (
+                h_temp is not None
+                and h_geom is not None
+                and self.fusion_gate is not None
+                and self.fusion is not None
+            )
+            gate = torch.sigmoid(self.fusion_gate(torch.cat([h_temp, h_geom], dim=-1)))
+            fused = self.fusion(gate * h_temp + (1.0 - gate) * h_geom)
+
+        delta_j = self.gsa.delta_head(fused)
+        return j0 + delta_j
+
+
+# ---------------------------------------------------------------------------
+# Dataset PyTorch sur ForcedPairDataset
+# ---------------------------------------------------------------------------
+
+class PairedPathSubset(Dataset):
+    """Sous-ensemble indexé de ForcedPairDataset sans fuite entre paires sœurs."""
+
+    def __init__(self, dataset: ForcedPairDataset, indices: np.ndarray) -> None:
+        self.x_a = torch.as_tensor(dataset.x_a[indices], dtype=torch.float32)
+        self.x_b = torch.as_tensor(dataset.x_b[indices], dtype=torch.float32)
+        self.act_a = torch.as_tensor(dataset.act_a[indices], dtype=torch.long)
+        self.act_b = torch.as_tensor(dataset.act_b[indices], dtype=torch.long)
+        self.j0 = torch.as_tensor(dataset.j0[indices], dtype=torch.float32)
+        self.j_final_a = torch.as_tensor(dataset.j_final_a[indices], dtype=torch.float32)
+        self.j_final_b = torch.as_tensor(dataset.j_final_b[indices], dtype=torch.float32)
+        self.omega = torch.as_tensor(dataset.omega[indices], dtype=torch.float32)
 
     def __len__(self) -> int:
-        return len(self.lengths)
+        return int(self.j0.shape[0])
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        length = int(self.lengths[index].item())
-
-        obs = self.observations[index, :length]
-        target = self.targets[index]
-        length_tensor = torch.tensor(length, dtype=torch.long)
-
-        if self.actions_are_indices:
-            action = self.actions[index, :length]
-        else:
-            action = self.actions[index, :length]
-
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         return {
-            "observations": obs,
-            "actions": action,
-            "targets": target,
-            "lengths": length_tensor,
-            "actions_are_indices": torch.tensor(
-                self.actions_are_indices, dtype=torch.bool
-            ),
+            "x_a": self.x_a[idx],
+            "x_b": self.x_b[idx],
+            "act_a": self.act_a[idx],
+            "act_b": self.act_b[idx],
+            "j0": self.j0[idx],
+            "j_final_a": self.j_final_a[idx],
+            "j_final_b": self.j_final_b[idx],
+            "omega": self.omega[idx],
         }
 
 
-def collate_sequences(batch):
-    max_length = max(item["lengths"].item() for item in batch)
-    batch_size = len(batch)
+def save_forced_pair_dataset(path: Path, dataset: ForcedPairDataset) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        x_a=dataset.x_a,
+        x_b=dataset.x_b,
+        act_a=dataset.act_a,
+        act_b=dataset.act_b,
+        j0=dataset.j0,
+        j_seq_a=dataset.j_seq_a,
+        j_seq_b=dataset.j_seq_b,
+        j_final_a=dataset.j_final_a,
+        j_final_b=dataset.j_final_b,
+        omega=dataset.omega,
+        initial_state_id=dataset.initial_state_id,
+        site_pair=dataset.site_pair,
+        mode=np.array(dataset.mode),
+    )
 
-    obs_dim = batch[0]["observations"].shape[-1]
-    target_dim = batch[0]["targets"].shape[-1]
-    action_dim = batch[0]["actions"].shape[-1]
 
-    observations = torch.zeros(batch_size, max_length, obs_dim)
-    actions = torch.zeros(batch_size, max_length, action_dim)
-    targets = torch.stack([item["targets"] for item in batch])
-    lengths = torch.stack([item["lengths"] for item in batch])
-    valid_mask = torch.zeros(batch_size, max_length, dtype=torch.bool)
-
-    actions_are_indices = batch[0]["actions_are_indices"].item()
-
-    for i, item in enumerate(batch):
-        length = int(item["lengths"].item())
-        observations[i, :length] = item["observations"]
-        actions[i, :length] = item["actions"]
-        valid_mask[i, :length] = True
-
-    if actions_are_indices:
-        actions = actions.long()
-        next_action = torch.full(
-            (batch_size, max_length), -100, dtype=torch.long
+def load_forced_pair_dataset(path: Path) -> ForcedPairDataset:
+    with np.load(path, allow_pickle=False) as data:
+        return ForcedPairDataset(
+            x_a=data["x_a"],
+            x_b=data["x_b"],
+            act_a=data["act_a"],
+            act_b=data["act_b"],
+            j0=data["j0"],
+            j_seq_a=data["j_seq_a"],
+            j_seq_b=data["j_seq_b"],
+            j_final_a=data["j_final_a"],
+            j_final_b=data["j_final_b"],
+            omega=data["omega"],
+            initial_state_id=data["initial_state_id"],
+            site_pair=data["site_pair"],
+            mode=str(data["mode"].item()),
         )
 
-        for i, item in enumerate(batch):
-            length = int(item["lengths"].item())
-            if length > 1:
-                next_action[i, : length - 1] = item["actions"][1:length]
 
-        return {
-            "observations": observations,
-            "actions": actions,
-            "targets": targets,
-            "lengths": lengths,
-            "valid_mask": valid_mask,
-            "next_action": next_action,
-            "actions_are_indices": torch.tensor(True),
-        }
-
-    next_state = torch.zeros_like(observations)
-
-    for i, item in enumerate(batch):
-        length = int(item["lengths"].item())
-        if length > 1:
-            next_state[i, : length - 1] = item["observations"][1:length]
-
-    return {
-        "observations": observations,
-        "actions": actions,
-        "targets": targets,
-        "lengths": lengths,
-        "valid_mask": valid_mask,
-        "next_state": next_state,
-        "actions_are_indices": torch.tensor(False),
+def build_synthetic_smoke_dataset(
+    n_sites: int, n_initial_states: int, eta: float, mode: TransportMode, seed: int
+) -> ForcedPairDataset:
+    """Jeu synthétique déterministe pour tester le pipeline hors dépôt."""
+    rng = np.random.default_rng(seed)
+    rows: dict[str, list] = {
+        "x_a": [], "x_b": [], "act_a": [], "act_b": [], "j0": [],
+        "jseq_a": [], "jseq_b": [], "ja": [], "jb": [], "omega": [],
+        "state_id": [], "pair": [],
     }
+    d_j = n_sites * (n_sites - 1) // 2
+    triu_r, triu_c = np.triu_indices(n_sites, k=1)
+
+    for state_id in range(n_initial_states):
+        x0 = rng.choice([-1.0, 1.0], size=(n_sites,))
+        raw = rng.normal(0.0, 0.5, size=(n_sites, n_sites))
+        j0_mat = 0.5 * (raw + raw.T)
+        np.fill_diagonal(j0_mat, 0.0)
+        j0_vec = j0_mat[triu_r, triu_c].astype(np.float32)
+
+        for k in range(n_sites):
+            for m in range(k + 1, n_sites):
+                xa = np.stack([x0, x0.copy(), x0.copy()])
+                xa[1, k] *= -1.0
+                xa[2, k] *= -1.0
+                xa[2, m] *= -1.0
+
+                xb = np.stack([x0, x0.copy(), x0.copy()])
+                xb[1, m] *= -1.0
+                xb[2, m] *= -1.0
+                xb[2, k] *= -1.0
+
+                ja = j0_vec.copy()
+                jb = j0_vec.copy()
+                if mode == "symmetric":
+                    # Terme dépendant de l'ordre (non commutatif)
+                    comm_scale = eta * float(x0[k] * x0[m])
+                    edge_idx = int(np.flatnonzero((triu_r == k) & (triu_c == m))[0])
+                    ja[edge_idx] += comm_scale
+                    jb[edge_idx] -= comm_scale
+
+                rows["x_a"].append(xa)
+                rows["x_b"].append(xb)
+                rows["act_a"].append((k, m))
+                rows["act_b"].append((m, k))
+                rows["j0"].append(j0_vec)
+                rows["jseq_a"].append(np.stack([j0_vec, j0_vec, ja]))
+                rows["jseq_b"].append(np.stack([j0_vec, j0_vec, jb]))
+                rows["ja"].append(ja)
+                rows["jb"].append(jb)
+                rows["omega"].append(ja - jb)
+                rows["state_id"].append(state_id)
+                rows["pair"].append((k, m))
+
+    return ForcedPairDataset(
+        x_a=np.asarray(rows["x_a"], dtype=np.float32),
+        x_b=np.asarray(rows["x_b"], dtype=np.float32),
+        act_a=np.asarray(rows["act_a"], dtype=np.int64),
+        act_b=np.asarray(rows["act_b"], dtype=np.int64),
+        j0=np.asarray(rows["j0"], dtype=np.float32),
+        j_seq_a=np.asarray(rows["jseq_a"], dtype=np.float32),
+        j_seq_b=np.asarray(rows["jseq_b"], dtype=np.float32),
+        j_final_a=np.asarray(rows["ja"], dtype=np.float32),
+        j_final_b=np.asarray(rows["jb"], dtype=np.float32),
+        omega=np.asarray(rows["omega"], dtype=np.float32),
+        initial_state_id=np.asarray(rows["state_id"], dtype=np.int64),
+        site_pair=np.asarray(rows["pair"], dtype=np.int64),
+        mode=mode,
+    )
 
 
-def load_nk_dataset(config: V2Config) -> Tuple[Dataset, Dataset, Dataset]:
-    path = Path(config.data_path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Fichier de données introuvable : {path}. "
-            "V2 n'utilise que les données NK existantes."
+def prepare_dataset(config: TrainV2Config) -> ForcedPairDataset:
+    if config.dataset_npz is not None:
+        path = Path(config.dataset_npz)
+        if not path.exists():
+            raise FileNotFoundError(f"Fichier introuvable : {path}")
+        return load_forced_pair_dataset(path)
+
+    if config.synthetic_smoke:
+        return build_synthetic_smoke_dataset(
+            n_sites=config.n_sites,
+            n_initial_states=config.n_initial_states,
+            eta=config.eta,
+            mode=config.transport_mode,
+            seed=config.seed,
         )
 
-    data = np.load(path, allow_pickle=False)
+    from balayage_commutateur_nk_v2 import sample_binary_symmetric_states
 
-    required = {
-        config.obs_key,
-        config.action_key,
-        config.target_key,
-        config.lengths_key,
-    }
-    missing = required - set(data.files)
-    if missing:
-        raise KeyError(f"Clés manquantes dans {path} : {sorted(missing)}")
-
-    observations = data[config.obs_key]
-    actions = data[config.action_key]
-    targets = data[config.target_key]
-    lengths = data[config.lengths_key]
-
-    n = len(lengths)
-    indices = np.arange(n)
     rng = np.random.default_rng(config.seed)
-    rng.shuffle(indices)
-
-    n_val = int(math.floor(n * config.val_fraction))
-    n_test = int(math.floor(n * config.test_fraction))
-    n_train = n - n_val - n_test
-
-    if n_train <= 0:
-        raise ValueError("Pas assez d'exemples pour entraîner.")
-
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train : n_train + n_val]
-    test_idx = indices[n_train + n_val :]
-
-    def subset(idx):
-        return NKSequenceDataset(
-            observations[idx],
-            actions[idx],
-            targets[idx],
-            lengths[idx],
-        )
-
-    return subset(train_idx), subset(val_idx), subset(test_idx)
-
-
-# ---------------------------------------------------------------------------
-# GSA : attention géométrique V2
-# ---------------------------------------------------------------------------
-
-class GeometricSelfAttention(nn.Module):
-    """
-    Attention causale avec biais de coût de transition.
-
-    score_ij = Q_i K_j / sqrt(d_head) - beta * S_ij + gamma * A_ij
-
-    S_ij : coût de transition estimé.
-    A_ij : compatibilité action-état, si disponible.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        action_dim: int,
-        beta_init: float = 0.5,
-        learn_beta: bool = True,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError("d_model doit être divisible par n_heads.")
-
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-        self.action_proj = nn.Linear(action_dim, self.d_head)
-        self.action_bias_proj = nn.Linear(self.d_head, 1)
-
-        if learn_beta:
-            self.log_beta = nn.Parameter(torch.tensor(math.log(beta_init)))
-        else:
-            self.register_buffer(
-                "log_beta",
-                torch.tensor(math.log(max(beta_init, 1e-8))),
-            )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        transition_cost: torch.Tensor,
-        actions: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, _ = x.shape
-        device = x.device
-
-        q = self.q_proj(x).view(
-            batch_size, seq_len, self.n_heads, self.d_head
-        ).transpose(1, 2)
-
-        k = self.k_proj(x).view(
-            batch_size, seq_len, self.n_heads, self.d_head
-        ).transpose(1, 2)
-
-        v = self.v_proj(x).view(
-            batch_size, seq_len, self.n_heads, self.d_head
-        ).transpose(1, 2)
-
-        scores = torch.matmul(q, k.transpose(-2, -1))
-        scores = scores / math.sqrt(self.d_head)
-
-        beta = torch.exp(self.log_beta)
-        scores = scores - beta * transition_cost.unsqueeze(1)
-
-        action_embed = self.action_proj(actions)
-        action_bias = self.action_bias_proj(action_embed).squeeze(-1)
-        scores = scores + action_bias.unsqueeze(1)
-
-        causal_mask = torch.tril(
-            torch.ones(
-                seq_len, seq_len, dtype=torch.bool, device=device
-            )
-        )
-        mask = causal_mask.unsqueeze(0) & valid_mask.unsqueeze(-1)
-        scores = scores.masked_fill(~mask, float("-inf"))
-
-        attention = F.softmax(scores, dim=-1)
-        attention = self.dropout(attention)
-
-        context = torch.matmul(attention, v)
-        context = context.transpose(1, 2).contiguous()
-        context = context.view(batch_size, seq_len, self.d_model)
-
-        output = self.out_proj(context)
-
-        return output, attention, transition_cost
-
-
-class GSAEncoderLayer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        action_dim: int,
-        ffn_dim: int,
-        beta_init: float,
-        learn_beta: bool,
-        dropout: float,
-    ):
-        super().__init__()
-        self.attention = GeometricSelfAttention(
-            d_model=d_model,
-            n_heads=n_heads,
-            action_dim=action_dim,
-            beta_init=beta_init,
-            learn_beta=learn_beta,
-            dropout=dropout,
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, d_model),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-        self.cost_head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 1),
-        )
-
-    def estimate_transition_cost(
-        self,
-        hidden_states: torch.Tensor,
-        actions: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, seq_len, d_model = hidden_states.shape
-
-        left = hidden_states.unsqueeze(2).expand(
-            batch_size, seq_len, seq_len, d_model
-        )
-        right = hidden_states.unsqueeze(1).expand(
-            batch_size, seq_len, seq_len, d_model
-        )
-
-        pair = torch.cat([left, right], dim=-1)
-        raw_cost = self.cost_head(pair).squeeze(-1)
-        cost = F.softplus(raw_cost)
-
-        invalid = ~valid_mask.unsqueeze(-1) | ~valid_mask.unsqueeze(-2)
-        cost = cost.masked_fill(invalid, 0.0)
-
-        return cost
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        actions: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ):
-        transition_cost = self.estimate_transition_cost(
-            x, actions, valid_mask
-        )
-
-        attended, attention, cost = self.attention(
-            x=x,
-            transition_cost=transition_cost,
-            actions=actions,
-            valid_mask=valid_mask,
-        )
-
-        x = self.norm1(x + self.dropout(attended))
-        x = self.norm2(x + self.dropout(self.ffn(x)))
-
-        return x, attention, cost
-
-
-# ---------------------------------------------------------------------------
-# NK-LSTM-GSA V2
-# ---------------------------------------------------------------------------
-
-class NKLSTMGSAV2(nn.Module):
-    def __init__(self, config: V2Config):
-        super().__init__()
-        self.config = config
-
-        input_dim = config.obs_dim + config.action_dim
-        self.input_proj = nn.Linear(input_dim, config.d_model)
-
-        self.lstm = nn.LSTM(
-            input_size=config.d_model,
-            hidden_size=config.d_model,
-            num_layers=config.lstm_layers,
-            batch_first=True,
-            dropout=config.lstm_dropout if config.lstm_layers > 1 else 0.0,
-        )
-
-        self.gsa_layers = nn.ModuleList(
-            [
-                GSAEncoderLayer(
-                    d_model=config.d_model,
-                    n_heads=config.n_heads,
-                    action_dim=config.action_dim,
-                    ffn_dim=config.ffn_dim,
-                    beta_init=config.beta_init,
-                    learn_beta=config.learn_beta,
-                    dropout=config.dropout,
-                )
-                for _ in range(config.gsa_layers)
-            ]
-        )
-
-        if config.fusion == "concat":
-            fusion_dim = config.d_model * 2
-            self.fusion = nn.Sequential(
-                nn.Linear(fusion_dim, config.d_model),
-                nn.GELU(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.d_model, config.d_model),
-            )
-        elif config.fusion == "gated":
-            fusion_dim = config.d_model * 2
-            self.fusion_gate = nn.Linear(fusion_dim, 1)
-            self.fusion = nn.Sequential(
-                nn.Linear(config.d_model, config.d_model),
-                nn.GELU(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.d_model, config.d_model),
-            )
-        else:
-            raise ValueError("fusion doit être 'concat' ou 'gated'.")
-
-        self.terminal_head = nn.Linear(config.d_model, config.target_dim)
-        self.next_state_head = nn.Linear(config.d_model, config.obs_dim)
-        self.next_action_head = nn.Linear(config.d_model, config.action_dim)
-        self.order_head = nn.Linear(config.d_model, 1)
-
-    def forward(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor,
-        lengths: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size, seq_len, _ = observations.shape
-
-        inputs = torch.cat([observations, actions], dim=-1)
-        embedded = self.input_proj(inputs)
-
-        packed = nn.utils.rnn.pack_padded_sequence(
-            embedded,
-            lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
-        )
-
-        packed_output, _ = self.lstm(packed)
-
-        temporal, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_output,
-            batch_first=True,
-            total_length=seq_len,
-        )
-
-        geometric = temporal
-        attention_maps = []
-        transition_costs = []
-
-        for layer in self.gsa_layers:
-            geometric, attention, cost = layer(
-                geometric, actions, valid_mask
-            )
-            attention_maps.append(attention)
-            transition_costs.append(cost)
-
-        if self.config.fusion == "concat":
-            fused_input = torch.cat([temporal, geometric], dim=-1)
-            fused = self.fusion(fused_input)
-        else:
-            gate_input = torch.cat([temporal, geometric], dim=-1)
-            gate = torch.sigmoid(self.fusion_gate(gate_input))
-            fused = gate * temporal + (1.0 - gate) * geometric
-            fused = self.fusion(fused)
-
-        terminal = self.terminal_head(fused[:, -1])
-        next_state = self.next_state_head(fused)
-        next_action_logits = self.next_action_head(fused)
-
-        order_logits = self.order_head(fused).squeeze(-1)
-
-        return {
-            "temporal": temporal,
-            "geometric": geometric,
-            "fused": fused,
-            "terminal": terminal,
-            "next_state": next_state,
-            "next_action_logits": next_action_logits,
-            "order_logits": order_logits,
-            "attention": attention_maps[-1],
-            "transition_cost": transition_costs[-1],
-        }
-
-
-# ---------------------------------------------------------------------------
-# Pertes V2
-# ---------------------------------------------------------------------------
-
-def sequence_mean(loss: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-    """
-    loss: (B, T)
-    valid_mask: (B, T)
-    """
-    masked = loss * valid_mask.float()
-    denominator = valid_mask.float().sum().clamp_min(1.0)
-    return masked.sum() / denominator
-
-
-def terminal_loss(
-    output: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-) -> torch.Tensor:
-    return F.mse_loss(output["terminal"], batch["targets"])
-
-
-def path_loss(
-    output: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    valid_mask: torch.Tensor,
-) -> torch.Tensor:
-    if "next_action" in batch:
-        logits = output["next_action_logits"]
-        target = batch["next_action"]
-
-        return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            target.reshape(-1),
-            ignore_index=-100,
-            reduction="mean",
-        )
-
-    next_state = batch["next_state"]
-    predicted = output["next_state"]
-
-    error = (predicted - next_state).abs().sum(dim=-1)
-    shifted_mask = valid_mask.clone()
-    shifted_mask[:, -1] = False
-
-    return sequence_mean(error, shifted_mask)
-
-
-def order_loss(
-    output: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    valid_mask: torch.Tensor,
-) -> torch.Tensor:
-    batch_size, seq_len = output["order_logits"].shape
-    device = output["order_logits"].device
-
-    positions = torch.arange(seq_len, device=device).float()
-    positions = positions.unsqueeze(0).expand(batch_size, seq_len)
-
-    max_lengths = batch["lengths"].float().unsqueeze(-1).clamp_min(2.0)
-    normalized_positions = positions / (max_lengths - 1.0)
-
-    predicted = torch.sigmoid(output["order_logits"])
-    error = (predicted - normalized_positions) ** 2
-
-    return sequence_mean(error, valid_mask)
-
-
-def gsa_regularization(
-    output: Dict[str, torch.Tensor],
-    valid_mask: torch.Tensor,
-    epsilon: float,
-) -> torch.Tensor:
-    cost = output["transition_cost"]
-
-    positive_penalty = F.softplus(epsilon - cost)
-    magnitude_penalty = cost ** 2
-
-    pair_valid = (
-        valid_mask.unsqueeze(-1) & valid_mask.unsqueeze(-2)
+    initial_states = sample_binary_symmetric_states(
+        n_sites=config.n_sites,
+        n_states=config.n_initial_states,
+        rng=rng,
+        scale=config.scale_j,
+    )
+    return build_forced_pair_dataset(
+        initial_states=initial_states,
+        eta=config.eta,
+        mode=config.transport_mode,
     )
 
-    positive_loss = sequence_mean(
-        positive_penalty, pair_valid.float()
-    )
-    magnitude_loss = sequence_mean(
-        magnitude_penalty, pair_valid.float()
-    )
-
-    return positive_loss + magnitude_loss
-
-
-def nk_v2_loss(
-    output: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    config: V2Config,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    valid_mask = batch["valid_mask"]
-
-    terminal = terminal_loss(output, batch)
-    path = path_loss(output, batch, valid_mask)
-    order = order_loss(output, batch, valid_mask)
-    gsa_reg = gsa_regularization(output, valid_mask, config.epsilon)
-
-    total = (
-        config.lambda_terminal * terminal
-        + config.lambda_path * path
-        + config.lambda_order * order
-        + config.lambda_gsa_reg * gsa_reg
-    )
-
-    metrics = {
-        "loss": total.item(),
-        "terminal": terminal.item(),
-        "path": path.item(),
-        "order": order.item(),
-        "gsa_reg": gsa_reg.item(),
-    }
-
-    return total, metrics
-
 
 # ---------------------------------------------------------------------------
-# Entraînement et validation
+# Boucle d'entraînement et d'évaluation
 # ---------------------------------------------------------------------------
-
-def move_batch(batch: Dict[str, torch.Tensor], device: torch.device):
-    return {
-        key: value.to(device, non_blocking=True)
-        for key, value in batch.items()
-    }
-
 
 def run_epoch(
-    model: NKLSTMGSAV2,
+    model: HybridPathModel,
     loader: DataLoader,
-    optimizer: Optional[torch.optim.Optimizer],
-    config: V2Config,
+    optimizer: torch.optim.Optimizer | None,
+    config: TrainV2Config,
     device: torch.device,
-    scaler: Optional[torch.amp.GradScaler],
-) -> Tuple[float, Dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, float | int]]:
     training = optimizer is not None
     model.train(training)
 
     totals = {
-        "loss": 0.0,
-        "terminal": 0.0,
-        "path": 0.0,
-        "order": 0.0,
-        "gsa_reg": 0.0,
+        "loss_total": 0.0,
+        "loss_terminal": 0.0,
+        "loss_closure": 0.0,
+        "loss_geometry_regularizer": 0.0,
     }
-    count = 0
+    n_samples = 0
+    omega_hats: list[np.ndarray] = []
+    omega_trues: list[np.ndarray] = []
 
-    for batch in loader:
-        batch = move_batch(batch, device)
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for batch in loader:
+            x_a = batch["x_a"].to(device)
+            x_b = batch["x_b"].to(device)
+            act_a = batch["act_a"].to(device)
+            act_b = batch["act_b"].to(device)
+            j0 = batch["j0"].to(device)
+            target_a = batch["j_final_a"].to(device)
+            target_b = batch["j_final_b"].to(device)
 
-        if training:
-            optimizer.zero_grad(set_to_none=True)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
 
-        if config.amp and device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                output = model(
-                    observations=batch["observations"],
-                    actions=batch["actions"],
-                    lengths=batch["lengths"],
-                    valid_mask=batch["valid_mask"],
-                )
-                loss, metrics = nk_v2_loss(output, batch, config)
-        else:
-            output = model(
-                observations=batch["observations"],
-                actions=batch["actions"],
-                lengths=batch["lengths"],
-                valid_mask=batch["valid_mask"],
+            pred_a, pred_b, omega_hat = predict_path_pair(
+                model, x_a, act_a, x_b, act_b, j0
             )
-            loss, metrics = nk_v2_loss(output, batch, config)
+            loss, info = paired_gsa_loss(
+                pred_a=pred_a,
+                pred_b=pred_b,
+                target_a=target_a,
+                target_b=target_b,
+                lambda_omega=config.lambda_omega,
+                lambda_geometry=config.lambda_geometry,
+                model=model,
+            )
 
-        if training:
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(
-                    model.parameters(), config.grad_clip
-                )
-                scaler.step(optimizer)
-                scaler.update()
-            else:
+            if training:
                 loss.backward()
-                nn.utils.clip_grad_norm_(
-                    model.parameters(), config.grad_clip
-                )
+                nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
                 optimizer.step()
 
-        for key in totals:
-            totals[key] += metrics[key]
-        count += 1
+            bs = int(j0.shape[0])
+            n_samples += bs
+            for k in totals:
+                totals[k] += info[k] * bs
 
-    return totals["loss"] / max(count, 1), {
-        key: value / max(count, 1) for key, value in totals.items()
-    }
+            omega_hats.append(omega_hat.detach().cpu().numpy())
+            omega_trues.append((target_a - target_b).detach().cpu().numpy())
 
-
-@torch.no_grad()
-def evaluate(
-    model: NKLSTMGSAV2,
-    loader: DataLoader,
-    config: V2Config,
-    device: torch.device,
-) -> Tuple[float, Dict[str, float]]:
-    model.eval()
-    return run_epoch(model, loader, None, config, device, None)
-
-
-def save_checkpoint(
-    path: Path,
-    model: NKLSTMGSAV2,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch: int,
-    best_val_loss: float,
-    config: V2Config,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": (
-                scheduler.state_dict() if scheduler is not None else None
-            ),
-            "best_val_loss": best_val_loss,
-            "config": asdict(config),
-        },
-        path,
+    avg_losses = {k: v / max(n_samples, 1) for k, v in totals.items()}
+    metrics = closure_metrics(
+        np.concatenate(omega_hats, axis=0),
+        np.concatenate(omega_trues, axis=0),
     )
+    return avg_losses, metrics
 
 
-def build_loaders(
-    train_dataset: Dataset,
-    val_dataset: Dataset,
-    config: V2Config,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    generator = torch.Generator()
-    generator.manual_seed(config.seed)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        collate_fn=collate_sequences,
-        generator=generator,
-        pin_memory=True,
+def parse_args() -> TrainV2Config:
+    parser = argparse.ArgumentParser(description="Entraînement NK-LSTM-GSA V2 sur ForcedPairDataset.")
+    parser.add_argument(
+        "--arch-mode",
+        choices=["lstm_only", "gsa_only", "hybrid_concat", "hybrid_gated"],
+        default="hybrid_concat",
     )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        collate_fn=collate_sequences,
-        pin_memory=True,
-    )
-
-    return train_loader, val_loader, val_loader
-
-
-def build_optimizer_and_scheduler(
-    model: NKLSTMGSAV2,
-    config: V2Config,
-    steps_per_epoch: int,
-):
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-    )
-
-    if config.scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(config.epochs - config.warmup_epochs, 1),
-        )
-    elif config.scheduler == "none":
-        scheduler = None
-    else:
-        raise ValueError("scheduler doit être 'cosine' ou 'none'.")
-
-    return optimizer, scheduler
-
-
-def parse_args() -> V2Config:
-    parser = argparse.ArgumentParser(
-        description="Entraînement NK-LSTM-GSA V2."
-    )
-
-    parser.add_argument("--data-path", default="data/nk_sequences.npz")
-    parser.add_argument("--output-dir", default="runs/nk_lstm_gsa_v2")
-    parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--lstm-layers", type=int, default=2)
-    parser.add_argument("--gsa-layers", type=int, default=1)
+    parser.add_argument("--geometry-mode", choices=["none", "fixed", "learned"], default="learned")
+    parser.add_argument("--transport-mode", choices=["symmetric", "integrable"], default="symmetric")
+    parser.add_argument("--n-sites", type=int, default=6)
+    parser.add_argument("--n-initial-states", type=int, default=64)
+    parser.add_argument("--eta", type=float, default=0.25)
+    parser.add_argument("--scale-j", type=float, default=0.5)
+    parser.add_argument("--dataset-npz", type=str, default=None)
+    parser.add_argument("--synthetic-smoke", action="store_true")
+    parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--beta", type=float, default=0.5)
-    parser.add_argument("--fusion", choices=["concat", "gated"], default="concat")
-    parser.add_argument("--scheduler", choices=["cosine", "none"], default="cosine")
-    parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--no-save-every-epoch", action="store_true")
-
+    parser.add_argument("--gsa-layers", type=int, default=2)
+    parser.add_argument("--lstm-layers", type=int, default=2)
+    parser.add_argument("--beta-action", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lambda-omega", type=float, default=1.0)
+    parser.add_argument("--lambda-geometry", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--output-dir", type=str, default="runs/nk_lstm_gsa_v2")
     args = parser.parse_args()
 
-    config = V2Config(
-        data_path=args.data_path,
-        output_dir=args.output_dir,
-        seed=args.seed,
+    return TrainV2Config(
+        arch_mode=args.arch_mode,
+        geometry_mode=args.geometry_mode,
+        transport_mode=args.transport_mode,
+        n_sites=args.n_sites,
+        n_initial_states=args.n_initial_states,
+        eta=args.eta,
+        scale_j=args.scale_j,
+        dataset_npz=args.dataset_npz,
+        synthetic_smoke=args.synthetic_smoke,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        gsa_layers=args.gsa_layers,
+        lstm_layers=args.lstm_layers,
+        beta_action=args.beta_action,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,
-        d_model=args.d_model,
-        lstm_layers=args.lstm_layers,
-        gsa_layers=args.gsa_layers,
-        n_heads=args.n_heads,
-        beta_init=args.beta,
-        fusion=args.fusion,
-        scheduler=args.scheduler,
-        amp=args.amp,
-        save_every_epoch=not args.no_save_every_epoch,
+        lambda_omega=args.lambda_omega,
+        lambda_geometry=args.lambda_geometry,
+        seed=args.seed,
+        output_dir=args.output_dir,
     )
-
-    return config
 
 
 def main() -> None:
     config = parse_args()
     set_seed(config.seed)
+    device = torch.device(config.device)
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(asdict(config), f, indent=2)
 
-    with open(output_dir / "config.json", "w", encoding="utf-8") as handle:
-        json.dump(asdict(config), handle, indent=2)
+    dataset = prepare_dataset(config)
+    if dataset.n_sites != config.n_sites if hasattr(dataset, "n_sites") else dataset.x_a.shape[-1] != config.n_sites:
+        raise ValueError("Incohérence sur n_sites entre la configuration et le dataset.")
 
-    device = torch.device(config.device)
-
-    train_dataset, val_dataset, test_dataset = load_nk_dataset(config)
-    train_loader, val_loader, test_loader = build_loaders(
-        train_dataset, val_dataset, config
+    splits = split_indices_by_initial_state(
+        dataset=dataset,
+        seed=config.seed,
+        train_fraction=config.train_fraction,
+        validation_fraction=config.validation_fraction,
     )
 
-    model = NKLSTMGSAV2(config).to(device)
-
-    steps_per_epoch = max(len(train_loader), 1)
-    optimizer, scheduler = build_optimizer_and_scheduler(
-        model, config, steps_per_epoch
+    gen = torch.Generator().manual_seed(config.seed)
+    train_loader = DataLoader(
+        PairedPathSubset(dataset, splits["train"]),
+        batch_size=config.batch_size,
+        shuffle=True,
+        generator=gen,
+    )
+    val_loader = DataLoader(
+        PairedPathSubset(dataset, splits["validation"]),
+        batch_size=config.batch_size,
+        shuffle=False,
+    )
+    test_loader = DataLoader(
+        PairedPathSubset(dataset, splits["test"]),
+        batch_size=config.batch_size,
+        shuffle=False,
     )
 
-    scaler = (
-        torch.amp.GradScaler("cuda")
-        if config.amp and device.type == "cuda"
-        else None
+    gsa_cfg = GSAConfig(
+        n_sites=config.n_sites,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        n_layers=config.gsa_layers,
+        ff_mult=config.ff_mult,
+        dropout=config.dropout,
+        beta_action=config.beta_action,
+        max_len=config.max_len,
+        edge_eps=config.edge_eps,
+        geometry_mode=config.geometry_mode,
+    )
+    model = HybridPathModel(
+        gsa_config=gsa_cfg,
+        arch_mode=config.arch_mode,
+        lstm_layers=config.lstm_layers,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
 
     best_val_loss = float("inf")
     patience = 0
-
     history = []
 
     for epoch in range(1, config.epochs + 1):
-        train_loss, train_metrics = run_epoch(
-            model, train_loader, optimizer, config, device, scaler
-        )
+        train_losses, train_metrics = run_epoch(model, train_loader, optimizer, config, device)
+        val_losses, val_metrics = run_epoch(model, val_loader, None, config, device)
 
-        if scheduler is not None and epoch > config.warmup_epochs:
-            scheduler.step()
-
-        val_loss, val_metrics = evaluate(
-            model, val_loader, config, device
-        )
-
-        record = {
+        history.append({
             "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "train": train_metrics,
-            "validation": val_metrics,
-            "learning_rate": optimizer.param_groups[0]["lr"],
-        }
-        history.append(record)
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+        })
 
         print(
             f"Epoch {epoch:03d} | "
-            f"train {train_loss:.5f} | "
-            f"val {val_loss:.5f} | "
-            f"terminal {val_metrics['terminal']:.5f} | "
-            f"path {val_metrics['path']:.5f} | "
-            f"order {val_metrics['order']:.5f}"
+            f"train={train_losses['loss_total']:.6f} | "
+            f"val={val_losses['loss_total']:.6f} | "
+            f"omega_mse={val_metrics['mse']:.6f} | "
+            f"cos={val_metrics['mean_cosine_nonzero']:.4f}"
         )
 
-        improved = val_loss < best_val_loss - config.min_delta
-
-        if improved:
-            best_val_loss = val_loss
+        if val_losses["loss_total"] < best_val_loss - config.min_delta:
+            best_val_loss = val_losses["loss_total"]
             patience = 0
-            save_checkpoint(
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "config": asdict(config),
+                },
                 output_dir / "best.pt",
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                best_val_loss,
-                config,
             )
         else:
             patience += 1
+            if patience >= config.early_stopping_patience:
+                print(f"Arrêt anticipé à l'époque {epoch} (meilleure val={best_val_loss:.6f}).")
+                break
 
-        if config.save_every_epoch:
-            save_checkpoint(
-                output_dir / "last.pt",
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                best_val_loss,
-                config,
-            )
+    with open(output_dir / "history.json", "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
 
-        with open(output_dir / "history.json", "w", encoding="utf-8") as handle:
-            json.dump(history, handle, indent=2)
+    ckpt = torch.load(output_dir / "best.pt", map_location=device, weights_only=True)
+    model.load_state_dict(ckpt["model_state_dict"])
+    test_losses, test_metrics = run_epoch(model, test_loader, None, config, device)
 
-        if patience >= config.early_stopping_patience:
-            print(
-                f"Early stopping à l'époque {epoch} ; "
-                f"meilleure val_loss = {best_val_loss:.5f}."
-            )
-            break
+    summary = {
+        "arch_mode": config.arch_mode,
+        "geometry_mode": config.geometry_mode,
+        "transport_mode": config.transport_mode,
+        "best_val_loss": best_val_loss,
+        "test_losses": test_losses,
+        "test_metrics": test_metrics,
+    }
+    with open(output_dir / "test_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
 
-    checkpoint = torch.load(output_dir / "best.pt", map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-    test_loss, test_metrics = evaluate(
-        model, test_loader, config, device
-    )
-
-    with open(output_dir / "test_metrics.json", "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "test_loss": test_loss,
-                "metrics": test_metrics,
-                "best_val_loss": best_val_loss,
-            },
-            handle,
-            indent=2,
-        )
-
-    print(f"Test loss : {test_loss:.5f}")
-    print(f"Résultats sauvegardés dans : {output_dir}")
+    print("Résultats Test :", json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
