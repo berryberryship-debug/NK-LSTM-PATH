@@ -14,27 +14,47 @@ Chaîne d'observables :
     (X, J) -> A(J) -> w(X, J)
 
 Modules utilisés :
-    fiber_bundle.py
-    trajectories.py
+    src/fiber_bundle.py
+    src/trajectories.py
 
-Les trois fichiers doivent être dans le même dossier.
+Le dossier src/ est ajouté automatiquement au chemin d'importation.
+Le script peut donc être lancé depuis la racine du dépôt.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Tuple
+import sys
 
 import numpy as np
 
-from fiber_bundle import (
+
+# ================================================================
+# 0. CHEMIN DES MODULES DU PROJET
+# ================================================================
+
+_REPO_ROOT = Path(__file__).resolve().parent
+_SRC_DIR = _REPO_ROOT / "src"
+
+# Dans le dépôt, fiber_bundle.py et trajectories.py résident dans src/.
+# Le test is_dir() conserve aussi la compatibilité avec une disposition
+# locale où ces modules seraient directement à côté de ce script.
+if _SRC_DIR.is_dir():
+    src_path = str(_SRC_DIR)
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+
+
+from fiber_bundle import (  # noqa: E402
     mutate_postflip,
     accessibility_A,
     _validate_state,
     _validate_J,
 )
 
-from trajectories import (
+from trajectories import (  # noqa: E402
     NKLandscape,
     transition_rates,
 )
@@ -167,19 +187,16 @@ def collect_config() -> ExperimentConfig:
         n_seeds=10,
         random_seed=7,
         scale_J=0.2,
-
         eta=eta,
         mu=mu,
         beta=beta,
         theta_A=theta_A,
         lam=lam,
-
         nk_K=nk_K,
         nk_seed=7,
     )
 
     validate_config(cfg)
-
     return cfg
 
 
@@ -201,9 +218,9 @@ def validate_config(
             "n_seeds doit être positif."
         )
 
-    if cfg.scale_J < 0.0:
+    if not np.isfinite(cfg.scale_J) or cfg.scale_J < 0.0:
         raise ValueError(
-            "scale_J doit être positif ou nul."
+            "scale_J doit être fini et positif ou nul."
         )
 
     if cfg.nk_K < 0 or cfg.nk_K >= cfg.n_sites:
@@ -220,7 +237,6 @@ def validate_config(
     }
 
     for name, value in parameters.items():
-
         if not np.isfinite(value):
             raise ValueError(
                 f"Le paramètre {name} doit être fini."
@@ -231,15 +247,17 @@ def validate_config(
             "mu doit être supérieur ou égal à zéro."
         )
 
-    if cfg.rtol < 0.0 or cfg.atol < 0.0:
-        raise ValueError(
-            "Les tolérances numériques doivent être positives ou nulles."
-        )
+    tolerances = {
+        "rtol": cfg.rtol,
+        "atol": cfg.atol,
+        "tol_w": cfg.tol_w,
+    }
 
-    if cfg.tol_w < 0.0:
-        raise ValueError(
-            "tol_w doit être positif ou nul."
-        )
+    for name, value in tolerances.items():
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"{name} doit être fini et positif ou nul."
+            )
 
 
 # ================================================================
@@ -261,8 +279,8 @@ def build_transition_adapter(
 
         transition_adapter(X, J)
 
-    fnk_fn est la fitness du même NKLandscape
-    pendant toute l'expérience.
+    fnk_fn peut être une fonction de fitness ou l'objet NKLandscape,
+    qui est lui-même appelable et expose delta_fitness_flip.
     """
 
     def transition_adapter(
@@ -367,6 +385,8 @@ class PairOrderRecord:
     delta_w_norm: float
     delta_w_max: float
 
+    # Nom historique : compte les désaccords entre masques finaux,
+    # pas des événements temporels de franchissement.
     threshold_crossing_count: int
 
 
@@ -391,8 +411,10 @@ class SymmetricOrderSweepSummary:
     mean_delta_w_norm: float
     max_delta_w_norm: float
 
+    # Fraction des comparaisons où max(abs(w_A - w_B)) > tol_w.
     frac_nonzero_delta_w: float
 
+    # Nom historique : somme des désaccords site par site des masques finaux.
     total_threshold_crossings: int
 
     records: List[PairOrderRecord]
@@ -517,22 +539,16 @@ def compare_symmetric_mutation_order(
     return {
         "XA": XA,
         "XB": XB,
-
         "JA": JA,
         "JB": JB,
-
         "same_X_endpoint": same_X,
         "same_full_endpoint_exact": same_exact,
         "same_full_endpoint_close": same_close,
-
         "sym_err_A": matrix_symmetry_error(JA),
         "sym_err_B": matrix_symmetry_error(JB),
-
         "diag_err_A": matrix_diagonal_error(JA),
         "diag_err_B": matrix_diagonal_error(JB),
-
         "gap_matrix": gap,
-
         "non_commut_gap_fro": float(
             np.linalg.norm(
                 gap,
@@ -564,8 +580,8 @@ def evaluate_observable_transmission(
         ||w_A - w_B||
         max |w_A - w_B|
 
-    Les franchissements comptent les différences entre les masques
-    binaires finaux, pas les événements temporels.
+    Le compteur compare les masques binaires finaux
+    (A_k > theta_A). Il ne compte pas d'événements temporels.
     """
 
     A_A = np.asarray(
@@ -616,7 +632,7 @@ def evaluate_observable_transmission(
     active_A = A_A > theta_A
     active_B = A_B > theta_A
 
-    crossings = int(
+    mask_disagreements = int(
         np.sum(active_A != active_B)
     )
 
@@ -624,7 +640,7 @@ def evaluate_observable_transmission(
         float(np.linalg.norm(delta_A)),
         float(np.linalg.norm(delta_w)),
         float(np.max(np.abs(delta_w))),
-        crossings,
+        mask_disagreements,
     )
 
 
@@ -669,8 +685,22 @@ def sweep_symmetric_order(
     """
     Exécute le balayage des deux ordres de mutation.
 
-    L'opérateur natif mutate_postflip est utilisé directement.
+    La fraction Delta w non nulle est définie composante par composante :
+
+        max(abs(w_A - w_B)) > tol_w
+
+    Cette définition est partagée avec audit_robustesse_eta.py.
     """
+
+    for name, value in (
+        ("tol_w", tol_w),
+        ("rtol", rtol),
+        ("atol", atol),
+    ):
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"{name} doit être fini et positif ou nul."
+            )
 
     records: List[PairOrderRecord] = []
 
@@ -701,7 +731,7 @@ def sweep_symmetric_order(
                 atol=atol,
             )
 
-            dA, dw, dw_max, crossings = (
+            dA, dw, dw_max, mask_disagreements = (
                 evaluate_observable_transmission(
                     XA=res["XA"],
                     JA=res["JA"],
@@ -717,32 +747,24 @@ def sweep_symmetric_order(
                     seed_idx=seed_idx,
                     k=k,
                     m=m,
-
                     same_X_endpoint=res["same_X_endpoint"],
-
                     same_full_endpoint_exact=res[
                         "same_full_endpoint_exact"
                     ],
-
                     same_full_endpoint_close=res[
                         "same_full_endpoint_close"
                     ],
-
                     symmetry_error_A=res["sym_err_A"],
                     symmetry_error_B=res["sym_err_B"],
-
                     diagonal_error_A=res["diag_err_A"],
                     diagonal_error_B=res["diag_err_B"],
-
                     non_commut_gap_fro=res[
                         "non_commut_gap_fro"
                     ],
-
                     delta_A_norm=dA,
                     delta_w_norm=dw,
                     delta_w_max=dw_max,
-
-                    threshold_crossing_count=crossings,
+                    threshold_crossing_count=mask_disagreements,
                 )
             )
 
@@ -807,7 +829,18 @@ def sweep_symmetric_order(
         dtype=np.float64,
     )
 
-    cross_vals = np.array(
+    # Critère composante par composante, identique à l'audit eta.
+    dw_max_vals = np.array(
+        [r.delta_w_max for r in records],
+        dtype=np.float64,
+    )
+
+    if not np.all(np.isfinite(dw_max_vals)):
+        raise RuntimeError(
+            "Les écarts maximaux de taux contiennent une valeur non finie."
+        )
+
+    mask_disagreement_vals = np.array(
         [r.threshold_crossing_count for r in records],
         dtype=np.int64,
     )
@@ -818,59 +851,45 @@ def sweep_symmetric_order(
 
     return SymmetricOrderSweepSummary(
         n_samples=len(records),
-
         mean_non_commut_gap_fro=float(
             np.mean(gaps)
         ),
-
         max_non_commut_gap_fro=float(
             np.max(gaps)
         ),
-
         max_symmetry_error=float(
             np.max(sym_errs)
         ),
-
         max_diagonal_error=float(
             np.max(diag_errs)
         ),
-
         frac_same_X_endpoint=float(
             np.mean(same_x)
         ),
-
         frac_same_full_endpoint_exact=float(
             np.mean(full_exact)
         ),
-
         frac_same_full_endpoint_close=float(
             np.mean(full_close)
         ),
-
         mean_delta_A_norm=float(
             np.mean(dA_vals)
         ),
-
         max_delta_A_norm=float(
             np.max(dA_vals)
         ),
-
         mean_delta_w_norm=float(
             np.mean(dw_vals)
         ),
-
         max_delta_w_norm=float(
             np.max(dw_vals)
         ),
-
         frac_nonzero_delta_w=float(
-            np.mean(dw_vals > tol_w)
+            np.mean(dw_max_vals > tol_w)
         ),
-
         total_threshold_crossings=int(
-            np.sum(cross_vals)
+            np.sum(mask_disagreement_vals)
         ),
-
         records=records,
     )
 
@@ -889,7 +908,19 @@ def sample_binary_symmetric_states(
     Génère :
         X0 in {-1, +1}^N
         J0 symétrique à diagonale nulle.
+
+    scale est l'écart-type des coefficients de la matrice brute avant
+    symétrisation. Pour des coefficients bruts indépendants de même
+    écart-type, les coefficients hors diagonale de J0 ont donc un
+    écart-type égal à scale / sqrt(2).
     """
+
+    if n_sites < 2:
+        raise ValueError("n_sites doit être >= 2.")
+    if n_seeds < 1:
+        raise ValueError("n_seeds doit être >= 1.")
+    if not np.isfinite(scale) or scale < 0.0:
+        raise ValueError("scale doit être fini et positif ou nul.")
 
     states = []
 
@@ -1001,11 +1032,14 @@ def print_summary(
     )
 
     print(
-        f"Franchissements de seuil     : "
+        f"Désaccords masques finaux    : "
         f"{summary.total_threshold_crossings}"
     )
 
     print("=" * 68)
+    print("Définition Delta w non nul : max(abs(w_A - w_B)) > tol_w.")
+    print("Désaccords masques finaux : comparaison site par site de A_k > theta_A.")
+    print("Ce compteur ne représente pas des franchissements temporels du seuil.")
 
 
 # ================================================================
@@ -1018,7 +1052,6 @@ def main() -> SymmetricOrderSweepSummary:
     """
 
     cfg = collect_config()
-
     validate_config(cfg)
 
     # ------------------------------------------------------------
@@ -1046,10 +1079,11 @@ def main() -> SymmetricOrderSweepSummary:
         seed=cfg.nk_seed,
     )
 
-    # Le même objet NKLandscape est employé dans tous les calculs.
+    # On transmet l'objet NKLandscape, pas seulement sa méthode fitness.
+    # transition_rates peut ainsi appeler delta_fitness_flip directement.
     transition_adapter = build_transition_adapter(
         cfg,
-        fnk_fn=nk_landscape.fitness,
+        fnk_fn=nk_landscape,
     )
 
     # ------------------------------------------------------------
@@ -1127,7 +1161,6 @@ def main() -> SymmetricOrderSweepSummary:
         )
 
     print_summary(summary)
-
     return summary
 
 
