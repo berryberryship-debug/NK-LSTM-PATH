@@ -13,6 +13,11 @@ Tensor conventions:
     pad_mask: (B, L), bool, True means padding (right-padding only)
     pos     : (B, L), integer position indices
 
+Causal filtration:
+    Token 0 receives no incoming action (special index N).
+    Token t (t >= 1) receives act_idx[:, t - 1], the transition x[t-1] -> x[t].
+    Token t therefore depends only on (x[0:t], act[0:t-1], j0).
+
 For a query at position i and key at position j <= i, the geometric bias is
     - beta_action * sum_{t=j}^{i-1} c_theta(x[t], act[t]).
 It therefore depends on the observed path segment.  The all-pairs shortest-path
@@ -32,6 +37,14 @@ from torch.nn import functional as F
 
 TransportMode = Literal["integrable", "symmetric"]
 GeometryMode = Literal["none", "fixed", "learned"]
+
+_INTEGER_DTYPES = (
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.uint8,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +122,36 @@ def _undirected_edge_index(n_sites: int) -> tuple[torch.Tensor, int]:
     return torch.as_tensor(lookup, dtype=torch.long), len(edge_to_id)
 
 
+def _validate_actions_and_transitions(
+    x_seq: torch.Tensor,
+    act_idx: torch.Tensor,
+    valid_transition: torch.Tensor,
+) -> torch.Tensor:
+    """Validate integer action indices and exact single-site hypercube flips before clamping."""
+    batch, length, n_sites = x_seq.shape
+    if act_idx.shape != (batch, length - 1):
+        raise ValueError("act_idx doit avoir la forme (B,L-1).")
+    if act_idx.dtype not in _INTEGER_DTYPES:
+        raise TypeError("act_idx doit être un tenseur d'entiers.")
+    if valid_transition.shape != (batch, length - 1) or valid_transition.dtype != torch.bool:
+        raise ValueError("valid_transition doit être booléen et de forme (B,L-1).")
+
+    if act_idx.numel() and torch.any(valid_transition & ((act_idx < 0) | (act_idx >= n_sites))):
+        raise ValueError("Chaque action valide doit être un indice entre 0 et N-1.")
+
+    safe_actions = act_idx.to(torch.long).clamp(min=0, max=n_sites - 1)
+    if length > 1 and torch.any(valid_transition):
+        flip_mask = F.one_hot(safe_actions, num_classes=n_sites).to(x_seq.dtype)
+        expected_next = x_seq[:, :-1] * (1.0 - 2.0 * flip_mask)
+        mismatch = valid_transition & torch.any(expected_next != x_seq[:, 1:], dim=-1)
+        if torch.any(mismatch):
+            raise ValueError(
+                "Transition invalide : x_seq[:, t+1] doit être exactement le flip "
+                "du site act_idx[:, t] sur x_seq[:, t]."
+            )
+    return safe_actions
+
+
 class UndirectedPositiveEdgeCosts(nn.Module):
     """Learn one positive cost per undirected edge of the binary hypercube.
 
@@ -180,21 +223,22 @@ def cumulative_observed_action(
     Returns (B,L,L). Entries above the causal diagonal are set to zero because
     those locations are masked in attention.
     """
+    if x_seq.ndim != 3:
+        raise ValueError("x_seq doit avoir la forme (B,L,N).")
     batch, length, n_sites = x_seq.shape
-    if act_idx.shape != (batch, length - 1):
-        raise ValueError("act_idx doit avoir la forme (B,L-1).")
     if edge_cost_table.shape != (1 << n_sites, n_sites):
         raise ValueError("edge_cost_table doit avoir la forme (2**N,N).")
-    state_idx = states_to_indices(x_seq)
+    if not torch.isfinite(x_seq).all():
+        raise ValueError("x_seq contient des valeurs non finies.")
     if pad_mask is None:
         valid_transition = torch.ones((batch, length - 1), device=x_seq.device, dtype=torch.bool)
     else:
         if pad_mask.shape != (batch, length) or pad_mask.dtype != torch.bool:
             raise ValueError("pad_mask doit être booléen et de forme (B,L).")
         valid_transition = (~pad_mask[:, :-1]) & (~pad_mask[:, 1:])
-    if act_idx.numel() and torch.any(valid_transition & ((act_idx < 0) | (act_idx >= n_sites))):
-        raise ValueError("Chaque action valide doit être un indice entre 0 et N-1.")
-    safe_actions = act_idx.clamp(min=0, max=n_sites - 1)
+
+    safe_actions = _validate_actions_and_transitions(x_seq, act_idx, valid_transition)
+    state_idx = states_to_indices(x_seq)
     edge_costs = edge_cost_table[state_idx[:, :-1], safe_actions]
     edge_costs = edge_costs * valid_transition.to(edge_costs.dtype)
     prefix = torch.cat(
@@ -338,7 +382,7 @@ class GSAPathModel(nn.Module):
         d_j = n * (n - 1) // 2
         self.x_proj = nn.Linear(n, config.d_model)
         self.j0_proj = nn.Linear(d_j, config.d_model)
-        self.action_embedding = nn.Embedding(n + 1, config.d_model)  # n = terminal/no-action token
+        self.action_embedding = nn.Embedding(n + 1, config.d_model)  # n = initial/no-action token
         self.position_embedding = nn.Embedding(config.max_len, config.d_model)
         self.input_norm = nn.LayerNorm(config.d_model)
         self.blocks = nn.ModuleList([
@@ -380,33 +424,42 @@ class GSAPathModel(nn.Module):
             return None
         return cumulative_observed_action(x_seq, act_idx, table, pad_mask)
 
-    def forward(
+    def embed_inputs(
         self,
         x_seq: torch.Tensor,
         act_idx: torch.Tensor,
         j0: torch.Tensor,
         pos: torch.Tensor | None = None,
         pad_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single source of truth for causal path embeddings.
+
+        Token 0 receives special_action = n_sites.
+        Token t (t >= 1) receives act_idx[:, t - 1] (incoming transition x[t-1] -> x[t]).
+        """
         if x_seq.ndim != 3:
             raise ValueError("x_seq doit avoir la forme (B,L,N).")
         batch, length, n_sites = x_seq.shape
         if n_sites != self.config.n_sites:
             raise ValueError(f"N attendu={self.config.n_sites}, reçu={n_sites}.")
         if length < 2 or length > self.config.max_len:
-            raise ValueError("La longueur L doit appartenir à [2,max_len].")
+            raise ValueError(f"La longueur L doit appartenir à [2,{self.config.max_len}].")
         if act_idx.shape != (batch, length - 1):
             raise ValueError("act_idx doit avoir la forme (B,L-1).")
         if j0.shape != (batch, self.d_J):
             raise ValueError(f"j0 doit avoir la forme (B,{self.d_J}).")
         if not torch.is_floating_point(x_seq) or not torch.is_floating_point(j0):
             raise TypeError("x_seq et j0 doivent être des tenseurs flottants.")
+        if not torch.isfinite(x_seq).all() or not torch.isfinite(j0).all():
+            raise ValueError("x_seq et j0 doivent contenir uniquement des valeurs finies.")
+
         if pos is None:
-            pos = torch.arange(length, device=x_seq.device).expand(batch, length)
+            pos = torch.arange(length, device=x_seq.device, dtype=torch.long).expand(batch, length)
         if pos.shape != (batch, length) or pos.dtype != torch.long:
             raise ValueError("pos doit être long et de forme (B,L).")
         if torch.any(pos < 0) or torch.any(pos >= self.config.max_len):
             raise ValueError("pos contient un indice hors de [0,max_len).")
+
         if pad_mask is None:
             pad_mask = torch.zeros((batch, length), device=x_seq.device, dtype=torch.bool)
         elif pad_mask.shape != (batch, length) or pad_mask.dtype != torch.bool:
@@ -419,15 +472,24 @@ class GSAPathModel(nn.Module):
         if torch.any((x_seq != 1.0) & (x_seq != -1.0)):
             raise ValueError("x_seq doit contenir uniquement -1 et +1.")
 
-        action_tokens = torch.full((batch, length), self.config.n_sites,
-                                   device=x_seq.device, dtype=torch.long)
+        valid_incoming = (~pad_mask[:, :-1]) & (~pad_mask[:, 1:])
+        safe_actions = _validate_actions_and_transitions(x_seq, act_idx, valid_incoming)
+
+        special_action = self.config.n_sites
+        action_tokens = torch.full(
+            (batch, length),
+            special_action,
+            device=x_seq.device,
+            dtype=torch.long,
+        )
         if length > 1:
-            valid_actions = (~pad_mask[:, :-1]) & (~pad_mask[:, 1:])
-            safe_actions = act_idx.clamp(min=0, max=self.config.n_sites - 1)
-            action_tokens[:, :-1] = torch.where(
-                valid_actions, safe_actions, torch.full_like(safe_actions, self.config.n_sites)
+            action_tokens[:, 1:] = torch.where(
+                valid_incoming,
+                safe_actions,
+                torch.full_like(safe_actions, special_action),
             )
-        action_tokens = action_tokens.masked_fill(pad_mask, self.config.n_sites)
+        action_tokens = action_tokens.masked_fill(pad_mask, special_action)
+
         hidden = (
             self.x_proj(x_seq)
             + self.action_embedding(action_tokens)
@@ -435,8 +497,25 @@ class GSAPathModel(nn.Module):
             + self.j0_proj(j0).unsqueeze(1)
         )
         hidden = self.input_norm(hidden)
-        if pad_mask is not None:
-            hidden = hidden.masked_fill(pad_mask[:, :, None], 0.0)
+        hidden = hidden.masked_fill(pad_mask[:, :, None], 0.0)
+        return hidden, pad_mask
+
+    def forward(
+        self,
+        x_seq: torch.Tensor,
+        act_idx: torch.Tensor,
+        j0: torch.Tensor,
+        pos: torch.Tensor | None = None,
+        pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden, pad_mask = self.embed_inputs(
+            x_seq=x_seq,
+            act_idx=act_idx,
+            j0=j0,
+            pos=pos,
+            pad_mask=pad_mask,
+        )
+        batch = hidden.shape[0]
         action_bias = self.path_action_bias(x_seq, act_idx, pad_mask)
         for block in self.blocks:
             hidden = block(hidden, action_bias, pad_mask, self.config.beta_action)
@@ -738,17 +817,56 @@ def test_path_vs_shortest_action_property() -> dict[str, float]:
     }
 
 
+def _build_valid_test_paths(
+    batch: int,
+    length: int,
+    n_sites: int,
+    gen: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_seq = torch.empty((batch, length, n_sites), dtype=torch.float32)
+    act_idx = torch.randint(0, n_sites, (batch, length - 1), generator=gen, dtype=torch.long)
+    x_seq[:, 0] = torch.where(torch.rand((batch, n_sites), generator=gen) > 0.5, 1.0, -1.0)
+    for t in range(length - 1):
+        x_seq[:, t + 1] = x_seq[:, t].clone()
+        x_seq[torch.arange(batch), t + 1, act_idx[:, t]] *= -1.0
+    return x_seq, act_idx
+
+
 def self_test() -> None:
     property_result = test_path_vs_shortest_action_property()
     config = GSAConfig(n_sites=6, d_model=32, n_heads=4, n_layers=2, max_len=8, geometry_mode="learned")
     model = GSAPathModel(config)
-    batch, length, n_sites = 5, 3, 6
-    x_seq = torch.where(torch.rand(batch, length, n_sites) > 0.5, 1.0, -1.0)
-    act_idx = torch.randint(0, n_sites, (batch, length - 1))
-    j0 = torch.randn(batch, config.n_sites * (config.n_sites - 1) // 2)
+    gen = torch.Generator().manual_seed(42)
+    batch, length, n_sites = 5, 4, 6
+    x_seq, act_idx = _build_valid_test_paths(batch, length, n_sites, gen)
+    j0 = torch.randn(batch, config.n_sites * (config.n_sites - 1) // 2, generator=gen)
     pred = model(x_seq, act_idx, j0)
     assert pred.shape == j0.shape
     assert torch.isfinite(pred).all()
+
+    # Causal prefix invariance: altering act_idx[:, t:] and future states leaves prefix 0..t unchanged.
+    emb_ref, _ = model.embed_inputs(x_seq, act_idx, j0)
+    for t in range(length - 1):
+        act_alt = act_idx.clone()
+        act_alt[:, t:] = (act_alt[:, t:] + 1) % n_sites
+        x_alt = x_seq.clone()
+        for step in range(t, length - 1):
+            x_alt[:, step + 1] = x_alt[:, step].clone()
+            x_alt[torch.arange(batch), step + 1, act_alt[:, step]] *= -1.0
+        emb_alt, _ = model.embed_inputs(x_alt, act_alt, j0)
+        torch.testing.assert_close(emb_ref[:, :t + 1], emb_alt[:, :t + 1], atol=1e-6, rtol=0.0)
+
+    # Invalid action rejection before clamping (independent of geometry_mode).
+    for mode in ("none", "fixed", "learned"):
+        m_check = GSAPathModel(GSAConfig(n_sites=6, d_model=16, n_heads=2, n_layers=1, geometry_mode=mode))
+        bad_act = act_idx.clone()
+        bad_act[0, 0] = -1
+        try:
+            m_check(x_seq, bad_act, j0)
+            raise AssertionError(f"Action négative acceptée en mode {mode}.")
+        except ValueError:
+            pass
+
     table = model.edge_costs.table()
     assert table.shape == (1 << n_sites, n_sites)
     assert torch.all(table > 0)
