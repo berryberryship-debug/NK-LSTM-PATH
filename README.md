@@ -3818,3 +3818,437 @@ Les précisions de cet addendum se rapportent aux passages suivants du document 
 | G | 10 — État de validation, limites et travaux restant à réaliser | Portée exacte des validations et limites des conclusions |
 
 **Principe de lecture :** chaque complément doit être lu conjointement avec sa section d'origine. L'addendum précise ou rectifie l'interprétation de ces passages sans remplacer leur contenu initial.
+
+## Description scientifique du protocole : dépendance au chemin et holonomie discrète dans NK-LSTM-PATH
+
+1. Contexte et formulation de l'espace d'état
+
+Le protocole étudie un système couplé associant une configuration génotypique discrète et une matrice d'interaction structurelle.
+
+La configuration binaire de (N) sites est représentée par :
+
+[
+X=(s_1,\ldots,s_N)^\top\in{-1,+1}^N.
+]
+
+La structure interactionnelle est représentée par une matrice :
+
+[
+J\in\mathbb R^{N\times N},
+]
+
+symétrique et à diagonale nulle :
+
+[
+J=J^\top,\qquad \operatorname{diag}(J)=0.
+]
+
+L'espace des états complets est défini par :
+
+[
+\mathcal E=
+{-1,+1}^N\times\mathcal S_{\mathrm{sym},0}(N),
+]
+
+où :
+
+[
+\mathcal S_{\mathrm{sym},0}(N)
+
+\left{
+J\in\mathbb R^{N\times N}
+\mid
+J=J^\top,\
+\operatorname{diag}(J)=0
+\right}.
+]
+
+Chaque état complet associe ainsi une configuration génotypique (X) à une structure interactionnelle (J).
+
+2. Opérateurs de mutation et chemins sur l'hypercube
+
+Soit (\sigma_k) l'opérateur d'inversion élémentaire du site (k) :
+
+[
+(\sigma_k(X))_i=
+\begin{cases}
+-s_k & \text{si }i=k,\
+s_i & \text{si }i\neq k.
+\end{cases}
+]
+
+Pour deux sites distincts (k\neq m), les opérateurs de mutation commutent :
+
+[
+\sigma_m\circ\sigma_k
+
+\sigma_k\circ\sigma_m.
+]
+
+Cette propriété est exacte sur l'hypercube discret.
+
+À partir d'un état initial ((X_0,J_0)), deux chemins mutationnels sont comparés :
+
+[
+\begin{aligned}
+\text{Chemin A}:&
+\quad
+(X_0,J_0)
+\xrightarrow{\sigma_k}
+(X_1,J_1)
+\xrightarrow{\sigma_m}
+(X_A,J_A),\
+\text{Chemin B}:&
+\quad
+(X_0,J_0)
+\xrightarrow{\sigma_m}
+(X'_1,J'_1)
+\xrightarrow{\sigma_k}
+(X_B,J_B).
+\end{aligned}
+]
+
+Les deux chemins aboutissent nécessairement au même état génotypique :
+
+[
+X_A=X_B=\sigma_m(\sigma_k(X_0)).
+]
+
+En revanche, cette égalité ne garantit pas l'identité des matrices structurelles finales.
+
+Le protocole examine précisément cette distinction entre commutation génotypique et dépendance au chemin du transport structurel.
+
+3. Transport de la structure et défaut de fermeture
+
+Chaque mutation entraîne une mise à jour de la matrice d'interaction par l'intermédiaire de l'opérateur "mutate_postflip", paramétré notamment par le coefficient de couplage (\eta).
+
+On représente cette mise à jour par :
+
+[
+J'=T_k(X,J;\eta).
+]
+
+Les transports composés le long des deux chemins sont :
+
+[
+H_A=
+T_m(X_1,J_1;\eta)
+\circ
+T_k(X_0,J_0;\eta),
+]
+
+[
+H_B=
+T_k(X'_1,J'_1;\eta)
+\circ
+T_m(X_0,J_0;\eta).
+]
+
+Le défaut de fermeture du transport est défini par :
+
+[
+\mathcal H_{km}(X_0,J_0)
+
+J_A-J_B.
+]
+
+Sa mesure scalaire utilise la norme de Frobenius :
+
+[
+\Delta_J=
+|J_A-J_B|_F
+
+\sqrt{
+\sum_{i,j=1}^{N}
+(J_{A,ij}-J_{B,ij})^2
+}.
+]
+
+Une valeur non nulle indique que les deux ordres de transport produisent des structures finales différentes pour l'état initial et la paire de mutations considérés.
+
+Précision terminologique : le script conserve le nom informatique "commutator_fro" pour cette mesure. Ce nom ne doit pas être interprété comme un commutateur matriciel :
+
+[
+[J_A,J_B]=J_AJ_B-J_BJ_A.
+]
+
+La quantité calculée est bien l'écart de transport entre chemins, et non le commutateur d'algèbre des deux matrices finales.
+
+3.1. Dépendance au chemin et interprétation géométrique
+
+Lorsque :
+
+[
+\Delta_J>0,
+]
+
+le transport structurel dépend de l'ordre des mutations, bien que le génotype final soit identique.
+
+Cette propriété constitue un défaut de fermeture sur le carré élémentaire de l'hypercube associé aux sites (k) et (m).
+
+Elle peut être interprétée comme une manifestation d'holonomie discrète : le transport de la structure le long de deux chemins reliant les mêmes sommets ne restitue pas nécessairement le même élément de la fibre finale.
+
+Une identification rigoureuse à une courbure géométrique exige toutefois de définir explicitement une connexion discrète sur le graphe de Hamming, ses opérateurs de transport et les propriétés de composition associées.
+
+Le défaut mesuré ici constitue donc un indicateur de dépendance au chemin. Il ne représente pas, à lui seul, un tenseur de courbure différentielle.
+
+4. Les deux règles de transport comparées
+
+Le script compare deux règles de transport appliquées aux mêmes états initiaux et aux mêmes paires de mutations.
+
+4.1. Contrôle intégrable
+
+La règle de contrôle est définie par :
+
+[
+\Psi_{ij}(X')=
+s'_i s'_j
+\qquad (i\neq j),
+]
+
+avec :
+
+[
+\Psi_{ii}=0.
+]
+
+Dans le code, cette règle est implémentée par "psi_integrable(X, J)".
+
+Elle construit une matrice à partir de l'état génotypique considéré, sans utiliser les valeurs de (J) pour construire directement (\Psi).
+
+Comme les deux chemins aboutissent au même génotype, cette règle sert de contrôle de fermeture du transport.
+
+Le résultat attendu est :
+
+[
+J_A=J_B,
+\qquad
+\Delta_J=0.
+]
+
+Cette propriété est également vérifiée numériquement dans le script : une erreur est déclenchée si le contrôle intégrable ne satisfait pas l'égalité des états génotypiques et l'égalité des états complets à la tolérance demandée.
+
+4.2. Transport symétrique natif
+
+Le second transport utilise l'opérateur natif :
+
+[
+\Psi=\psi_{\mathrm{sym}}(X',J),
+]
+
+implémenté dans "fiber_bundle.py".
+
+Il est transmis à "mutate_postflip" comme fonction de transport.
+
+Contrairement au contrôle précédent, les mises à jour successives peuvent conserver une dépendance à la structure intermédiaire et, par conséquent, à l'ordre des mutations.
+
+Pour les configurations et valeurs de (\eta) effectivement testées, les simulations ont mis en évidence des écarts structurels non nuls.
+
+Cette observation établit une dépendance au chemin dans les configurations concernées. Sa généralisation nécessite des balayages sur plusieurs graines, paramètres et configurations initiales.
+
+5. Propagation aux observables fonctionnelles
+
+Le protocole examine si les différences structurelles entre (J_A) et (J_B) se répercutent sur les observables fonctionnelles du système.
+
+5.1. Écart d'accessibilité
+
+L'accessibilité est représentée par :
+
+[
+A(J)\in\mathbb R^N.
+]
+
+L'écart entre les deux chemins est :
+
+[
+\Delta_A=
+|A(J_A)-A(J_B)|_2.
+]
+
+Le script conserve également les différences par composante :
+
+[
+\delta A_i=A_i(J_A)-A_i(J_B).
+]
+
+5.2. Écart des taux de transition
+
+Les taux de transition sont représentés par :
+
+[
+w(X,J)\in\mathbb R^N.
+]
+
+Comme les génotypes finaux sont identiques, la comparaison porte sur :
+
+[
+\Delta_w=
+|w(X_A,J_A)-w(X_B,J_B)|_2.
+]
+
+L'écart maximal par site est :
+
+[
+\Delta w_{\max}
+
+\max_{1\leq i\leq N}
+|w_{A,i}-w_{B,i}|.
+]
+
+Les différences individuelles sont également conservées :
+
+[
+\delta w_i=w_{A,i}-w_{B,i}.
+]
+
+Une comparaison est considérée comme présentant un écart de taux non nul lorsque :
+
+[
+\Delta w_{\max}>\operatorname{tol}_w.
+]
+
+5.3. Désaccords entre les masques d'accessibilité
+
+Le masque d'accessibilité est défini par le seuil (\theta_A) :
+
+[
+M_i(J)=
+\mathbb I[A_i(J)>\theta_A].
+]
+
+Le nombre de désaccords entre les deux chemins est :
+
+[
+\Delta_{\mathrm{masque}}
+
+\sum_{i=1}^{N}
+\mathbb I
+\left[
+M_i(J_A)\neq M_i(J_B)
+\right].
+]
+
+Ce compteur mesure le nombre de sites dont le statut d'accessibilité final diffère selon l'ordre des mutations.
+
+Il identifie ainsi une divergence potentielle dans les possibilités de transition ultérieures.
+
+Il ne mesure pas les franchissements temporels du seuil et ne démontre pas, à lui seul, l'ouverture ou la fermeture définitive de voies évolutives.
+
+6. Construction et contrôle du protocole numérique
+
+Le paysage NK canonique et les états initiaux sont générés une seule fois par exécution.
+
+Les deux règles de transport utilisent les mêmes états initiaux, les mêmes matrices (J_0), les mêmes paramètres et les mêmes paires de sites.
+
+Chaque paire non ordonnée est évaluée une seule fois :
+
+[
+(k,m),\qquad k<m.
+]
+
+Les deux ordres de mutation sont comparés au sein de chaque observation.
+
+Pour (N) sites et (S) états initiaux, le nombre de comparaisons est :
+
+[
+N_{\mathrm{comparaisons}}
+
+S\binom{N}{2}.
+]
+
+Les diagnostics de symétrie et de diagonale nulle sont calculés sur les matrices brutes avant leur validation structurelle par "_validate_J".
+
+Cette distinction permet de mesurer les éventuels défauts structurels avant toute validation susceptible de rejeter les matrices.
+
+Le protocole contrôle notamment :
+
+- l'identité des génotypes finaux ;
+- l'identité exacte ou approchée des états complets ;
+- l'écart structurel entre les matrices finales ;
+- les erreurs de symétrie ;
+- les erreurs de diagonale ;
+- les différences d'accessibilité ;
+- les différences des taux de transition ;
+- les désaccords entre les masques d'accessibilité finaux.
+
+Les résultats détaillés, y compris les différences par site, sont conservés dans les enregistrements JSON.
+
+7. Dépendances internes du code
+
+Le script "balayage_commutateur_nk_v2.py" utilise les modules suivants :
+
+"fiber_bundle.py"
+
+Fournit les fonctions et opérateurs structurels :
+
+- "_validate_J"
+- "_validate_state"
+- "accessibility_A"
+- "mutate_postflip"
+- "psi_sym"
+
+"nk_landscape.py"
+
+Fournit la classe :
+
+- "NKLandscape"
+
+Cette classe génère le paysage NK canonique utilisé dans les deux comparaisons.
+
+"trajectories.py"
+
+Fournit la fonction :
+
+- "transition_rates"
+
+Elle calcule les taux de transition à partir de l'état génotypique, de la matrice d'interaction et du paysage NK partagé.
+
+Les imports effectifs du script sont :
+
+from fiber_bundle import (
+    _validate_J,
+    _validate_state,
+    accessibility_A,
+    mutate_postflip,
+    psi_sym,
+)
+
+from nk_landscape import NKLandscape
+
+from trajectories import transition_rates
+
+Cette organisation distingue la définition du paysage NK, les opérateurs de transport structurel et la dynamique des transitions.
+
+8. Synthèse des niveaux conceptuels
+
+Propriété| Formulation| Statut dans le protocole
+Commutation génotypique| (\sigma_k\circ\sigma_m=\sigma_m\circ\sigma_k)| Exacte sur l'hypercube
+Fermeture du transport| (J_A-J_B=0)| Vérifiée pour le contrôle intégrable
+Défaut de fermeture| (\Delta_J=|J_A-J_B|_F)| Mesuré pour les deux transports
+Dépendance au chemin| (\Delta_J>0)| Observée pour les configurations testées du transport symétrique
+Propagation fonctionnelle| (\Delta_A,\Delta_w,\Delta_{\mathrm{masque}})| Mesurée numériquement
+Courbure différentielle| Définition d'une connexion et de sa courbure| Formalisation ultérieure nécessaire
+
+9. Conclusion
+
+Le protocole met en évidence une distinction fondamentale entre la commutation des mutations génotypiques et la commutation des transports structurels.
+
+Deux séquences mutationnelles peuvent conduire exactement au même génotype final tout en produisant des matrices d'interaction différentes.
+
+Cette différence constitue une dépendance au chemin du transport dans l'espace des structures associées au génotype.
+
+Le protocole permet ensuite d'examiner la propagation de cette différence vers l'accessibilité, les taux de transition et les masques fonctionnels du paysage adaptatif.
+
+La relation centrale étudiée est donc :
+
+[
+\boxed{
+\text{Commutation des mutations}
+;\not\Rightarrow;
+\text{Commutation des transports}
+}
+]
+
+L'intérêt du modèle réside dans l'étude de cette dissociation : l'identité de l'état génotypique final n'implique pas nécessairement l'identité de son état structurel associé.
+
+Le défaut de fermeture mesuré constitue ainsi un indicateur numérique de mémoire du chemin dans le transport structurel, dont l'interprétation en termes de courbure géométrique demeure une étape formelle distincte.
