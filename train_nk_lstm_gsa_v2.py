@@ -13,7 +13,7 @@ Architecture testée :
 
 Invariants :
 - États x_seq dans {-1, +1}^N.
-- Causalité stricte (filtration temporelle) :
+- Causalité stricte (filtration temporelle déléguée à `GSAPathModel.embed_inputs`) :
   Le token 0 ne reçoit aucune action (jeton spécial N).
   Le token t (t >= 1) reçoit act_idx[:, t-1], c'est-à-dire l'action
   qui a permis la transition de x[t-1] vers x[t].
@@ -171,9 +171,20 @@ def _assert_same_shape(name: str, a: np.ndarray, b: np.ndarray) -> None:
 
 
 def _validate_binary_states(x: np.ndarray, name: str) -> None:
+    if not np.all(np.isfinite(x)):
+        raise ValueError(
+            f"{name} contient des valeurs non finies."
+        )
     if not np.all((x == 1.0) | (x == -1.0)):
         raise ValueError(
             f"{name} contient des valeurs autres que -1/+1."
+        )
+
+
+def _validate_finite_array(arr: np.ndarray, name: str) -> None:
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(
+            f"{name} contient des valeurs non finies (NaN ou Inf)."
         )
 
 
@@ -196,6 +207,11 @@ def _validate_single_flip_transitions(
             f"{name}.act doit avoir la forme (B,L-1)."
         )
 
+    if not np.issubdtype(act_idx.dtype, np.integer):
+        raise TypeError(
+            f"{name}: act_idx doit être un tableau d'entiers, reçu {act_idx.dtype}."
+        )
+
     B, L, N = x_seq.shape
 
     if act_idx.shape != (B, L - 1):
@@ -209,7 +225,7 @@ def _validate_single_flip_transitions(
 
         if np.any(actions < 0) or np.any(actions >= N):
             raise ValueError(
-                f"{name}: action hors domaine à t={t}."
+                f"{name}: action hors domaine [0, {N - 1}] à t={t}."
             )
 
         expected = x_seq[:, t].copy()
@@ -229,20 +245,21 @@ def validate_forced_pair_dataset(
     dataset: ForcedPairDataset,
     expected_n_sites: int,
     expected_mode: TransportMode | None = None,
+    max_len: int = 32,
 ) -> None:
     """
     Validation structurelle complète avant entraînement.
 
     Vérifie :
-    - dimensions ;
-    - états binaires ;
-    - transitions hypercube ;
+    - contrat strict L == 3 (carré forcé à deux flips k->m vs m->k) et L <= max_len ;
+    - dimensions et finitude numérique de tous les tenseurs ;
+    - états binaires {-1, +1} ;
+    - transitions hypercube à un seul site par pas ;
     - J0 au premier état ;
     - J_final cohérent avec j_seq[-1] ;
     - omega = J_final_a - J_final_b ;
-    - état initial identique entre les deux ordres ;
-    - état final identique entre les deux ordres ;
-    - cohérence des deux actions forcées.
+    - état initial et état final identiques entre les deux ordres ;
+    - sites distincts k != m dans [0, N-1] et actions inversées (k, m) / (m, k).
     """
 
     required = [
@@ -286,7 +303,7 @@ def validate_forced_pair_dataset(
     site_pair = np.asarray(dataset.site_pair)
 
     # ------------------------------------------------------------------
-    # Dimensions principales
+    # Dimensions principales et contrat L == 3 <= max_len
     # ------------------------------------------------------------------
 
     if x_a.ndim != 3 or x_b.ndim != 3:
@@ -295,6 +312,11 @@ def validate_forced_pair_dataset(
         )
 
     B, L, N = x_a.shape
+
+    if B < 1:
+        raise ValueError(
+            "Le dataset ne peut pas être vide (B >= 1 requis)."
+        )
 
     if N != expected_n_sites:
         raise ValueError(
@@ -308,31 +330,38 @@ def validate_forced_pair_dataset(
             f"{x_a.shape} vs {x_b.shape}."
         )
 
-    if L < 2:
-        raise ValueError("Une trajectoire doit contenir au moins 2 états.")
+    if L > max_len:
+        raise ValueError(
+            f"Longueur de trajectoire L={L} supérieure à max_len={max_len}."
+        )
 
-    if L > 32:
-        warnings.warn(
-            f"Le dataset contient L={L} états. "
-            "Vérifier max_len avant entraînement."
+    if L != 3:
+        raise ValueError(
+            f"Le contrat ForcedPairDataset exige exactement L=3 états "
+            f"(carré à deux flips), reçu L={L}."
         )
 
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
 
-    if act_a.shape != (B, L - 1):
-        raise ValueError(
-            f"act_a.shape={act_a.shape}, attendu={(B, L - 1)}."
+    if not np.issubdtype(act_a.dtype, np.integer) or not np.issubdtype(act_b.dtype, np.integer):
+        raise TypeError(
+            "act_a et act_b doivent être des tableaux d'entiers."
         )
 
-    if act_b.shape != (B, L - 1):
+    if act_a.shape != (B, 2):
         raise ValueError(
-            f"act_b.shape={act_b.shape}, attendu={(B, L - 1)}."
+            f"act_a.shape={act_a.shape}, attendu={(B, 2)}."
+        )
+
+    if act_b.shape != (B, 2):
+        raise ValueError(
+            f"act_b.shape={act_b.shape}, attendu={(B, 2)}."
         )
 
     # ------------------------------------------------------------------
-    # J
+    # J et finitude numérique
     # ------------------------------------------------------------------
 
     if j0.ndim != 2:
@@ -347,16 +376,16 @@ def validate_forced_pair_dataset(
             f"j0.shape={j0.shape}, attendu={(B, d_j)}."
         )
 
-    if j_seq_a.shape != (B, L, d_j):
+    if j_seq_a.shape != (B, 3, d_j):
         raise ValueError(
             f"j_seq_a.shape={j_seq_a.shape}, "
-            f"attendu={(B, L, d_j)}."
+            f"attendu={(B, 3, d_j)}."
         )
 
-    if j_seq_b.shape != (B, L, d_j):
+    if j_seq_b.shape != (B, 3, d_j):
         raise ValueError(
             f"j_seq_b.shape={j_seq_b.shape}, "
-            f"attendu={(B, L, d_j)}."
+            f"attendu={(B, 3, d_j)}."
         )
 
     if j_final_a.shape != (B, d_j):
@@ -377,9 +406,24 @@ def validate_forced_pair_dataset(
             f"attendu={(B, d_j)}."
         )
 
+    for arr_name, arr in (
+        ("j0", j0),
+        ("j_seq_a", j_seq_a),
+        ("j_seq_b", j_seq_b),
+        ("j_final_a", j_final_a),
+        ("j_final_b", j_final_b),
+        ("omega", omega),
+    ):
+        _validate_finite_array(arr, arr_name)
+
     # ------------------------------------------------------------------
-    # IDs
+    # IDs et paires de sites
     # ------------------------------------------------------------------
+
+    if not np.issubdtype(initial_state_id.dtype, np.integer):
+        raise TypeError(
+            "initial_state_id doit être un tableau d'entiers."
+        )
 
     if initial_state_id.shape != (B,):
         raise ValueError(
@@ -387,10 +431,25 @@ def validate_forced_pair_dataset(
             f"attendu={(B,)}."
         )
 
+    if not np.issubdtype(site_pair.dtype, np.integer):
+        raise TypeError(
+            "site_pair doit être un tableau d'entiers."
+        )
+
     if site_pair.ndim != 2 or site_pair.shape != (B, 2):
         raise ValueError(
             f"site_pair.shape={site_pair.shape}, "
             f"attendu={(B, 2)}."
+        )
+
+    if np.any(site_pair < 0) or np.any(site_pair >= N):
+        raise ValueError(
+            f"site_pair contient des indices hors de [0, {N - 1}]."
+        )
+
+    if np.any(site_pair[:, 0] == site_pair[:, 1]):
+        raise ValueError(
+            "site_pair doit contenir deux sites distincts k != m."
         )
 
     # ------------------------------------------------------------------
@@ -417,7 +476,7 @@ def validate_forced_pair_dataset(
     )
 
     # ------------------------------------------------------------------
-    # Les deux chemins doivent partir du même état
+    # Les deux chemins doivent partir du même état et arriver au même état
     # ------------------------------------------------------------------
 
     if not np.array_equal(x_a[:, 0], x_b[:, 0]):
@@ -425,49 +484,44 @@ def validate_forced_pair_dataset(
             "x_a[:,0] et x_b[:,0] doivent être identiques."
         )
 
-    # ------------------------------------------------------------------
-    # Les deux ordres doivent conduire au même état final
-    # ------------------------------------------------------------------
-
     if not np.array_equal(x_a[:, -1], x_b[:, -1]):
         raise ValueError(
             "Les chemins A et B n'aboutissent pas au même état final."
         )
 
     # ------------------------------------------------------------------
-    # Site pair cohérent avec les deux premiers actes
+    # Cohérence exacte des paires d'actions inversées (k, m) et (m, k)
     # ------------------------------------------------------------------
 
-    if L >= 3:
-        pair_a = np.sort(act_a[:, :2], axis=1)
-        pair_b = np.sort(act_b[:, :2], axis=1)
+    if np.any(act_a[:, 0] == act_a[:, 1]) or np.any(act_b[:, 0] == act_b[:, 1]):
+        raise ValueError(
+            "Les deux actions d'un chemin doivent porter sur des sites distincts."
+        )
 
-        if not np.array_equal(pair_a, site_pair):
-            raise ValueError(
-                "site_pair incohérent avec les deux actions du chemin A."
-            )
+    pair_a = np.sort(act_a, axis=1)
+    pair_b = np.sort(act_b, axis=1)
+    pair_expected = np.sort(site_pair, axis=1)
 
-        if not np.array_equal(pair_b, site_pair):
-            raise ValueError(
-                "site_pair incohérent avec les deux actions du chemin B."
-            )
+    if not np.array_equal(pair_a, pair_expected):
+        raise ValueError(
+            "site_pair incohérent avec les deux actions du chemin A."
+        )
 
-        if not np.array_equal(
-            act_a[:, 0],
-            act_b[:, 1],
-        ):
-            raise ValueError(
-                "Le chemin A doit commencer par l'action finale "
-                "du chemin B dans une paire k→m / m→k."
-            )
+    if not np.array_equal(pair_b, pair_expected):
+        raise ValueError(
+            "site_pair incohérent avec les deux actions du chemin B."
+        )
 
-        if not np.array_equal(
-            act_a[:, 1],
-            act_b[:, 0],
-        ):
-            raise ValueError(
-                "Les deux chemins doivent inverser exactement leur ordre."
-            )
+    if not np.array_equal(act_a[:, 0], act_b[:, 1]):
+        raise ValueError(
+            "Le chemin A doit commencer par l'action finale "
+            "du chemin B dans une paire k->m / m->k."
+        )
+
+    if not np.array_equal(act_a[:, 1], act_b[:, 0]):
+        raise ValueError(
+            "Les deux chemins doivent inverser exactement leur ordre."
+        )
 
     # ------------------------------------------------------------------
     # J initial
@@ -551,11 +605,9 @@ class HybridPathModel(nn.Module):
     Encodeur de chemin unifié compatible avec predict_path_pair.
 
     Important :
-    `lstm_only` ne signifie pas que toute l'infrastructure GSAPathModel
-    est supprimée. Les projections, embeddings et la tête J sont partagés.
-    Seule la voie d'attention GSA est désactivée.
-
-    La géométrie apprise n'est donc active que lorsque use_gsa=True.
+    `lstm_only` réutilise les projections d'entrée, les embeddings partagés et
+    la tête résiduelle `delta_head` du noyau GSA, mais supprime les blocs
+    d'attention GSA et `edge_costs` afin de n'exposer que des paramètres actifs.
     """
 
     def __init__(
@@ -604,6 +656,13 @@ class HybridPathModel(nn.Module):
             "hybrid_concat",
             "hybrid_gated",
         )
+
+        if not self.use_gsa:
+            # Libère les sous-modules GSA non utilisés afin que le décompte
+            # des paramètres entraînables reflète exactement les paramètres actifs.
+            self.gsa.blocks = nn.ModuleList()
+            self.gsa.final_norm = None
+            self.gsa.edge_costs = None
 
         # ------------------------------------------------------------------
         # LSTM
@@ -678,7 +737,7 @@ class HybridPathModel(nn.Module):
         return self.gsa.shortest_path_matrix()
 
     # ------------------------------------------------------------------
-    # Embedding causal
+    # Embedding causal unique délégué au noyau GSA
     # ------------------------------------------------------------------
 
     def _embed_inputs(
@@ -689,198 +748,13 @@ class HybridPathModel(nn.Module):
         pos: torch.Tensor | None,
         pad_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        if x_seq.ndim != 3:
-            raise ValueError(
-                "x_seq doit avoir la forme (B,L,N)."
-            )
-
-        batch, length, n_sites = x_seq.shape
-
-        if n_sites != self.config.n_sites:
-            raise ValueError(
-                f"N attendu={self.config.n_sites}, reçu={n_sites}."
-            )
-
-        if length < 2 or length > self.config.max_len:
-            raise ValueError(
-                f"La longueur L doit appartenir à [2, {self.config.max_len}]."
-            )
-
-        if act_idx.shape != (
-            batch,
-            length - 1,
-        ):
-            raise ValueError(
-                "act_idx doit avoir la forme (B,L-1)."
-            )
-
-        if j0.shape != (
-            batch,
-            self.d_J,
-        ):
-            raise ValueError(
-                f"j0 doit avoir la forme "
-                f"(B,{self.d_J})."
-            )
-
-        if (
-            not torch.is_floating_point(x_seq)
-            or not torch.is_floating_point(j0)
-        ):
-            raise TypeError(
-                "x_seq et j0 doivent être flottants."
-            )
-
-        # --------------------------------------------------------------
-        # Positions
-        # --------------------------------------------------------------
-
-        if pos is None:
-            pos = torch.arange(
-                length,
-                device=x_seq.device,
-                dtype=torch.long,
-            ).expand(batch, length)
-
-        if (
-            pos.shape != (batch, length)
-            or pos.dtype != torch.long
-        ):
-            raise ValueError(
-                "pos doit être long et de forme (B,L)."
-            )
-
-        if torch.any(pos < 0):
-            raise ValueError(
-                "pos contient une valeur négative."
-            )
-
-        if torch.any(pos >= self.config.max_len):
-            raise ValueError(
-                "pos contient un indice hors de max_len."
-            )
-
-        # --------------------------------------------------------------
-        # Padding
-        # --------------------------------------------------------------
-
-        if pad_mask is None:
-
-            pad_mask = torch.zeros(
-                (batch, length),
-                device=x_seq.device,
-                dtype=torch.bool,
-            )
-
-        elif (
-            pad_mask.shape != (batch, length)
-            or pad_mask.dtype != torch.bool
-        ):
-            raise ValueError(
-                "pad_mask doit être booléen et de forme (B,L)."
-            )
-
-        if torch.any(pad_mask.all(dim=1)):
-            raise ValueError(
-                "Chaque séquence doit contenir au moins "
-                "un état non rembourré."
-            )
-
-        # Padding à droite uniquement.
-        if length > 1:
-            invalid_padding = (
-                pad_mask[:, :-1]
-                & ~pad_mask[:, 1:]
-            )
-
-            if torch.any(invalid_padding):
-                raise ValueError(
-                    "pad_mask doit utiliser un padding à droite."
-                )
-
-        # --------------------------------------------------------------
-        # États
-        # --------------------------------------------------------------
-
-        if torch.any(
-            (x_seq != 1.0)
-            & (x_seq != -1.0)
-        ):
-            raise ValueError(
-                "x_seq doit contenir uniquement -1 et +1."
-            )
-
-        # --------------------------------------------------------------
-        # ACTIONS CAUSALES : Filtration temporelle
-        #
-        # Token 0 :
-        #     aucun acte entrant -> indice spécial n_sites.
-        #
-        # Token t (t >= 1) :
-        #     reçoit act[t-1], c'est-à-dire l'action qui a produit
-        #     x_t à partir de x_{t-1}.
-        #
-        # Ainsi :
-        #   token t = f(x_0,...,x_t, a_0,...,a_{t-1}, J0)
-        #
-        # aucune action future act[t:] n'est accessible.
-        # --------------------------------------------------------------
-
-        special_action = self.config.n_sites
-
-        action_tokens = torch.full(
-            (batch, length),
-            special_action,
-            device=x_seq.device,
-            dtype=torch.long,
+        return self.gsa.embed_inputs(
+            x_seq=x_seq,
+            act_idx=act_idx,
+            j0=j0,
+            pos=pos,
+            pad_mask=pad_mask,
         )
-
-        if length > 1:
-            valid_incoming = (
-                ~pad_mask[:, 1:]
-                & ~pad_mask[:, :-1]
-            )
-
-            safe_actions = act_idx.clamp(
-                min=0,
-                max=self.config.n_sites - 1,
-            )
-
-            # Injection sur les indices 1 à L-1
-            action_tokens[:, 1:] = torch.where(
-                valid_incoming,
-                safe_actions,
-                torch.full_like(
-                    safe_actions,
-                    special_action,
-                ),
-            )
-
-        action_tokens = action_tokens.masked_fill(
-            pad_mask,
-            special_action,
-        )
-
-        # --------------------------------------------------------------
-        # Embedding partagé
-        # --------------------------------------------------------------
-
-        hidden = (
-            self.gsa.x_proj(x_seq)
-            + self.gsa.action_embedding(action_tokens)
-            + self.gsa.position_embedding(pos)
-            + self.gsa.j0_proj(j0).unsqueeze(1)
-        )
-
-        hidden = self.gsa.input_norm(hidden)
-
-        hidden = hidden.masked_fill(
-            pad_mask[:, :, None],
-            0.0,
-        )
-
-        return hidden, pad_mask
 
     # ------------------------------------------------------------------
     # Forward
@@ -955,6 +829,8 @@ class HybridPathModel(nn.Module):
         h_geom = None
 
         if self.use_gsa:
+
+            assert self.gsa.final_norm is not None
 
             action_bias = self.gsa.path_action_bias(
                 x_seq,
@@ -1061,7 +937,7 @@ class PairedPathSubset(Dataset):
 
     Les j_seq sont conservés pour validation et audit futur,
     même si la fonction de perte actuelle de gsa_v1_core
-    supervise principalement la sortie terminale.
+    supervise uniquement la sortie terminale.
     """
 
     def __init__(
@@ -1279,12 +1155,6 @@ def build_synthetic_smoke_dataset(
         "state_id": [],
         "pair": [],
     }
-
-    d_j = (
-        n_sites
-        * (n_sites - 1)
-        // 2
-    )
 
     triu_r, triu_c = np.triu_indices(
         n_sites,
@@ -1534,6 +1404,7 @@ def prepare_dataset(
             dataset,
             expected_n_sites=config.n_sites,
             expected_mode=config.transport_mode,
+            max_len=config.max_len,
         )
 
         return dataset
@@ -1552,6 +1423,7 @@ def prepare_dataset(
             dataset,
             expected_n_sites=config.n_sites,
             expected_mode=config.transport_mode,
+            max_len=config.max_len,
         )
 
         return dataset
@@ -1583,6 +1455,7 @@ def prepare_dataset(
         dataset,
         expected_n_sites=config.n_sites,
         expected_mode=config.transport_mode,
+        max_len=config.max_len,
     )
 
     return dataset
@@ -1753,6 +1626,11 @@ def run_epoch(
                 lambda_geometry=config.lambda_geometry,
                 model=model,
             )
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Perte non finie détectée pendant run_epoch."
+                )
 
             if training:
 
@@ -2016,13 +1894,29 @@ def build_self_test_batch(
     )
 
 
+def _rollout_from_prefix(
+    x_base: torch.Tensor,
+    act_alt: torch.Tensor,
+    start_step: int,
+) -> torch.Tensor:
+    """Recompute x_alt[:, start_step+1:] consistently from act_alt[:, start_step:]."""
+    x_alt = x_base.clone()
+    batch = x_alt.shape[0]
+    length = x_alt.shape[1]
+    batch_idx = torch.arange(batch, device=x_alt.device)
+    for t in range(start_step, length - 1):
+        x_alt[:, t + 1] = x_alt[:, t].clone()
+        x_alt[batch_idx, t + 1, act_alt[:, t]] *= -1.0
+    return x_alt
+
+
 def self_test(
     config: TrainV2Config,
 ) -> None:
 
     print()
     print("=" * 72)
-    print("SELF-TEST NK-LSTM-GSA V2 (AVEC CAUSALITÉ STRICTE)")
+    print("SELF-TEST NK-LSTM-GSA V2 (CAUSALITÉ & SYNCHRONISATION NOYAU)")
     print("=" * 72)
 
     device = torch.device(
@@ -2062,7 +1956,7 @@ def self_test(
     )
 
     # --------------------------------------------------------------
-    # Test des quatre architectures
+    # 1. Test des quatre architectures et paramètres actifs
     # --------------------------------------------------------------
 
     for arch_mode in (
@@ -2108,10 +2002,7 @@ def self_test(
         loss = out.square().mean()
         loss.backward()
 
-        # ----------------------------------------------------------
         # Gradient LSTM
-        # ----------------------------------------------------------
-
         if model.use_lstm:
 
             assert (
@@ -2130,49 +2021,31 @@ def self_test(
                 "dans la branche LSTM."
             )
 
-        # ----------------------------------------------------------
-        # Gradient GSA
-        # ----------------------------------------------------------
-
-        if (
-            model.use_gsa
-            and model.gsa.edge_costs
-            is not None
-        ):
-
-            edge_grad = (
-                model
-                .gsa
-                .edge_costs
-                .edge_logits
-                .grad
-            )
-
-            assert (
-                edge_grad is not None
-            ), (
-                "Gradient absent des "
-                "coûts géométriques "
-                "alors que GSA est active."
-            )
-
-        else:
-
-            if (
-                model.gsa.edge_costs
-                is not None
-            ):
-                assert (
+        # Gradient GSA et absence de sous-modules inactifs en lstm_only
+        if model.use_gsa:
+            if model.gsa.edge_costs is not None:
+                edge_grad = (
                     model
                     .gsa
                     .edge_costs
                     .edge_logits
                     .grad
-                    is None
-                ), (
-                    "Un gradient GSA inattendu "
-                    "est apparu en lstm_only."
                 )
+                assert (
+                    edge_grad is not None
+                ), (
+                    "Gradient absent des "
+                    "coûts géométriques "
+                    "alors que GSA est active."
+                )
+        else:
+            assert (
+                len(model.gsa.blocks) == 0
+                and model.gsa.final_norm is None
+                and model.gsa.edge_costs is None
+            ), (
+                "Des sous-modules GSA inactifs subsistent en lstm_only."
+            )
 
         print(
             "  forward        : OK"
@@ -2183,7 +2056,46 @@ def self_test(
         )
 
     # --------------------------------------------------------------
-    # Test antisymétrie exacte
+    # 2. Synchronisation exacte noyau GSAPathModel <-> HybridPathModel
+    # --------------------------------------------------------------
+
+    print(
+        "\n[TEST] synchronisation GSAPathModel <-> HybridPathModel (gsa_only)"
+    )
+
+    hybrid_gsa = HybridPathModel(
+        gsa_config=gsa_cfg,
+        arch_mode="gsa_only",
+        lstm_layers=config.lstm_layers,
+    ).to(device)
+    hybrid_gsa.eval()
+
+    with torch.no_grad():
+        out_core = hybrid_gsa.gsa(
+            x_seq=x,
+            act_idx=act,
+            j0=j0,
+            pad_mask=pad_mask,
+        )
+        out_hybrid = hybrid_gsa(
+            x_seq=x,
+            act_idx=act,
+            j0=j0,
+            pad_mask=pad_mask,
+        )
+
+    torch.testing.assert_close(
+        out_core,
+        out_hybrid,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    print(
+        "  équivalence noyau : OK"
+    )
+
+    # --------------------------------------------------------------
+    # 3. Test antisymétrie exacte
     # --------------------------------------------------------------
 
     print(
@@ -2195,71 +2107,14 @@ def self_test(
         arch_mode="hybrid_concat",
         lstm_layers=config.lstm_layers,
     ).to(device)
+    model.eval()
 
     x_a = x
-    x_b = x.clone()
-
     act_a = act
     act_b = act.clone()
-
-    if act.shape[1] >= 2:
-
-        act_b[:, 0] = act[:, 1]
-        act_b[:, 1] = act[:, 0]
-
-        x_b = x.clone()
-
-        for b in range(
-            x.shape[0]
-        ):
-
-            x_b[b, 0] = x[b, 0]
-
-            x_b[b, 1] = (
-                x_b[b, 0]
-                .clone()
-            )
-
-            x_b[
-                b,
-                1,
-                act_b[b, 0],
-            ] *= -1.0
-
-            x_b[b, 2] = (
-                x_b[b, 1]
-                .clone()
-            )
-
-            x_b[
-                b,
-                2,
-                act_b[b, 1],
-            ] *= -1.0
-
-            if x.shape[1] > 3:
-                for t in range(
-                    2,
-                    x.shape[1] - 1,
-                ):
-                    x_b[
-                        b,
-                        t + 1,
-                    ] = (
-                        x_b[
-                            b,
-                            t,
-                        ].clone()
-                    )
-
-                    x_b[
-                        b,
-                        t + 1,
-                        act_b[
-                            b,
-                            t,
-                        ],
-                    ] *= -1.0
+    act_b[:, 0] = act[:, 1]
+    act_b[:, 1] = act[:, 0]
+    x_b = _rollout_from_prefix(x, act_b, start_step=0)
 
     _, _, omega_ab = (
         predict_path_pair(
@@ -2295,69 +2150,104 @@ def self_test(
     )
 
     # --------------------------------------------------------------
-    # Test causalité d'embedding stricte
+    # 4. Test causalité complet (tous les préfixes + blocs GSA + sensibilité)
     # --------------------------------------------------------------
 
     print(
-        "\n[TEST] causalité stricte des actions"
+        "\n[TEST] causalité stricte sur tous les préfixes et blocs GSA"
     )
 
-    model = HybridPathModel(
-        gsa_config=gsa_cfg,
-        arch_mode="lstm_only",
-        lstm_layers=config.lstm_layers,
-    ).to(device)
+    model.eval()
+    length = x.shape[1]
 
-    embedded_1, _ = (
-        model._embed_inputs(
+    with torch.no_grad():
+        emb_ref, _ = model._embed_inputs(
             x_seq=x,
             act_idx=act,
             j0=j0,
             pos=None,
             pad_mask=pad_mask,
         )
-    )
+        bias_ref = model.gsa.path_action_bias(x, act, pad_mask)
+        gsa_ref = emb_ref
+        for block in model.gsa.blocks:
+            gsa_ref = block(gsa_ref, bias_ref, pad_mask, gsa_cfg.beta_action)
 
-    act_future = act.clone()
+        # Invariance pour chaque préfixe 0..t lors d'une perturbation à partir de t
+        for t in range(length - 1):
+            act_future = act.clone()
+            act_future[:, t:] = (act_future[:, t:] + 1) % config.n_sites
+            x_future = _rollout_from_prefix(x, act_future, start_step=t)
 
-    if act_future.shape[1] >= 2:
-        act_future[:, 1:] = (
-            (
-                act_future[:, 1:]
-                + 1
+            emb_alt, _ = model._embed_inputs(
+                x_seq=x_future,
+                act_idx=act_future,
+                j0=j0,
+                pos=None,
+                pad_mask=pad_mask,
             )
-            % config.n_sites
-        )
+            bias_alt = model.gsa.path_action_bias(x_future, act_future, pad_mask)
+            gsa_alt = emb_alt
+            for block in model.gsa.blocks:
+                gsa_alt = block(gsa_alt, bias_alt, pad_mask, gsa_cfg.beta_action)
 
-    embedded_2, _ = (
-        model._embed_inputs(
-            x_seq=x,
-            act_idx=act_future,
-            j0=j0,
-            pos=None,
-            pad_mask=pad_mask,
-        )
-    )
+            torch.testing.assert_close(
+                emb_ref[:, : t + 1],
+                emb_alt[:, : t + 1],
+                atol=1e-6,
+                rtol=0.0,
+            )
+            torch.testing.assert_close(
+                gsa_ref[:, : t + 1],
+                gsa_alt[:, : t + 1],
+                atol=1e-6,
+                rtol=0.0,
+            )
 
-    # Le token 0 ne reçoit aucune action (décalage causal).
-    torch.testing.assert_close(
-        embedded_1[:, 0],
-        embedded_2[:, 0],
-        atol=1e-6,
-        rtol=0.0,
-    )
+        # Sensibilité complémentaire : modifier act[:, t - 1] modifie le token t
+        for t in range(1, length):
+            act_prev_mod = act.clone()
+            act_prev_mod[:, t - 1] = (act_prev_mod[:, t - 1] + 1) % config.n_sites
+            x_prev_mod = _rollout_from_prefix(x, act_prev_mod, start_step=t - 1)
 
-    # Le token 1 dépend uniquement de act[:, 0],
-    # donc perturber act[:, 1:] ne doit pas modifier embedded[:, 1].
-    torch.testing.assert_close(
-        embedded_1[:, 1],
-        embedded_2[:, 1],
-        atol=1e-6,
-        rtol=0.0,
-    )
+            emb_mod, _ = model._embed_inputs(
+                x_seq=x_prev_mod,
+                act_idx=act_prev_mod,
+                j0=j0,
+                pos=None,
+                pad_mask=pad_mask,
+            )
+            assert not torch.allclose(
+                emb_ref[:, t],
+                emb_mod[:, t],
+                atol=1e-6,
+            ), f"Le token {t} devrait dépendre de l'action entrante act[:, {t - 1}]."
 
     print(
-        "  filtration causale : OK (aucun impact d'action future)"
+        "  filtration causale (tous préfixes + GSA + sensibilité) : OK"
+    )
+
+    # --------------------------------------------------------------
+    # 5. Rejet strict des actions invalides avant clamp
+    # --------------------------------------------------------------
+
+    print(
+        "\n[TEST] rejet strict des actions invalides"
+    )
+
+    for bad_val in (-1, config.n_sites):
+        bad_act = act.clone()
+        bad_act[0, 0] = bad_val
+        try:
+            model(x_seq=x, act_idx=bad_act, j0=j0, pad_mask=pad_mask)
+            raise AssertionError(
+                f"Une action invalide ({bad_val}) a été acceptée."
+            )
+        except ValueError:
+            pass
+
+    print(
+        "  validation actions : OK"
     )
 
     print()
@@ -2718,7 +2608,7 @@ def main() -> None:
         warnings.warn(
             "geometry_mode='learned' est sans effet "
             "sur le forward en arch_mode='lstm_only' : "
-            "la voie GSA n'est pas utilisée."
+            "la voie GSA est désactivée."
         )
 
     # --------------------------------------------------------------
@@ -2882,17 +2772,18 @@ def main() -> None:
         lstm_layers=config.lstm_layers,
     ).to(device)
 
+    active_params = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
+    )
+
     print()
     print(
-        f"Paramètres entraînables : "
-        f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
+        f"Paramètres entraînables actifs : "
+        f"{active_params:,}"
     )
 
     # --------------------------------------------------------------
     # Optimiseur
-    #
-    # zero_grad(set_to_none=True) assure qu'un paramètre dont le
-    # gradient est None n'est pas modifié par AdamW (weight decay inclus).
     # --------------------------------------------------------------
 
     optimizer = torch.optim.AdamW(
@@ -3087,6 +2978,10 @@ def main() -> None:
 
         "transport_mode": (
             config.transport_mode
+        ),
+
+        "active_trainable_parameters": (
+            active_params
         ),
 
         "best_val_loss": (
