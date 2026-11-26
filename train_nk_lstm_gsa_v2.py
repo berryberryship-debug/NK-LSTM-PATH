@@ -23,21 +23,22 @@ Invariants :
 - Antisymétrie exacte :
       Omega_hat(a,b) = -Omega_hat(b,a)
   via la différence algébrique des deux prédictions de chemin.
-- Split groupé par initial_state_id.
+- Split groupé par initial_state_id avec contrôle explicite de non-chevauchement.
 - Baseline explicite :
       J_hat(t) = J0
       Omega_hat(t) = 0
 
 IMPORTANT :
-Cette V2 entraîne ici la prédiction terminale de J et du commutateur
-d'ordre Omega. Elle ne constitue pas encore la version complète de
-navigation spatiale à pertes multiples.
+Cette V2 entraîne la prédiction terminale de J et du commutateur d'ordre Omega
+(sans intégration dynamique multi-pas de J(t) ni apprentissage d'une métrique
+riemannienne dépendante de l'état).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import warnings
 from dataclasses import asdict, dataclass
@@ -72,7 +73,7 @@ ArchMode = Literal[
 
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION (VALIDATION STRICTE)
 # ============================================================================
 
 
@@ -142,6 +143,91 @@ class TrainV2Config:
     self_test: bool = False
     output_dir: str = "runs/nk_lstm_gsa_v2"
 
+    def __post_init__(self) -> None:
+        if self.arch_mode not in ("lstm_only", "gsa_only", "hybrid_concat", "hybrid_gated"):
+            raise ValueError(f"arch_mode invalide : {self.arch_mode}")
+        if self.geometry_mode not in ("none", "fixed", "learned"):
+            raise ValueError(f"geometry_mode invalide : {self.geometry_mode}")
+        if self.transport_mode not in ("symmetric", "integrable"):
+            raise ValueError(f"transport_mode invalide : {self.transport_mode}")
+
+        if self.n_sites < 2:
+            raise ValueError(f"n_sites doit être >= 2, reçu {self.n_sites}.")
+        if self.d_model < 1 or self.n_heads < 1 or self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) doit être > 0 et divisible par n_heads ({self.n_heads})."
+            )
+        if self.gsa_layers < 1:
+            raise ValueError(f"gsa_layers doit être >= 1, reçu {self.gsa_layers}.")
+        if self.lstm_layers < 1:
+            raise ValueError(f"lstm_layers doit être >= 1, reçu {self.lstm_layers}.")
+        if self.ff_mult < 1:
+            raise ValueError(f"ff_mult doit être >= 1, reçu {self.ff_mult}.")
+        if self.max_len < 3:
+            raise ValueError(
+                f"max_len doit être >= 3 pour ForcedPairDataset (L=3), reçu {self.max_len}."
+            )
+
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size doit être >= 1, reçu {self.batch_size}.")
+        if self.epochs < 1:
+            raise ValueError(f"epochs doit être >= 1, reçu {self.epochs}.")
+        if self.early_stopping_patience < 1:
+            raise ValueError(
+                f"early_stopping_patience doit être >= 1, reçu {self.early_stopping_patience}."
+            )
+        if self.dataset_npz is None and not self.self_test and self.n_initial_states < 3:
+            raise ValueError(
+                f"n_initial_states doit être >= 3 pour construire train/val/test, reçu {self.n_initial_states}."
+            )
+
+        if not (0.0 <= self.dropout < 1.0):
+            raise ValueError(f"dropout doit appartenir à [0, 1), reçu {self.dropout}.")
+        if not (0.0 < self.train_fraction < 1.0):
+            raise ValueError(f"train_fraction doit être dans ]0, 1[, reçu {self.train_fraction}.")
+        if not (0.0 < self.validation_fraction < 1.0):
+            raise ValueError(
+                f"validation_fraction doit être dans ]0, 1[, reçu {self.validation_fraction}."
+            )
+        if self.train_fraction + self.validation_fraction >= 1.0:
+            raise ValueError(
+                "train_fraction + validation_fraction doit être strictement inférieur à 1.0."
+            )
+
+        numeric_fields = {
+            "dropout": self.dropout,
+            "beta_action": self.beta_action,
+            "edge_eps": self.edge_eps,
+            "eta": self.eta,
+            "scale_j": self.scale_j,
+            "train_fraction": self.train_fraction,
+            "validation_fraction": self.validation_fraction,
+            "lr": self.lr,
+            "weight_decay": self.weight_decay,
+            "grad_clip": self.grad_clip,
+            "lambda_omega": self.lambda_omega,
+            "lambda_geometry": self.lambda_geometry,
+            "min_delta": self.min_delta,
+        }
+        for field_name, val in numeric_fields.items():
+            if not math.isfinite(float(val)):
+                raise ValueError(f"Paramètre numérique non fini : {field_name}={val}.")
+
+        if self.beta_action < 0.0:
+            raise ValueError(f"beta_action doit être >= 0, reçu {self.beta_action}.")
+        if self.edge_eps <= 0.0:
+            raise ValueError(f"edge_eps doit être > 0, reçu {self.edge_eps}.")
+        if self.lr <= 0.0:
+            raise ValueError(f"lr doit être > 0, reçu {self.lr}.")
+        if self.weight_decay < 0.0:
+            raise ValueError(f"weight_decay doit être >= 0, reçu {self.weight_decay}.")
+        if self.grad_clip <= 0.0:
+            raise ValueError(f"grad_clip doit être > 0, reçu {self.grad_clip}.")
+        if self.lambda_omega < 0.0 or self.lambda_geometry < 0.0:
+            raise ValueError("lambda_omega et lambda_geometry doivent être >= 0.")
+        if self.min_delta < 0.0:
+            raise ValueError(f"min_delta doit être >= 0, reçu {self.min_delta}.")
+
 
 # ============================================================================
 # REPRODUCTIBILITÉ
@@ -160,14 +246,6 @@ def set_seed(seed: int) -> None:
 # ============================================================================
 # VALIDATION DATASET
 # ============================================================================
-
-
-def _assert_same_shape(name: str, a: np.ndarray, b: np.ndarray) -> None:
-    if a.shape != b.shape:
-        raise ValueError(
-            f"Incohérence de forme pour {name} : "
-            f"{a.shape} != {b.shape}"
-        )
 
 
 def _validate_binary_states(x: np.ndarray, name: str) -> None:
@@ -199,12 +277,12 @@ def _validate_single_flip_transitions(
     """
     if x_seq.ndim != 3:
         raise ValueError(
-            f"{name} doit avoir la forme (B,L,N)."
+            f"{name} doit avoir la forme (B, L, N)."
         )
 
     if act_idx.ndim != 2:
         raise ValueError(
-            f"{name}.act doit avoir la forme (B,L-1)."
+            f"{name}.act doit avoir la forme (B, L-1)."
         )
 
     if not np.issubdtype(act_idx.dtype, np.integer):
@@ -249,17 +327,6 @@ def validate_forced_pair_dataset(
 ) -> None:
     """
     Validation structurelle complète avant entraînement.
-
-    Vérifie :
-    - contrat strict L == 3 (carré forcé à deux flips k->m vs m->k) et L <= max_len ;
-    - dimensions et finitude numérique de tous les tenseurs ;
-    - états binaires {-1, +1} ;
-    - transitions hypercube à un seul site par pas ;
-    - J0 au premier état ;
-    - J_final cohérent avec j_seq[-1] ;
-    - omega = J_final_a - J_final_b ;
-    - état initial et état final identiques entre les deux ordres ;
-    - sites distincts k != m dans [0, N-1] et actions inversées (k, m) / (m, k).
     """
 
     required = [
@@ -275,10 +342,11 @@ def validate_forced_pair_dataset(
         "omega",
         "initial_state_id",
         "site_pair",
+        "mode",
     ]
 
     for name in required:
-        if not hasattr(dataset, name):
+        if not hasattr(dataset, name) or getattr(dataset, name) is None:
             raise ValueError(
                 f"Champ obligatoire absent du ForcedPairDataset : {name}"
             )
@@ -302,13 +370,9 @@ def validate_forced_pair_dataset(
     initial_state_id = np.asarray(dataset.initial_state_id)
     site_pair = np.asarray(dataset.site_pair)
 
-    # ------------------------------------------------------------------
-    # Dimensions principales et contrat L == 3 <= max_len
-    # ------------------------------------------------------------------
-
     if x_a.ndim != 3 or x_b.ndim != 3:
         raise ValueError(
-            "x_a et x_b doivent être de dimension 3 : (B,L,N)."
+            "x_a et x_b doivent être de dimension 3 : (B, L, N)."
         )
 
     B, L, N = x_a.shape
@@ -341,10 +405,6 @@ def validate_forced_pair_dataset(
             f"(carré à deux flips), reçu L={L}."
         )
 
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
-
     if not np.issubdtype(act_a.dtype, np.integer) or not np.issubdtype(act_b.dtype, np.integer):
         raise TypeError(
             "act_a et act_b doivent être des tableaux d'entiers."
@@ -359,10 +419,6 @@ def validate_forced_pair_dataset(
         raise ValueError(
             f"act_b.shape={act_b.shape}, attendu={(B, 2)}."
         )
-
-    # ------------------------------------------------------------------
-    # J et finitude numérique
-    # ------------------------------------------------------------------
 
     if j0.ndim != 2:
         raise ValueError(
@@ -416,10 +472,6 @@ def validate_forced_pair_dataset(
     ):
         _validate_finite_array(arr, arr_name)
 
-    # ------------------------------------------------------------------
-    # IDs et paires de sites
-    # ------------------------------------------------------------------
-
     if not np.issubdtype(initial_state_id.dtype, np.integer):
         raise TypeError(
             "initial_state_id doit être un tableau d'entiers."
@@ -452,16 +504,8 @@ def validate_forced_pair_dataset(
             "site_pair doit contenir deux sites distincts k != m."
         )
 
-    # ------------------------------------------------------------------
-    # États
-    # ------------------------------------------------------------------
-
     _validate_binary_states(x_a, "x_a")
     _validate_binary_states(x_b, "x_b")
-
-    # ------------------------------------------------------------------
-    # Trajectoires : une action = un flip
-    # ------------------------------------------------------------------
 
     _validate_single_flip_transitions(
         x_a,
@@ -475,10 +519,6 @@ def validate_forced_pair_dataset(
         "x_b/act_b",
     )
 
-    # ------------------------------------------------------------------
-    # Les deux chemins doivent partir du même état et arriver au même état
-    # ------------------------------------------------------------------
-
     if not np.array_equal(x_a[:, 0], x_b[:, 0]):
         raise ValueError(
             "x_a[:,0] et x_b[:,0] doivent être identiques."
@@ -488,10 +528,6 @@ def validate_forced_pair_dataset(
         raise ValueError(
             "Les chemins A et B n'aboutissent pas au même état final."
         )
-
-    # ------------------------------------------------------------------
-    # Cohérence exacte des paires d'actions inversées (k, m) et (m, k)
-    # ------------------------------------------------------------------
 
     if np.any(act_a[:, 0] == act_a[:, 1]) or np.any(act_b[:, 0] == act_b[:, 1]):
         raise ValueError(
@@ -523,10 +559,6 @@ def validate_forced_pair_dataset(
             "Les deux chemins doivent inverser exactement leur ordre."
         )
 
-    # ------------------------------------------------------------------
-    # J initial
-    # ------------------------------------------------------------------
-
     np.testing.assert_allclose(
         j_seq_a[:, 0],
         j0,
@@ -542,10 +574,6 @@ def validate_forced_pair_dataset(
         rtol=0.0,
         err_msg="j_seq_b[:,0] != j0",
     )
-
-    # ------------------------------------------------------------------
-    # J final
-    # ------------------------------------------------------------------
 
     np.testing.assert_allclose(
         j_seq_a[:, -1],
@@ -563,10 +591,6 @@ def validate_forced_pair_dataset(
         err_msg="j_seq_b[:,-1] != j_final_b",
     )
 
-    # ------------------------------------------------------------------
-    # Omega
-    # ------------------------------------------------------------------
-
     np.testing.assert_allclose(
         omega,
         j_final_a - j_final_b,
@@ -575,11 +599,12 @@ def validate_forced_pair_dataset(
         err_msg="omega != j_final_a - j_final_b",
     )
 
-    # ------------------------------------------------------------------
-    # Mode
-    # ------------------------------------------------------------------
-
     dataset_mode = str(dataset.mode)
+
+    if dataset_mode not in ("integrable", "symmetric"):
+        raise ValueError(
+            f"Transport mode inconnu dans le dataset : {dataset_mode}."
+        )
 
     if expected_mode is not None and dataset_mode != str(expected_mode):
         raise ValueError(
@@ -603,11 +628,6 @@ def validate_forced_pair_dataset(
 class HybridPathModel(nn.Module):
     """
     Encodeur de chemin unifié compatible avec predict_path_pair.
-
-    Important :
-    `lstm_only` réutilise les projections d'entrée, les embeddings partagés et
-    la tête résiduelle `delta_head` du noyau GSA, mais supprime les blocs
-    d'attention GSA et `edge_costs` afin de n'exposer que des paramètres actifs.
     """
 
     def __init__(
@@ -640,7 +660,6 @@ class HybridPathModel(nn.Module):
         self.arch_mode = arch_mode
         self.lstm_layers = int(lstm_layers)
 
-        # Infrastructure partagée avec le noyau GSA.
         self.gsa = GSAPathModel(gsa_config)
 
         d_model = gsa_config.d_model
@@ -658,15 +677,9 @@ class HybridPathModel(nn.Module):
         )
 
         if not self.use_gsa:
-            # Libère les sous-modules GSA non utilisés afin que le décompte
-            # des paramètres entraînables reflète exactement les paramètres actifs.
             self.gsa.blocks = nn.ModuleList()
             self.gsa.final_norm = None
             self.gsa.edge_costs = None
-
-        # ------------------------------------------------------------------
-        # LSTM
-        # ------------------------------------------------------------------
 
         if self.use_lstm:
             self.lstm = nn.LSTM(
@@ -686,10 +699,6 @@ class HybridPathModel(nn.Module):
         else:
             self.lstm = None
             self.lstm_norm = None
-
-        # ------------------------------------------------------------------
-        # Fusion
-        # ------------------------------------------------------------------
 
         if arch_mode == "hybrid_concat":
 
@@ -736,10 +745,6 @@ class HybridPathModel(nn.Module):
 
         return self.gsa.shortest_path_matrix()
 
-    # ------------------------------------------------------------------
-    # Embedding causal unique délégué au noyau GSA
-    # ------------------------------------------------------------------
-
     def _embed_inputs(
         self,
         x_seq: torch.Tensor,
@@ -756,9 +761,64 @@ class HybridPathModel(nn.Module):
             pad_mask=pad_mask,
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    def _encode_branches(
+        self,
+        x_seq: torch.Tensor,
+        act_idx: torch.Tensor,
+        j0: torch.Tensor,
+        pos: torch.Tensor | None = None,
+        pad_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        """Encode les séquences temporelle (LSTM) et géométrique (GSA) sur chaque pas."""
+        embedded, pad_mask = self._embed_inputs(
+            x_seq=x_seq,
+            act_idx=act_idx,
+            j0=j0,
+            pos=pos,
+            pad_mask=pad_mask,
+        )
+
+        length = embedded.shape[1]
+        lengths = (~pad_mask).sum(dim=1)
+
+        seq_temp = None
+        if self.use_lstm:
+            assert self.lstm is not None and self.lstm_norm is not None
+            packed = nn.utils.rnn.pack_padded_sequence(
+                embedded,
+                lengths.cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_out, _ = self.lstm(packed)
+            seq_temp, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_out,
+                batch_first=True,
+                total_length=length,
+            )
+            seq_temp = self.lstm_norm(seq_temp)
+            seq_temp = seq_temp.masked_fill(pad_mask[:, :, None], 0.0)
+
+        seq_geom = None
+        if self.use_gsa:
+            assert self.gsa.final_norm is not None
+            action_bias = self.gsa.path_action_bias(
+                x_seq,
+                act_idx,
+                pad_mask,
+            )
+            seq_geom = embedded
+            for block in self.gsa.blocks:
+                seq_geom = block(
+                    seq_geom,
+                    action_bias,
+                    pad_mask,
+                    self.config.beta_action,
+                )
+            seq_geom = self.gsa.final_norm(seq_geom)
+            seq_geom = seq_geom.masked_fill(pad_mask[:, :, None], 0.0)
+
+        return embedded, seq_temp, seq_geom, pad_mask
 
     def forward(
         self,
@@ -769,7 +829,7 @@ class HybridPathModel(nn.Module):
         pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
-        embedded, pad_mask = self._embed_inputs(
+        embedded, seq_temp, seq_geom, pad_mask = self._encode_branches(
             x_seq=x_seq,
             act_idx=act_idx,
             j0=j0,
@@ -777,106 +837,28 @@ class HybridPathModel(nn.Module):
             pad_mask=pad_mask,
         )
 
-        batch, length, _ = embedded.shape
-
+        batch = embedded.shape[0]
         lengths = (~pad_mask).sum(dim=1)
         last_valid = torch.clamp(lengths - 1, min=0)
+        batch_idx = torch.arange(batch, device=x_seq.device)
 
-        batch_idx = torch.arange(
-            batch,
-            device=x_seq.device,
-        )
-
-        # ==============================================================
-        # VOIE TEMPORELLE
-        # ==============================================================
-
-        h_temp = None
-
-        if self.use_lstm:
-
-            assert (
-                self.lstm is not None
-                and self.lstm_norm is not None
-            )
-
-            packed = nn.utils.rnn.pack_padded_sequence(
-                embedded,
-                lengths.cpu(),
-                batch_first=True,
-                enforce_sorted=False,
-            )
-
-            packed_out, _ = self.lstm(packed)
-
-            seq_temp, _ = nn.utils.rnn.pad_packed_sequence(
-                packed_out,
-                batch_first=True,
-                total_length=length,
-            )
-
-            seq_temp = self.lstm_norm(seq_temp)
-
-            h_temp = seq_temp[
-                batch_idx,
-                last_valid,
-            ]
-
-        # ==============================================================
-        # VOIE GÉOMÉTRIQUE
-        # ==============================================================
-
-        h_geom = None
-
-        if self.use_gsa:
-
-            assert self.gsa.final_norm is not None
-
-            action_bias = self.gsa.path_action_bias(
-                x_seq,
-                act_idx,
-                pad_mask,
-            )
-
-            seq_geom = embedded
-
-            for block in self.gsa.blocks:
-                seq_geom = block(
-                    seq_geom,
-                    action_bias,
-                    pad_mask,
-                    self.config.beta_action,
-                )
-
-            seq_geom = self.gsa.final_norm(seq_geom)
-
-            h_geom = seq_geom[
-                batch_idx,
-                last_valid,
-            ]
-
-        # ==============================================================
-        # FUSION
-        # ==============================================================
+        h_temp = seq_temp[batch_idx, last_valid] if seq_temp is not None else None
+        h_geom = seq_geom[batch_idx, last_valid] if seq_geom is not None else None
 
         if self.arch_mode == "lstm_only":
-
             assert h_temp is not None
             fused = h_temp
 
         elif self.arch_mode == "gsa_only":
-
             assert h_geom is not None
             fused = h_geom
 
         elif self.arch_mode == "hybrid_concat":
-
             assert (
                 h_temp is not None
                 and h_geom is not None
                 and self.fusion is not None
             )
-
             fused = self.fusion(
                 torch.cat(
                     [h_temp, h_geom],
@@ -885,14 +867,12 @@ class HybridPathModel(nn.Module):
             )
 
         elif self.arch_mode == "hybrid_gated":
-
             assert (
                 h_temp is not None
                 and h_geom is not None
                 and self.fusion_gate is not None
                 and self.fusion is not None
             )
-
             gate = torch.sigmoid(
                 self.fusion_gate(
                     torch.cat(
@@ -901,7 +881,6 @@ class HybridPathModel(nn.Module):
                     )
                 )
             )
-
             fused = self.fusion(
                 gate * h_temp
                 + (1.0 - gate) * h_geom
@@ -912,14 +891,6 @@ class HybridPathModel(nn.Module):
                 f"Mode architectural non géré : "
                 f"{self.arch_mode}"
             )
-
-        # ==============================================================
-        # PRÉDICTION RÉSIDUELLE
-        #
-        # J_hat = J0 + Delta_J
-        #
-        # Ce n'est PAS une intégration cumulative de deltas temporels.
-        # ==============================================================
 
         delta_j = self.gsa.delta_head(fused)
 
@@ -934,10 +905,6 @@ class HybridPathModel(nn.Module):
 class PairedPathSubset(Dataset):
     """
     Sous-ensemble de ForcedPairDataset.
-
-    Les j_seq sont conservés pour validation et audit futur,
-    même si la fonction de perte actuelle de gsa_v1_core
-    supervise uniquement la sortie terminale.
     """
 
     def __init__(
@@ -1201,10 +1168,6 @@ def build_synthetic_smoke_dataset(
                 n_sites,
             ):
 
-                # ------------------------------------------------------
-                # Chemin A : k -> m
-                # ------------------------------------------------------
-
                 xa = np.stack(
                     [
                         x0,
@@ -1216,10 +1179,6 @@ def build_synthetic_smoke_dataset(
                 xa[1, k] *= -1.0
                 xa[2, k] *= -1.0
                 xa[2, m] *= -1.0
-
-                # ------------------------------------------------------
-                # Chemin B : m -> k
-                # ------------------------------------------------------
 
                 xb = np.stack(
                     [
@@ -1238,7 +1197,6 @@ def build_synthetic_smoke_dataset(
 
                 if mode == "symmetric":
 
-                    # Terme explicitement dépendant de l'ordre.
                     comm_scale = (
                         eta
                         * float(
@@ -1472,14 +1430,6 @@ def compute_baseline_metrics(
     target_b: torch.Tensor,
 ) -> dict[str, float]:
 
-    """
-    Baseline prédictive :
-
-        J_hat_a = J0
-        J_hat_b = J0
-        Omega_hat = 0
-    """
-
     baseline_a = j0
     baseline_b = j0
 
@@ -1602,10 +1552,6 @@ def run_epoch(
                     set_to_none=True
                 )
 
-            # ----------------------------------------------------------
-            # Modèle
-            # ----------------------------------------------------------
-
             pred_a, pred_b, omega_hat = (
                 predict_path_pair(
                     model,
@@ -1642,10 +1588,6 @@ def run_epoch(
                 )
 
                 optimizer.step()
-
-            # ----------------------------------------------------------
-            # Pertes
-            # ----------------------------------------------------------
 
             bs = int(
                 j0.shape[0]
@@ -1702,10 +1644,6 @@ def run_epoch(
                 * bs
             )
 
-            # ----------------------------------------------------------
-            # Baseline
-            # ----------------------------------------------------------
-
             batch_baseline = (
                 compute_baseline_metrics(
                     j0=j0,
@@ -1719,10 +1657,6 @@ def run_epoch(
                     batch_baseline[key]
                     * bs
                 )
-
-            # ----------------------------------------------------------
-            # Omega
-            # ----------------------------------------------------------
 
             omega_hats.append(
                 omega_hat
@@ -1741,10 +1675,6 @@ def run_epoch(
                 .numpy()
             )
 
-    # --------------------------------------------------------------
-    # Moyennes
-    # --------------------------------------------------------------
-
     denominator = max(
         n_samples,
         1,
@@ -1759,10 +1689,6 @@ def run_epoch(
         key: value / denominator
         for key, value in baseline_totals.items()
     }
-
-    # --------------------------------------------------------------
-    # Métriques Omega
-    # --------------------------------------------------------------
 
     omega_pred = np.concatenate(
         omega_hats,
@@ -1910,9 +1836,43 @@ def _rollout_from_prefix(
     return x_alt
 
 
+def _build_same_state_different_incoming_action_path(
+    x_base: torch.Tensor,
+    act_base: torch.Tensor,
+    target_token: int,
+    n_sites: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Construit une trajectoire valide atteignant exactement le même vecteur d'état
+    x_base[:, target_token] à la position target_token via une action entrante
+    act_alt[:, target_token - 1] != act_base[:, target_token - 1].
+    """
+    batch = x_base.shape[0]
+    batch_idx = torch.arange(batch, device=x_base.device)
+    x_alt = x_base.clone()
+    act_alt = act_base.clone()
+
+    new_incoming = (act_base[:, target_token - 1] + 1) % n_sites
+    act_alt[:, target_token - 1] = new_incoming
+
+    x_alt[:, target_token - 1] = x_alt[:, target_token].clone()
+    x_alt[batch_idx, target_token - 1, new_incoming] *= -1.0
+
+    for step in range(target_token - 2, -1, -1):
+        x_alt[:, step] = x_alt[:, step + 1].clone()
+        x_alt[batch_idx, step, act_alt[:, step]] *= -1.0
+
+    return x_alt, act_alt
+
+
 def self_test(
     config: TrainV2Config,
 ) -> None:
+
+    if config.max_len < 4:
+        raise ValueError(
+            f"--self-test exige max_len >= 4 (séquences de test de longueur 4), "
+            f"reçu max_len={config.max_len}."
+        )
 
     print()
     print("=" * 72)
@@ -1956,7 +1916,7 @@ def self_test(
     )
 
     # --------------------------------------------------------------
-    # 1. Test des quatre architectures et paramètres actifs
+    # 1. Test des quatre architectures et des trois modes géométriques
     # --------------------------------------------------------------
 
     for arch_mode in (
@@ -1967,7 +1927,7 @@ def self_test(
     ):
 
         print(
-            f"\n[TEST] arch_mode={arch_mode}"
+            f"\n[TEST] arch_mode={arch_mode} (geometry_mode={gsa_cfg.geometry_mode})"
         )
 
         model = HybridPathModel(
@@ -1999,44 +1959,37 @@ def self_test(
             f"{expected_shape}"
         )
 
-        loss = out.square().mean()
+        loss = out.square().mean() + model.geometry_regularizer()
         loss.backward()
 
-        # Gradient LSTM
         if model.use_lstm:
-
-            assert (
-                model.lstm is not None
-            )
-
+            assert model.lstm is not None
             lstm_has_grad = any(
                 parameter.grad is not None
-                for parameter in (
-                    model.lstm.parameters()
-                )
+                for parameter in model.lstm.parameters()
             )
-
             assert lstm_has_grad, (
-                "Aucun gradient détecté "
-                "dans la branche LSTM."
+                "Aucun gradient détecté dans la branche LSTM."
             )
 
-        # Gradient GSA et absence de sous-modules inactifs en lstm_only
         if model.use_gsa:
-            if model.gsa.edge_costs is not None:
-                edge_grad = (
-                    model
-                    .gsa
-                    .edge_costs
-                    .edge_logits
-                    .grad
+            gsa_blocks_have_grad = any(
+                parameter.grad is not None
+                for parameter in model.gsa.blocks.parameters()
+            )
+            assert gsa_blocks_have_grad, (
+                "Aucun gradient détecté dans les blocs GSA."
+            )
+
+            if gsa_cfg.geometry_mode == "learned":
+                assert model.gsa.edge_costs is not None
+                edge_grad = model.gsa.edge_costs.edge_logits.grad
+                assert edge_grad is not None, (
+                    "Gradient absent des coûts géométriques en mode learned."
                 )
-                assert (
-                    edge_grad is not None
-                ), (
-                    "Gradient absent des "
-                    "coûts géométriques "
-                    "alors que GSA est active."
+            else:
+                assert model.gsa.edge_costs is None, (
+                    f"edge_costs ne doit pas être instancié en mode {gsa_cfg.geometry_mode}."
                 )
         else:
             assert (
@@ -2047,21 +2000,49 @@ def self_test(
                 "Des sous-modules GSA inactifs subsistent en lstm_only."
             )
 
-        print(
-            "  forward        : OK"
-        )
+        print("  forward        : OK")
+        print("  gradient       : OK")
 
-        print(
-            "  gradient       : OK"
+    print("\n[TEST] régimes géométriques (none, fixed, learned)")
+    for geom_mode in ("none", "fixed", "learned"):
+        geom_cfg = GSAConfig(
+            n_sites=config.n_sites,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.gsa_layers,
+            ff_mult=config.ff_mult,
+            dropout=0.0,
+            beta_action=config.beta_action,
+            max_len=config.max_len,
+            edge_eps=config.edge_eps,
+            geometry_mode=geom_mode,
         )
+        geom_model = HybridPathModel(
+            gsa_config=geom_cfg,
+            arch_mode="gsa_only",
+            lstm_layers=config.lstm_layers,
+        ).to(device)
+        geom_model.train()
+        bias = geom_model.gsa.path_action_bias(x, act, pad_mask)
+        if geom_mode == "none":
+            assert bias is None and geom_model.gsa.edge_costs is None
+        elif geom_mode == "fixed":
+            assert bias is not None and geom_model.gsa.edge_costs is None
+        else:
+            assert bias is not None and geom_model.gsa.edge_costs is not None
+
+        pred_geom = geom_model(x_seq=x, act_idx=act, j0=j0, pad_mask=pad_mask)
+        (pred_geom.square().mean() + geom_model.geometry_regularizer()).backward()
+        assert any(p.grad is not None for p in geom_model.gsa.blocks.parameters())
+        if geom_mode == "learned":
+            assert geom_model.gsa.edge_costs.edge_logits.grad is not None
+    print("  régimes géométriques : OK")
 
     # --------------------------------------------------------------
     # 2. Synchronisation exacte noyau GSAPathModel <-> HybridPathModel
     # --------------------------------------------------------------
 
-    print(
-        "\n[TEST] synchronisation GSAPathModel <-> HybridPathModel (gsa_only)"
-    )
+    print("\n[TEST] synchronisation GSAPathModel <-> HybridPathModel (gsa_only)")
 
     hybrid_gsa = HybridPathModel(
         gsa_config=gsa_cfg,
@@ -2090,17 +2071,13 @@ def self_test(
         atol=1e-6,
         rtol=1e-6,
     )
-    print(
-        "  équivalence noyau : OK"
-    )
+    print("  équivalence noyau : OK")
 
     # --------------------------------------------------------------
     # 3. Test antisymétrie exacte
     # --------------------------------------------------------------
 
-    print(
-        "\n[TEST] antisymétrie Omega"
-    )
+    print("\n[TEST] antisymétrie Omega")
 
     model = HybridPathModel(
         gsa_config=gsa_cfg,
@@ -2145,55 +2122,51 @@ def self_test(
         rtol=1e-6,
     )
 
-    print(
-        "  antisymétrie    : OK"
-    )
+    print("  antisymétrie    : OK")
 
     # --------------------------------------------------------------
-    # 4. Test causalité complet (tous les préfixes + blocs GSA + sensibilité)
+    # 4. Test causalité complet (préfixes + LSTM + GSA + isolation action)
     # --------------------------------------------------------------
 
-    print(
-        "\n[TEST] causalité stricte sur tous les préfixes et blocs GSA"
-    )
+    print("\n[TEST] causalité stricte sur tous les préfixes (embeddings, LSTM, GSA)")
 
     model.eval()
     length = x.shape[1]
 
     with torch.no_grad():
-        emb_ref, _ = model._embed_inputs(
+        emb_ref, lstm_ref, gsa_ref, _ = model._encode_branches(
             x_seq=x,
             act_idx=act,
             j0=j0,
             pos=None,
             pad_mask=pad_mask,
         )
-        bias_ref = model.gsa.path_action_bias(x, act, pad_mask)
-        gsa_ref = emb_ref
-        for block in model.gsa.blocks:
-            gsa_ref = block(gsa_ref, bias_ref, pad_mask, gsa_cfg.beta_action)
+        assert lstm_ref is not None and gsa_ref is not None
 
-        # Invariance pour chaque préfixe 0..t lors d'une perturbation à partir de t
+        # 4a. Invariance pour chaque préfixe 0..t (embeddings, LSTM et GSA)
         for t in range(length - 1):
             act_future = act.clone()
             act_future[:, t:] = (act_future[:, t:] + 1) % config.n_sites
             x_future = _rollout_from_prefix(x, act_future, start_step=t)
 
-            emb_alt, _ = model._embed_inputs(
+            emb_alt, lstm_alt, gsa_alt, _ = model._encode_branches(
                 x_seq=x_future,
                 act_idx=act_future,
                 j0=j0,
                 pos=None,
                 pad_mask=pad_mask,
             )
-            bias_alt = model.gsa.path_action_bias(x_future, act_future, pad_mask)
-            gsa_alt = emb_alt
-            for block in model.gsa.blocks:
-                gsa_alt = block(gsa_alt, bias_alt, pad_mask, gsa_cfg.beta_action)
+            assert lstm_alt is not None and gsa_alt is not None
 
             torch.testing.assert_close(
                 emb_ref[:, : t + 1],
                 emb_alt[:, : t + 1],
+                atol=1e-6,
+                rtol=0.0,
+            )
+            torch.testing.assert_close(
+                lstm_ref[:, : t + 1],
+                lstm_alt[:, : t + 1],
                 atol=1e-6,
                 rtol=0.0,
             )
@@ -2203,37 +2176,74 @@ def self_test(
                 atol=1e-6,
                 rtol=0.0,
             )
+            assert not torch.allclose(
+                lstm_ref[:, t + 1 :],
+                lstm_alt[:, t + 1 :],
+                atol=1e-6,
+            ), f"La sortie LSTM future (>{t}) doit réagir à la perturbation."
 
-        # Sensibilité complémentaire : modifier act[:, t - 1] modifie le token t
+        # 4b. Test de cohérence physique : modifier act[:, t - 1] et reconstruire x_t
         for t in range(1, length):
-            act_prev_mod = act.clone()
-            act_prev_mod[:, t - 1] = (act_prev_mod[:, t - 1] + 1) % config.n_sites
-            x_prev_mod = _rollout_from_prefix(x, act_prev_mod, start_step=t - 1)
+            act_phys = act.clone()
+            act_phys[:, t - 1] = (act_phys[:, t - 1] + 1) % config.n_sites
+            x_phys = _rollout_from_prefix(x, act_phys, start_step=t - 1)
 
-            emb_mod, _ = model._embed_inputs(
-                x_seq=x_prev_mod,
-                act_idx=act_prev_mod,
+            emb_phys, _, _, _ = model._encode_branches(
+                x_seq=x_phys,
+                act_idx=act_phys,
+                j0=j0,
+                pos=None,
+                pad_mask=pad_mask,
+            )
+            torch.testing.assert_close(
+                emb_ref[:, :t],
+                emb_phys[:, :t],
+                atol=1e-6,
+                rtol=0.0,
+            )
+            assert not torch.allclose(
+                emb_ref[:, t],
+                emb_phys[:, t],
+                atol=1e-6,
+            ), f"Le token {t} devrait changer après perturbation physique de act[:, {t - 1}]."
+
+        # 4c. Test d'isolation du canal d'action : état x_t identique, action entrante différente
+        for t in range(1, length):
+            x_same_state, act_diff_in = _build_same_state_different_incoming_action_path(
+                x_base=x,
+                act_base=act,
+                target_token=t,
+                n_sites=config.n_sites,
+            )
+            torch.testing.assert_close(
+                x[:, t],
+                x_same_state[:, t],
+                atol=1e-6,
+                rtol=0.0,
+            )
+            emb_iso, _, _, _ = model._encode_branches(
+                x_seq=x_same_state,
+                act_idx=act_diff_in,
                 j0=j0,
                 pos=None,
                 pad_mask=pad_mask,
             )
             assert not torch.allclose(
                 emb_ref[:, t],
-                emb_mod[:, t],
+                emb_iso[:, t],
                 atol=1e-6,
-            ), f"Le token {t} devrait dépendre de l'action entrante act[:, {t - 1}]."
+            ), (
+                f"Le token {t} devrait dépendre du canal d'action entrante act[:, {t - 1}] "
+                "même lorsque l'état x_t est identique."
+            )
 
-    print(
-        "  filtration causale (tous préfixes + GSA + sensibilité) : OK"
-    )
+    print("  filtration causale (préfixes + LSTM + GSA + cohérence + canal d'action) : OK")
 
     # --------------------------------------------------------------
-    # 5. Rejet strict des actions invalides avant clamp
+    # 5. Rejet strict des actions invalides et validation dataset/split
     # --------------------------------------------------------------
 
-    print(
-        "\n[TEST] rejet strict des actions invalides"
-    )
+    print("\n[TEST] rejet strict des actions invalides & disjonction du split")
 
     for bad_val in (-1, config.n_sites):
         bad_act = act.clone()
@@ -2246,20 +2256,36 @@ def self_test(
         except ValueError:
             pass
 
-    print(
-        "  validation actions : OK"
+    smoke_ds = build_synthetic_smoke_dataset(
+        n_sites=config.n_sites,
+        n_initial_states=6,
+        eta=config.eta,
+        mode="symmetric",
+        seed=config.seed,
     )
+    validate_forced_pair_dataset(
+        smoke_ds,
+        expected_n_sites=config.n_sites,
+        expected_mode="symmetric",
+        max_len=config.max_len,
+    )
+    smoke_splits = split_indices_by_initial_state(
+        smoke_ds,
+        seed=config.seed,
+        train_fraction=config.train_fraction,
+        validation_fraction=config.validation_fraction,
+    )
+    tr_ids = set(smoke_ds.initial_state_id[smoke_splits["train"]].tolist())
+    va_ids = set(smoke_ds.initial_state_id[smoke_splits["validation"]].tolist())
+    te_ids = set(smoke_ds.initial_state_id[smoke_splits["test"]].tolist())
+    assert tr_ids.isdisjoint(va_ids) and tr_ids.isdisjoint(te_ids) and va_ids.isdisjoint(te_ids)
+
+    print("  validation actions & split : OK")
 
     print()
-    print(
-        "=" * 72
-    )
-    print(
-        "SELF-TEST : TOUS LES TESTS SONT VALIDES"
-    )
-    print(
-        "=" * 72
-    )
+    print("=" * 72)
+    print("SELF-TEST : TOUS LES TESTS SONT VALIDES")
+    print("=" * 72)
 
 
 # ============================================================================
@@ -2554,10 +2580,6 @@ def main() -> None:
         config.seed
     )
 
-    # --------------------------------------------------------------
-    # Self-test direct
-    # --------------------------------------------------------------
-
     if config.self_test:
         self_test(config)
         return
@@ -2567,39 +2589,15 @@ def main() -> None:
     )
 
     print()
-    print(
-        "=" * 72
-    )
-    print(
-        "NK-LSTM-GSA V2"
-    )
-    print(
-        "=" * 72
-    )
+    print("=" * 72)
+    print("NK-LSTM-GSA V2")
+    print("=" * 72)
 
-    print(
-        f"Architecture : {config.arch_mode}"
-    )
-
-    print(
-        f"Géométrie   : {config.geometry_mode}"
-    )
-
-    print(
-        f"Transport    : {config.transport_mode}"
-    )
-
-    print(
-        f"Device       : {device}"
-    )
-
-    print(
-        f"Seed         : {config.seed}"
-    )
-
-    # --------------------------------------------------------------
-    # Avertissement sémantique
-    # --------------------------------------------------------------
+    print(f"Architecture : {config.arch_mode}")
+    print(f"Géométrie   : {config.geometry_mode}")
+    print(f"Transport    : {config.transport_mode}")
+    print(f"Device       : {device}")
+    print(f"Seed         : {config.seed}")
 
     if (
         config.arch_mode == "lstm_only"
@@ -2610,10 +2608,6 @@ def main() -> None:
             "sur le forward en arch_mode='lstm_only' : "
             "la voie GSA est désactivée."
         )
-
-    # --------------------------------------------------------------
-    # Sorties
-    # --------------------------------------------------------------
 
     output_dir = Path(
         config.output_dir
@@ -2636,10 +2630,6 @@ def main() -> None:
             indent=2,
         )
 
-    # --------------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------------
-
     dataset = prepare_dataset(
         config
     )
@@ -2657,10 +2647,6 @@ def main() -> None:
             f"dataset={actual_n_sites}, "
             f"config={config.n_sites}."
         )
-
-    # --------------------------------------------------------------
-    # Split groupé
-    # --------------------------------------------------------------
 
     splits = (
         split_indices_by_initial_state(
@@ -2684,26 +2670,25 @@ def main() -> None:
             "Un des splits est vide."
         )
 
+    train_ids = set(dataset.initial_state_id[splits["train"]].tolist())
+    val_ids = set(dataset.initial_state_id[splits["validation"]].tolist())
+    test_ids = set(dataset.initial_state_id[splits["test"]].tolist())
+
+    if not (
+        train_ids.isdisjoint(val_ids)
+        and train_ids.isdisjoint(test_ids)
+        and val_ids.isdisjoint(test_ids)
+    ):
+        raise RuntimeError(
+            "Fuite de groupe détectée : chevauchement d'initial_state_id "
+            "entre les partitions train, validation et test."
+        )
+
     print()
-    print(
-        "Split groupé :"
-    )
-
-    print(
-        f"  train      = {len(splits['train'])}"
-    )
-
-    print(
-        f"  validation = {len(splits['validation'])}"
-    )
-
-    print(
-        f"  test       = {len(splits['test'])}"
-    )
-
-    # --------------------------------------------------------------
-    # DataLoaders
-    # --------------------------------------------------------------
+    print("Split groupé (disjonction des états initiaux vérifiée) :")
+    print(f"  train      = {len(splits['train'])} ({len(train_ids)} états)")
+    print(f"  validation = {len(splits['validation'])} ({len(val_ids)} états)")
+    print(f"  test       = {len(splits['test'])} ({len(test_ids)} états)")
 
     gen = (
         torch.Generator()
@@ -2740,10 +2725,6 @@ def main() -> None:
         shuffle=False,
     )
 
-    # --------------------------------------------------------------
-    # Configuration GSA
-    # --------------------------------------------------------------
-
     gsa_cfg = GSAConfig(
         n_sites=config.n_sites,
 
@@ -2762,10 +2743,6 @@ def main() -> None:
         geometry_mode=config.geometry_mode,
     )
 
-    # --------------------------------------------------------------
-    # Modèle
-    # --------------------------------------------------------------
-
     model = HybridPathModel(
         gsa_config=gsa_cfg,
         arch_mode=config.arch_mode,
@@ -2782,19 +2759,11 @@ def main() -> None:
         f"{active_params:,}"
     )
 
-    # --------------------------------------------------------------
-    # Optimiseur
-    # --------------------------------------------------------------
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
-
-    # --------------------------------------------------------------
-    # Entraînement
-    # --------------------------------------------------------------
 
     best_val_loss = float(
         "inf"
@@ -2850,10 +2819,6 @@ def main() -> None:
             f"{val_metrics['delta_mse_omega_vs_baseline']:.6f}"
         )
 
-        # ----------------------------------------------------------
-        # Early stopping
-        # ----------------------------------------------------------
-
         if (
             val_losses["loss_total"]
             < best_val_loss
@@ -2906,10 +2871,6 @@ def main() -> None:
 
                 break
 
-    # --------------------------------------------------------------
-    # Historique
-    # --------------------------------------------------------------
-
     with open(
         output_dir
         / "history.json",
@@ -2922,10 +2883,6 @@ def main() -> None:
             f,
             indent=2,
         )
-
-    # --------------------------------------------------------------
-    # Recharge meilleur modèle
-    # --------------------------------------------------------------
 
     best_path = (
         output_dir
@@ -2949,10 +2906,6 @@ def main() -> None:
         ]
     )
 
-    # --------------------------------------------------------------
-    # Test final
-    # --------------------------------------------------------------
-
     test_losses, test_metrics = (
         run_epoch(
             model,
@@ -2962,10 +2915,6 @@ def main() -> None:
             device,
         )
     )
-
-    # --------------------------------------------------------------
-    # Résumé
-    # --------------------------------------------------------------
 
     summary = {
         "arch_mode": (
@@ -3032,17 +2981,9 @@ def main() -> None:
         )
 
     print()
-    print(
-        "=" * 72
-    )
-
-    print(
-        "RÉSULTATS TEST"
-    )
-
-    print(
-        "=" * 72
-    )
+    print("=" * 72)
+    print("RÉSULTATS TEST")
+    print("=" * 72)
 
     print(
         json.dumps(
