@@ -3803,3 +3803,18 @@ Elles ne constituent pas une validation de l'ensemble des expériences périphé
 
 Le programme expérimental décrit dans le présent README demeure donc ouvert sur ces questions.
 
+## Repérage des compléments dans le README
+
+Les précisions de cet addendum se rapportent aux passages suivants du document principal. Les renvois permettent de retrouver les résultats, les tableaux et les protocoles auxquels elles apportent un complément.
+
+| Complément | Section d'origine | Élément concerné |
+|---|---|---|
+| A | 5.2 — Audit numérique de non-commutativité et balayage de η | Tableau des résultats du balayage : définition des écarts ΔA et Δw |
+| B | 5.2 — Définition exacte des indicateurs | Compteur `total_threshold_crossings`, désaccords entre masques d'accessibilité et calcul de C_T |
+| C | 5.2 — Paramètres de référence et protocole expérimental | Réutilisation des configurations initiales et du paysage NK pendant le balayage de η |
+| D | 5.2 — Résultats du balayage ; 5.3 — Audit de reproductibilité multi-graines | Comparaison des fractions de 82,7 % et de 80,0 % |
+| E | 5.3 — Bloc B : Variation de la graine du paysage NK | Invariance des écarts géométriques et dépendance des taux à la réalisation NK |
+| F | 9 — Organisation des fichiers et arborescence du dépôt | Emplacement de `audit_reproductibilite_graines.py` |
+| G | 10 — État de validation, limites et travaux restant à réaliser | Portée exacte des validations et limites des conclusions |
+
+**Principe de lecture :** chaque complément doit être lu conjointement avec sa section d'origine. L'addendum précise ou rectifie l'interprétation de ces passages sans remplacer leur contenu initial.
