@@ -1,29 +1,24 @@
-"""GSA-V1 core for NK-LSTM-PATH.
-
-Geometric self-attention with a learned positive edge action on the N-dimensional
-binary hypercube.  The model consumes forced paths, not Ogata trajectories.
-
-Project integration (from repository root):
-    from gsa_v1_core import build_forced_pair_dataset, GSAPathModel
-
-Tensor conventions:
-    x_seq   : (B, L, N), values in {-1, +1}; L = T + 1 states
-    act_idx : (B, T), integer flipped-site indices; action t maps x[t] -> x[t+1]
-    j0      : (B, N*(N-1)//2), upper-triangle packing of the initial symmetric J
-    pad_mask: (B, L), bool, True means padding (right-padding only)
-    pos     : (B, L), integer position indices
-
-Causal filtration:
-    Token 0 receives no incoming action (special index N).
-    Token t (t >= 1) receives act_idx[:, t - 1], the transition x[t-1] -> x[t].
-    Token t therefore depends only on (x[0:t], act[0:t-1], j0).
-
-For a query at position i and key at position j <= i, the geometric bias is
-    - beta_action * sum_{t=j}^{i-1} c_theta(x[t], act[t]).
-It therefore depends on the observed path segment.  The all-pairs shortest-path
-matrix S* is provided as a diagnostic/reference, not substituted for the
-observed path action in the attention bias.
+#!/usr/bin/env python3
 """
+gsa_v1_core.py
+
+Noyau géométrique et causal pour l'encodage de trajectoires sur l'hypercube
+{-1, +1}^N et la prédiction antisymétrique du commutateur d'ordre Omega.
+
+Invariants garantis par le noyau :
+1. Source unique d'embedding causal (`GSAPathModel.embed_inputs`) :
+   - Token 0 : jeton spécial `n_sites` (aucune action entrante).
+   - Token t (t >= 1) : `act_idx[:, t - 1]` (transition entrante x[t-1] -> x[t]).
+2. Validation stricte des indices d'actions et des transitions à un seul flip
+   avant tout clamp ou indexation.
+3. Coûts d'arêtes non orientés strictement positifs sur l'hypercube (en mode
+   `learned`), coûts unitaires fixes (`fixed`), ou sans biais géométrique (`none`).
+4. Action géométrique observée le long du chemin :
+       S_obs[b, i, j] = sum_{t=j}^{i-1} c_theta(x[t], act[t])   pour j <= i
+5. Antisymétrie exacte par construction via différence algébrique d'un encodeur
+   partagé : Omega_hat(a, b) = J_hat(a) - J_hat(b) = -Omega_hat(b, a).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -33,93 +28,49 @@ from typing import Literal, Sequence
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+
 
 TransportMode = Literal["integrable", "symmetric"]
 GeometryMode = Literal["none", "fixed", "learned"]
 
-_INTEGER_DTYPES = (
-    torch.int8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-    torch.uint8,
-)
-
 
 # ---------------------------------------------------------------------------
-# J <-> vector convention
+# Packing / unpacking symmetric coupling matrices J (zero diagonal)
 # ---------------------------------------------------------------------------
-
-def _upper_indices(n_sites: int) -> tuple[np.ndarray, np.ndarray]:
-    return np.triu_indices(n_sites, k=1)
-
 
 def pack_J(J: np.ndarray) -> np.ndarray:
-    """Pack a symmetric, zero-diagonal J into lexicographic upper-triangle order."""
-    arr = np.asarray(J, dtype=np.float64)
-    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
-        raise ValueError("J doit être une matrice carrée.")
-    if not np.all(np.isfinite(arr)):
-        raise ValueError("J contient des valeurs non finies.")
-    if not np.allclose(arr, arr.T, rtol=1e-10, atol=1e-12):
-        raise ValueError("J doit être symétrique.")
-    if not np.allclose(np.diag(arr), 0.0, rtol=0.0, atol=1e-12):
-        raise ValueError("La diagonale de J doit être nulle.")
-    rows, cols = _upper_indices(arr.shape[0])
-    return arr[rows, cols].copy()
+    """Pack upper-triangular off-diagonal entries of symmetric (N, N) J into (d_J,)."""
+    mat = np.asarray(J, dtype=np.float64)
+    if mat.ndim != 2 or mat.shape[0] != mat.shape[1] or mat.shape[0] < 2:
+        raise ValueError(f"J doit être une matrice carrée (N, N) avec N >= 2, reçu {mat.shape}.")
+    r, c = np.triu_indices(mat.shape[0], k=1)
+    return mat[r, c].copy()
 
 
-def unpack_J(vector: np.ndarray | torch.Tensor, n_sites: int):
-    """Unpack upper-triangle vector to a symmetric zero-diagonal matrix."""
-    expected = n_sites * (n_sites - 1) // 2
-    if isinstance(vector, torch.Tensor):
-        if vector.shape[-1] != expected:
-            raise ValueError(f"Dernière dimension attendue: {expected}, reçue: {vector.shape[-1]}.")
-        out = vector.new_zeros((*vector.shape[:-1], n_sites, n_sites))
-        rows, cols = _upper_indices(n_sites)
-        r = torch.as_tensor(rows, device=vector.device)
-        c = torch.as_tensor(cols, device=vector.device)
-        out[..., r, c] = vector
-        out[..., c, r] = vector
-        return out
-    arr = np.asarray(vector)
-    if arr.shape[-1] != expected:
-        raise ValueError(f"Dernière dimension attendue: {expected}, reçue: {arr.shape[-1]}.")
-    out = np.zeros((*arr.shape[:-1], n_sites, n_sites), dtype=arr.dtype)
-    rows, cols = _upper_indices(n_sites)
-    out[..., rows, cols] = arr
-    out[..., cols, rows] = arr
-    return out
+def unpack_J(j_vec: np.ndarray, n_sites: int) -> np.ndarray:
+    """Reconstruct symmetric (N, N) matrix with zero diagonal from (d_J,) vector."""
+    vec = np.asarray(j_vec, dtype=np.float64)
+    d_j = n_sites * (n_sites - 1) // 2
+    if vec.shape != (d_j,):
+        raise ValueError(f"j_vec doit avoir la forme ({d_j},), reçu {vec.shape}.")
+    mat = np.zeros((n_sites, n_sites), dtype=np.float64)
+    r, c = np.triu_indices(n_sites, k=1)
+    mat[r, c] = vec
+    mat[c, r] = vec
+    return mat
 
 
 # ---------------------------------------------------------------------------
-# Binary hypercube indexing and edge geometry
+# Hypercube indexing and strict transition validation
 # ---------------------------------------------------------------------------
 
 def states_to_indices(x_seq: torch.Tensor) -> torch.Tensor:
-    """Map {-1,+1}^N states to integer vertices in [0, 2**N)."""
-    if x_seq.ndim != 3:
-        raise ValueError("x_seq doit avoir la forme (B,L,N).")
-    bits = (x_seq > 0).to(torch.long)
+    """Convert binary states in {-1, +1}^N of shape (..., N) to integer indices in [0, 2^N)."""
     n_sites = x_seq.shape[-1]
+    bits = (x_seq > 0).to(torch.long)
     weights = (1 << torch.arange(n_sites, device=x_seq.device, dtype=torch.long))
-    return torch.sum(bits * weights, dim=-1)
-
-
-def _undirected_edge_index(n_sites: int) -> tuple[torch.Tensor, int]:
-    """Return an (2**N,N) lookup; reverse traversals share one edge parameter."""
-    n_states = 1 << n_sites
-    edge_to_id: dict[tuple[int, int], int] = {}
-    lookup = np.empty((n_states, n_sites), dtype=np.int64)
-    for state in range(n_states):
-        for site in range(n_sites):
-            neighbour = state ^ (1 << site)
-            key = (min(state, neighbour), max(state, neighbour))
-            if key not in edge_to_id:
-                edge_to_id[key] = len(edge_to_id)
-            lookup[state, site] = edge_to_id[key]
-    return torch.as_tensor(lookup, dtype=torch.long), len(edge_to_id)
+    return (bits * weights).sum(dim=-1)
 
 
 def _validate_actions_and_transitions(
@@ -127,88 +78,106 @@ def _validate_actions_and_transitions(
     act_idx: torch.Tensor,
     valid_transition: torch.Tensor,
 ) -> torch.Tensor:
-    """Validate integer action indices and exact single-site hypercube flips before clamping."""
+    """Validate action domain and single-site hypercube flips before any indexing."""
+    if torch.is_floating_point(act_idx) or torch.is_complex(act_idx) or act_idx.dtype == torch.bool:
+        raise TypeError(f"act_idx doit être un tenseur d'entiers, reçu {act_idx.dtype}.")
     batch, length, n_sites = x_seq.shape
     if act_idx.shape != (batch, length - 1):
-        raise ValueError("act_idx doit avoir la forme (B,L-1).")
-    if act_idx.dtype not in _INTEGER_DTYPES:
-        raise TypeError("act_idx doit être un tenseur d'entiers.")
+        raise ValueError(f"act_idx doit avoir la forme {(batch, length - 1)}, reçu {act_idx.shape}.")
     if valid_transition.shape != (batch, length - 1) or valid_transition.dtype != torch.bool:
-        raise ValueError("valid_transition doit être booléen et de forme (B,L-1).")
+        raise ValueError("valid_transition doit être booléen et de forme (B, L-1).")
 
-    if act_idx.numel() and torch.any(valid_transition & ((act_idx < 0) | (act_idx >= n_sites))):
-        raise ValueError("Chaque action valide doit être un indice entre 0 et N-1.")
+    if torch.any(valid_transition):
+        active_actions = act_idx[valid_transition]
+        if torch.any((active_actions < 0) | (active_actions >= n_sites)):
+            raise ValueError(f"act_idx contient une action hors du domaine [0, {n_sites - 1}].")
 
-    safe_actions = act_idx.to(torch.long).clamp(min=0, max=n_sites - 1)
+    safe_actions = torch.where(
+        valid_transition,
+        act_idx.to(torch.long),
+        torch.zeros_like(act_idx, dtype=torch.long),
+    )
+
     if length > 1 and torch.any(valid_transition):
-        flip_mask = F.one_hot(safe_actions, num_classes=n_sites).to(x_seq.dtype)
-        expected_next = x_seq[:, :-1] * (1.0 - 2.0 * flip_mask)
-        mismatch = valid_transition & torch.any(expected_next != x_seq[:, 1:], dim=-1)
-        if torch.any(mismatch):
+        expected_next = x_seq[:, :-1].clone()
+        b_idx = torch.arange(batch, device=x_seq.device)[:, None].expand(batch, length - 1)
+        t_idx = torch.arange(length - 1, device=x_seq.device)[None, :].expand(batch, length - 1)
+        flip_sign = torch.where(valid_transition, -1.0, 1.0).to(x_seq.dtype)
+        expected_next[b_idx, t_idx, safe_actions] = (
+            expected_next[b_idx, t_idx, safe_actions] * flip_sign
+        )
+        if not torch.equal(expected_next[valid_transition], x_seq[:, 1:][valid_transition]):
             raise ValueError(
-                "Transition invalide : x_seq[:, t+1] doit être exactement le flip "
-                "du site act_idx[:, t] sur x_seq[:, t]."
+                "Transition hypercube invalide : x_seq[:, t+1] doit correspondre "
+                "au flip exact du seul site act_idx[:, t]."
             )
+
     return safe_actions
 
 
+# ---------------------------------------------------------------------------
+# Undirected edge costs and observed path action
+# ---------------------------------------------------------------------------
+
 class UndirectedPositiveEdgeCosts(nn.Module):
-    """Learn one positive cost per undirected edge of the binary hypercube.
+    """Learnable strictly positive undirected edge costs on the N-cube."""
 
-    Softplus followed by a bounded transform guarantees strictly positive,
-    bounded costs.  Mean normalization fixes their global scale so beta_action
-    remains interpretable.  For N=6 this gives 192 undirected edge parameters.
-    """
-
-    def __init__(self, n_sites: int, eps: float = 1e-4) -> None:
+    def __init__(self, n_sites: int, edge_eps: float = 1e-4) -> None:
         super().__init__()
-        if n_sites < 1:
-            raise ValueError("n_sites doit être >= 1.")
-        if eps <= 0:
-            raise ValueError("eps doit être strictement positif.")
+        if n_sites < 2:
+            raise ValueError("n_sites doit être >= 2.")
+        if edge_eps <= 0.0:
+            raise ValueError("edge_eps doit être > 0.")
         self.n_sites = int(n_sites)
-        self.n_states = 1 << self.n_sites
-        self.eps = float(eps)
-        edge_lookup, n_edges = _undirected_edge_index(self.n_sites)
-        self.register_buffer("edge_lookup", edge_lookup)
-        self.edge_logits = nn.Parameter(torch.zeros(n_edges))
+        self.edge_eps = float(edge_eps)
 
-    def unique_costs(self) -> torch.Tensor:
-        positive = F.softplus(self.edge_logits)
-        bounded_raw = 0.5 + 1.5 * (positive / (1.0 + positive))
-        # bounded_raw is in (0.5, 2); after mean normalization costs lie in
-        # (0.25, 4), with global mean exactly one (up to floating-point error).
-        return bounded_raw / bounded_raw.mean().clamp_min(self.eps)
+        n_states = 1 << self.n_sites
+        n_undirected = self.n_sites * (1 << (self.n_sites - 1))
+        edge_id_table = torch.full((n_states, self.n_sites), -1, dtype=torch.long)
+
+        next_id = 0
+        for state in range(n_states):
+            for site in range(self.n_sites):
+                neighbour = state ^ (1 << site)
+                if state < neighbour:
+                    edge_id_table[state, site] = next_id
+                    edge_id_table[neighbour, site] = next_id
+                    next_id += 1
+
+        assert next_id == n_undirected
+        self.register_buffer("edge_id_table", edge_id_table, persistent=False)
+        self.edge_logits = nn.Parameter(torch.zeros(n_undirected, dtype=torch.float32))
 
     def table(self) -> torch.Tensor:
-        """Return c_theta(state, site), shape (2**N,N), with reverse symmetry."""
-        return self.unique_costs()[self.edge_lookup]
+        """Return symmetric (2^N, N) table of strictly positive edge traversal costs."""
+        costs = F.softplus(self.edge_logits) + self.edge_eps
+        return costs[self.edge_id_table]
 
     def regularizer(self) -> torch.Tensor:
-        """Penalize excessive edge-cost heterogeneity, not the fixed mean scale."""
-        log_cost = torch.log(self.unique_costs().clamp_min(self.eps))
-        return torch.mean((log_cost - log_cost.mean()) ** 2)
+        """Smooth L2 regularization keeping edge logits well-conditioned."""
+        return (self.edge_logits ** 2).mean()
 
     def all_pairs_shortest_paths(self) -> torch.Tensor:
-        """Differentiable min-plus Floyd-Warshall; returns S* of shape (2**N,2**N)."""
-        costs = self.table()
-        n_states = self.n_states
-        device, dtype = costs.device, costs.dtype
-        inf = torch.tensor(float("inf"), device=device, dtype=dtype)
-        dist = torch.full((n_states, n_states), inf, device=device, dtype=dtype)
-        idx = torch.arange(n_states, device=device)
+        """Compute exact all-pairs shortest-path matrix S* on the N-cube (2^N, 2^N)."""
+        table = self.table()
+        n_states = 1 << self.n_sites
+        inf = torch.tensor(float("inf"), device=table.device, dtype=table.dtype)
+        dist = torch.full((n_states, n_states), inf, device=table.device, dtype=table.dtype)
+        idx = torch.arange(n_states, device=table.device)
         dist[idx, idx] = 0.0
         for site in range(self.n_sites):
-            neighbours = idx ^ (1 << site)
-            dist[idx, neighbours] = costs[:, site]
+            dist[idx, idx ^ (1 << site)] = table[:, site]
         for pivot in range(n_states):
-            through = dist[:, pivot:pivot + 1] + dist[pivot:pivot + 1, :]
-            dist = torch.minimum(dist, through)
+            dist = torch.minimum(dist, dist[:, pivot:pivot + 1] + dist[pivot:pivot + 1, :])
         return dist
 
 
-def fixed_unit_edge_table(n_sites: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Unit edge costs: a fixed hypercube metric (shortest distance = Hamming)."""
+def fixed_unit_edge_table(
+    n_sites: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return unit-cost edge table (2^N, N) corresponding to Hamming step cost 1."""
     return torch.ones((1 << n_sites, n_sites), device=device, dtype=dtype)
 
 
@@ -218,23 +187,20 @@ def cumulative_observed_action(
     edge_cost_table: torch.Tensor,
     pad_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build S_obs[b,i,j] = action cost from token j to token i for j <= i.
-
-    Returns (B,L,L). Entries above the causal diagonal are set to zero because
-    those locations are masked in attention.
-    """
+    """Compute causal observed path action matrix S_obs[b, i, j] = sum_{t=j}^{i-1} c(x_t, a_t)."""
     if x_seq.ndim != 3:
-        raise ValueError("x_seq doit avoir la forme (B,L,N).")
+        raise ValueError("x_seq doit avoir la forme (B, L, N).")
     batch, length, n_sites = x_seq.shape
     if edge_cost_table.shape != (1 << n_sites, n_sites):
-        raise ValueError("edge_cost_table doit avoir la forme (2**N,N).")
-    if not torch.isfinite(x_seq).all():
-        raise ValueError("x_seq contient des valeurs non finies.")
+        raise ValueError(
+            f"edge_cost_table doit avoir la forme {(1 << n_sites, n_sites)}, "
+            f"reçu {edge_cost_table.shape}."
+        )
     if pad_mask is None:
         valid_transition = torch.ones((batch, length - 1), device=x_seq.device, dtype=torch.bool)
     else:
         if pad_mask.shape != (batch, length) or pad_mask.dtype != torch.bool:
-            raise ValueError("pad_mask doit être booléen et de forme (B,L).")
+            raise ValueError("pad_mask doit être booléen et de forme (B, L).")
         valid_transition = (~pad_mask[:, :-1]) & (~pad_mask[:, 1:])
 
     safe_actions = _validate_actions_and_transitions(x_seq, act_idx, valid_transition)
@@ -256,9 +222,8 @@ def observed_action_excess(
     observed_action: torch.Tensor,
     shortest_paths: torch.Tensor,
 ) -> torch.Tensor:
-    """Return max(0, S_obs - S*(endpoints)); diagnostic path excess (B,L,L)."""
+    """Return max(0, S_obs - S*(endpoints)); diagnostic path excess (B, L, L)."""
     state_idx = states_to_indices(x_seq)
-    # For query i, key j: compare the observed j->i segment with S*(x_j,x_i).
     start = state_idx[:, None, :]
     end = state_idx[:, :, None]
     shortest = shortest_paths[start, end]
@@ -297,7 +262,7 @@ class GeometricSelfAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
         if action_bias is not None:
             if action_bias.shape != (batch, length, length):
-                raise ValueError("action_bias doit avoir la forme (B,L,L).")
+                raise ValueError("action_bias doit avoir la forme (B, L, L).")
             scores = scores - float(beta_action) * action_bias[:, None, :, :]
 
         causal_mask = torch.triu(
@@ -305,7 +270,6 @@ class GeometricSelfAttention(nn.Module):
         )
         scores = scores.masked_fill(causal_mask[None, None, :, :], float("-inf"))
         if pad_mask is not None:
-            # True in pad_mask means the key is padding and cannot be attended to.
             scores = scores.masked_fill(pad_mask[:, None, None, :], float("-inf"))
         weights = torch.softmax(scores, dim=-1)
         weights = self.attn_dropout(weights)
@@ -360,7 +324,7 @@ class GSAConfig:
         if self.n_layers < 1 or self.ff_mult < 1 or self.max_len < 2:
             raise ValueError("n_layers, ff_mult et max_len doivent être positifs.")
         if not (0.0 <= self.dropout < 1.0):
-            raise ValueError("dropout doit appartenir à [0,1).")
+            raise ValueError("dropout doit appartenir à [0, 1).")
         if self.beta_action < 0.0 or self.edge_eps <= 0.0:
             raise ValueError("beta_action doit être >= 0 et edge_eps > 0.")
         if self.geometry_mode not in ("none", "fixed", "learned"):
@@ -368,12 +332,7 @@ class GSAConfig:
 
 
 class GSAPathModel(nn.Module):
-    """Predict J_final from a forced path using shared path encoders.
-
-    A path is encoded once; for a pair, call the same model on both orders and
-    subtract predictions.  This makes Omega_hat(a,b) = -Omega_hat(b,a) by
-    construction.
-    """
+    """Predict J_final from a forced path using shared path encoders."""
 
     def __init__(self, config: GSAConfig = GSAConfig()) -> None:
         super().__init__()
@@ -382,7 +341,7 @@ class GSAPathModel(nn.Module):
         d_j = n * (n - 1) // 2
         self.x_proj = nn.Linear(n, config.d_model)
         self.j0_proj = nn.Linear(d_j, config.d_model)
-        self.action_embedding = nn.Embedding(n + 1, config.d_model)  # n = initial/no-action token
+        self.action_embedding = nn.Embedding(n + 1, config.d_model)
         self.position_embedding = nn.Embedding(config.max_len, config.d_model)
         self.input_norm = nn.LayerNorm(config.d_model)
         self.blocks = nn.ModuleList([
@@ -438,16 +397,16 @@ class GSAPathModel(nn.Module):
         Token t (t >= 1) receives act_idx[:, t - 1] (incoming transition x[t-1] -> x[t]).
         """
         if x_seq.ndim != 3:
-            raise ValueError("x_seq doit avoir la forme (B,L,N).")
+            raise ValueError("x_seq doit avoir la forme (B, L, N).")
         batch, length, n_sites = x_seq.shape
         if n_sites != self.config.n_sites:
             raise ValueError(f"N attendu={self.config.n_sites}, reçu={n_sites}.")
         if length < 2 or length > self.config.max_len:
-            raise ValueError(f"La longueur L doit appartenir à [2,{self.config.max_len}].")
+            raise ValueError(f"La longueur L doit appartenir à [2, {self.config.max_len}].")
         if act_idx.shape != (batch, length - 1):
-            raise ValueError("act_idx doit avoir la forme (B,L-1).")
+            raise ValueError("act_idx doit avoir la forme (B, L-1).")
         if j0.shape != (batch, self.d_J):
-            raise ValueError(f"j0 doit avoir la forme (B,{self.d_J}).")
+            raise ValueError(f"j0 doit avoir la forme (B, {self.d_J}).")
         if not torch.is_floating_point(x_seq) or not torch.is_floating_point(j0):
             raise TypeError("x_seq et j0 doivent être des tenseurs flottants.")
         if not torch.isfinite(x_seq).all() or not torch.isfinite(j0).all():
@@ -456,17 +415,16 @@ class GSAPathModel(nn.Module):
         if pos is None:
             pos = torch.arange(length, device=x_seq.device, dtype=torch.long).expand(batch, length)
         if pos.shape != (batch, length) or pos.dtype != torch.long:
-            raise ValueError("pos doit être long et de forme (B,L).")
+            raise ValueError("pos doit être long et de forme (B, L).")
         if torch.any(pos < 0) or torch.any(pos >= self.config.max_len):
-            raise ValueError("pos contient un indice hors de [0,max_len).")
+            raise ValueError("pos contient un indice hors de [0, max_len).")
 
         if pad_mask is None:
             pad_mask = torch.zeros((batch, length), device=x_seq.device, dtype=torch.bool)
         elif pad_mask.shape != (batch, length) or pad_mask.dtype != torch.bool:
-            raise ValueError("pad_mask doit être booléen et de forme (B,L).")
+            raise ValueError("pad_mask doit être booléen et de forme (B, L).")
         if torch.any(pad_mask.all(dim=1)):
             raise ValueError("Chaque séquence doit contenir au moins un état non rembourré.")
-        # Padding must be on the right: once padded, all later positions are padded.
         if length > 1 and torch.any(pad_mask[:, :-1] & ~pad_mask[:, 1:]):
             raise ValueError("pad_mask doit utiliser un remplissage à droite.")
         if torch.any((x_seq != 1.0) & (x_seq != -1.0)):
@@ -543,7 +501,6 @@ class GSAPathModel(nn.Module):
             device=self.position_embedding.weight.device,
             dtype=self.position_embedding.weight.dtype,
         )
-        # A temporary fixed-edge instance is unnecessary: direct min-plus closure.
         n_states = 1 << self.config.n_sites
         inf = torch.tensor(float("inf"), device=table.device, dtype=table.dtype)
         dist = torch.full((n_states, n_states), inf, device=table.device, dtype=table.dtype)
@@ -562,18 +519,18 @@ class GSAPathModel(nn.Module):
 
 @dataclass(frozen=True)
 class ForcedPairDataset:
-    x_a: np.ndarray          # (P,T+1,N)
-    x_b: np.ndarray          # (P,T+1,N)
-    act_a: np.ndarray        # (P,T)
-    act_b: np.ndarray        # (P,T)
-    j0: np.ndarray           # (P,d_J)
-    j_seq_a: np.ndarray      # (P,T+1,d_J), retained for a coupled-state extension
-    j_seq_b: np.ndarray      # (P,T+1,d_J), retained for a coupled-state extension
-    j_final_a: np.ndarray    # (P,d_J)
-    j_final_b: np.ndarray    # (P,d_J)
-    omega: np.ndarray        # (P,d_J) = j_final_a - j_final_b
+    x_a: np.ndarray          # (P, T+1, N)
+    x_b: np.ndarray          # (P, T+1, N)
+    act_a: np.ndarray        # (P, T)
+    act_b: np.ndarray        # (P, T)
+    j0: np.ndarray           # (P, d_J)
+    j_seq_a: np.ndarray      # (P, T+1, d_J), retained for a coupled-state extension
+    j_seq_b: np.ndarray      # (P, T+1, d_J), retained for a coupled-state extension
+    j_final_a: np.ndarray    # (P, d_J)
+    j_final_b: np.ndarray    # (P, d_J)
+    omega: np.ndarray        # (P, d_J) = j_final_a - j_final_b
     initial_state_id: np.ndarray  # (P,)
-    site_pair: np.ndarray        # (P,2)
+    site_pair: np.ndarray        # (P, 2)
     mode: str
 
     @property
@@ -582,7 +539,6 @@ class ForcedPairDataset:
 
 
 def _rollout_forced_path(X0, J0, actions: Sequence[int], eta: float, mode: TransportMode):
-    # Delayed import lets the model and its unit tests run outside the repository.
     from balayage_commutateur_nk_v2 import step_flip_node
 
     x = np.asarray(X0, dtype=np.float64).copy()
@@ -603,12 +559,7 @@ def build_forced_pair_dataset(
     eta: float = 0.25,
     mode: TransportMode = "symmetric",
 ) -> ForcedPairDataset:
-    """Build matched (k->m, m->k) pairs using step_flip_node from the project.
-
-    No NKLandscape or Ogata thinning is called: the action order is imposed.
-    The landscape affects stochastic action selection, not the forced mutation
-    operator used to define these paired commutator targets.
-    """
+    """Build matched (k->m, m->k) pairs using step_flip_node from the project."""
     if mode not in ("integrable", "symmetric"):
         raise ValueError("mode doit être integrable ou symmetric.")
     if not initial_states:
@@ -673,9 +624,9 @@ def split_indices_by_initial_state(
 ) -> dict[str, np.ndarray]:
     """Split by initial-state group to prevent sibling path-pair leakage."""
     if not (0.0 < train_fraction < 1.0):
-        raise ValueError("train_fraction doit être dans ]0,1[.")
+        raise ValueError("train_fraction doit être dans ]0, 1[.")
     if not (0.0 < validation_fraction < 1.0):
-        raise ValueError("validation_fraction doit être dans ]0,1[.")
+        raise ValueError("validation_fraction doit être dans ]0, 1[.")
     if train_fraction + validation_fraction >= 1.0:
         raise ValueError("Les fractions train + validation doivent être < 1.")
     groups = np.unique(dataset.initial_state_id)
@@ -692,11 +643,17 @@ def split_indices_by_initial_state(
     val_groups = shuffled[n_train:n_train + n_val]
     test_groups = shuffled[n_train + n_val:]
     ids = dataset.initial_state_id
-    return {
+    splits = {
         "train": np.flatnonzero(np.isin(ids, train_groups)),
         "validation": np.flatnonzero(np.isin(ids, val_groups)),
         "test": np.flatnonzero(np.isin(ids, test_groups)),
     }
+    train_ids = set(ids[splits["train"]].tolist())
+    val_ids = set(ids[splits["validation"]].tolist())
+    test_ids = set(ids[splits["test"]].tolist())
+    if not (train_ids.isdisjoint(val_ids) and train_ids.isdisjoint(test_ids) and val_ids.isdisjoint(test_ids)):
+        raise RuntimeError("Chevauchement d'initial_state_id détecté entre partitions.")
+    return splits
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +672,7 @@ def predict_path_pair(
     pad_mask_a: torch.Tensor | None = None,
     pad_mask_b: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Predict both orders with identical weights and return Omega_hat = Jhat_a-Jhat_b."""
+    """Predict both orders with identical weights and return Omega_hat = Jhat_a - Jhat_b."""
     pred_a = model(x_a, act_a, j0, pos=pos_a, pad_mask=pad_mask_a)
     pred_b = model(x_b, act_b, j0, pos=pos_b, pad_mask=pad_mask_b)
     return pred_a, pred_b, pred_a - pred_b
@@ -733,7 +690,7 @@ def paired_gsa_loss(
     """Terminal loss + pair-closure loss + optional edge-cost regularization."""
     if pred_a.shape != pred_b.shape or pred_a.shape != target_a.shape or pred_b.shape != target_b.shape:
         raise ValueError("Les quatre tenseurs de J terminal doivent avoir la même forme.")
-    omega_hat = pred_a - pred_b  # shared head => exact antisymmetry by construction
+    omega_hat = pred_a - pred_b
     omega_true = target_a - target_b
     loss_j = 0.5 * (F.mse_loss(pred_a, target_a) + F.mse_loss(pred_b, target_b))
     loss_omega = F.mse_loss(omega_hat, omega_true)
@@ -756,7 +713,7 @@ def closure_metrics(omega_hat: np.ndarray, omega_true: np.ndarray, eps: float = 
     pred = np.asarray(omega_hat, dtype=np.float64)
     true = np.asarray(omega_true, dtype=np.float64)
     if pred.shape != true.shape or pred.ndim != 2:
-        raise ValueError("omega_hat et omega_true doivent être de même forme (P,d_J).")
+        raise ValueError("omega_hat et omega_true doivent être de même forme (P, d_J).")
     errors = pred - true
     norms = np.linalg.norm(true, axis=1)
     pred_norms = np.linalg.norm(pred, axis=1)
@@ -787,9 +744,6 @@ def test_path_vs_shortest_action_property() -> dict[str, float]:
         costs[state, site] = value
         costs[neighbour, site] = value
 
-    # Start vertex 0; common endpoint 0 xor 1 xor 2 = 3.
-    # Path A: 0 --site0(cost 1)--> 1 --site1(cost 4)--> 3; total 5.
-    # Path B: 0 --site1(cost 2)--> 2 --site0(cost 1.5)--> 3; total 3.5.
     set_undirected(0, 0, 1.0)
     set_undirected(1, 1, 4.0)
     set_undirected(0, 1, 2.0)
@@ -808,8 +762,8 @@ def test_path_vs_shortest_action_property() -> dict[str, float]:
     action_b = costs[0, 1] + costs[2, 0]
     shortest_ab = dist[0, 3]
     assert np.isclose(shortest_ab, min(action_a, action_b))
-    assert np.isclose(shortest_ab, dist[0, 3])  # same two endpoints => same S*
-    assert not np.isclose(action_a, action_b)    # observed action distinguishes order
+    assert np.isclose(shortest_ab, dist[0, 3])
+    assert not np.isclose(action_a, action_b)
     return {
         "observed_action_k_then_m": float(action_a),
         "observed_action_m_then_k": float(action_b),
@@ -832,31 +786,88 @@ def _build_valid_test_paths(
     return x_seq, act_idx
 
 
+def _build_same_state_different_incoming_action_path(
+    x_seq: torch.Tensor,
+    act_idx: torch.Tensor,
+    target_token: int,
+    n_sites: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Construct a valid hypercube trajectory with identical x[:, target_token]
+    but a distinct incoming action act_alt[:, target_token - 1] != act_idx[:, target_token - 1].
+    """
+    batch = x_seq.shape[0]
+    batch_idx = torch.arange(batch, device=x_seq.device)
+    x_alt = x_seq.clone()
+    act_alt = act_idx.clone()
+
+    new_incoming = (act_idx[:, target_token - 1] + 1) % n_sites
+    act_alt[:, target_token - 1] = new_incoming
+
+    x_alt[:, target_token - 1] = x_alt[:, target_token].clone()
+    x_alt[batch_idx, target_token - 1, new_incoming] *= -1.0
+
+    for step in range(target_token - 2, -1, -1):
+        x_alt[:, step] = x_alt[:, step + 1].clone()
+        x_alt[batch_idx, step, act_alt[:, step]] *= -1.0
+
+    return x_alt, act_alt
+
+
 def self_test() -> None:
     property_result = test_path_vs_shortest_action_property()
-    config = GSAConfig(n_sites=6, d_model=32, n_heads=4, n_layers=2, max_len=8, geometry_mode="learned")
-    model = GSAPathModel(config)
     gen = torch.Generator().manual_seed(42)
     batch, length, n_sites = 5, 4, 6
     x_seq, act_idx = _build_valid_test_paths(batch, length, n_sites, gen)
-    j0 = torch.randn(batch, config.n_sites * (config.n_sites - 1) // 2, generator=gen)
-    pred = model(x_seq, act_idx, j0)
-    assert pred.shape == j0.shape
-    assert torch.isfinite(pred).all()
+    j0 = torch.randn(batch, n_sites * (n_sites - 1) // 2, generator=gen)
 
-    # Causal prefix invariance: altering act_idx[:, t:] and future states leaves prefix 0..t unchanged.
-    emb_ref, _ = model.embed_inputs(x_seq, act_idx, j0)
-    for t in range(length - 1):
-        act_alt = act_idx.clone()
-        act_alt[:, t:] = (act_alt[:, t:] + 1) % n_sites
-        x_alt = x_seq.clone()
-        for step in range(t, length - 1):
-            x_alt[:, step + 1] = x_alt[:, step].clone()
-            x_alt[torch.arange(batch), step + 1, act_alt[:, step]] *= -1.0
-        emb_alt, _ = model.embed_inputs(x_alt, act_alt, j0)
-        torch.testing.assert_close(emb_ref[:, :t + 1], emb_alt[:, :t + 1], atol=1e-6, rtol=0.0)
+    learned_model = None
+    for mode in ("none", "fixed", "learned"):
+        cfg = GSAConfig(n_sites=n_sites, d_model=32, n_heads=4, n_layers=2, max_len=8, geometry_mode=mode)
+        m = GSAPathModel(cfg)
+        m.train()
+        pred = m(x_seq, act_idx, j0)
+        assert pred.shape == j0.shape
+        assert torch.isfinite(pred).all()
+        loss = pred.square().mean() + m.geometry_regularizer()
+        loss.backward()
 
-    # Invalid action rejection before clamping (independent of geometry_mode).
+        assert any(p.grad is not None for p in m.blocks.parameters()), (
+            f"Gradient absent des blocs GSA en geometry_mode={mode}."
+        )
+        if mode == "learned":
+            assert m.edge_costs is not None
+            assert m.edge_costs.edge_logits.grad is not None
+            assert torch.isfinite(m.edge_costs.edge_logits.grad).all()
+            learned_model = m
+        else:
+            assert m.edge_costs is None
+
+    assert learned_model is not None
+    model = learned_model
+    model.eval()
+
+    with torch.no_grad():
+        emb_ref, _ = model.embed_inputs(x_seq, act_idx, j0)
+        for t in range(length - 1):
+            act_alt = act_idx.clone()
+            act_alt[:, t:] = (act_alt[:, t:] + 1) % n_sites
+            x_alt = x_seq.clone()
+            for step in range(t, length - 1):
+                x_alt[:, step + 1] = x_alt[:, step].clone()
+                x_alt[torch.arange(batch), step + 1, act_alt[:, step]] *= -1.0
+            emb_alt, _ = model.embed_inputs(x_alt, act_alt, j0)
+            torch.testing.assert_close(emb_ref[:, :t + 1], emb_alt[:, :t + 1], atol=1e-6, rtol=0.0)
+
+        for t in range(1, length):
+            x_same_state, act_diff_in = _build_same_state_different_incoming_action_path(
+                x_seq, act_idx, target_token=t, n_sites=n_sites
+            )
+            torch.testing.assert_close(x_seq[:, t], x_same_state[:, t], atol=1e-6, rtol=0.0)
+            emb_iso, _ = model.embed_inputs(x_same_state, act_diff_in, j0)
+            assert not torch.allclose(emb_ref[:, t], emb_iso[:, t], atol=1e-6), (
+                f"Le token {t} doit refléter l'action entrante act[:, {t - 1}] à état x_t identique."
+            )
+
     for mode in ("none", "fixed", "learned"):
         m_check = GSAPathModel(GSAConfig(n_sites=6, d_model=16, n_heads=2, n_layers=1, geometry_mode=mode))
         bad_act = act_idx.clone()
@@ -870,7 +881,6 @@ def self_test() -> None:
     table = model.edge_costs.table()
     assert table.shape == (1 << n_sites, n_sites)
     assert torch.all(table > 0)
-    # Reverse traversal of every undirected edge has exactly the same cost.
     for state in range(1 << n_sites):
         for site in range(n_sites):
             neighbour = state ^ (1 << site)
@@ -879,13 +889,8 @@ def self_test() -> None:
     assert shortest is not None and shortest.shape == (1 << n_sites, 1 << n_sites)
     assert torch.isfinite(shortest).all()
     assert torch.allclose(shortest, shortest.T, atol=1e-6, rtol=1e-6)
-    loss = pred.square().mean() + model.geometry_regularizer()
-    loss.backward()
-    assert model.edge_costs.edge_logits.grad is not None
-    assert torch.isfinite(model.edge_costs.edge_logits.grad).all()
     print("GSA-V1 SELF-TEST: OK")
     print("Property S* / action observée:", property_result)
-    print("Model output:", tuple(pred.shape))
     print("Undirected edges:", model.edge_costs.edge_logits.numel())
     print("Parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
