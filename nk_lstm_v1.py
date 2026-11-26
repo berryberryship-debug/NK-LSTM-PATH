@@ -35,8 +35,11 @@ le chemin d'actions accepté et les configurations suffisent à déterminer
 la composition du transport. Une trajectoire sans événement reçoit un token
 sans action et doit prédire J_final = J0.
 
-La validation sépare des états initiaux complets : toutes les trajectoires
-issues d'un même (X0,J0) restent dans la même partition.
+Les états initiaux sont répartis en trois blocs disjoints : entraînement,
+validation (sélection de l'époque) et test final. Toutes les trajectoires
+issues d'un même (X0,J0) restent dans une seule partition.
+
+La tête prédit un résidu : J_final_hat = J0 + delta_J_hat.
 
 Exécution depuis la racine du dépôt :
     python .\\nk_lstm_v1.py
@@ -280,13 +283,38 @@ def make_adaptive_record(
     if not np.array_equal(current_X, np.asarray(simulation.X_final, dtype=np.float64)):
         raise RuntimeError("Reconstruction des configurations incohérente avec X_final.")
 
+    J0_array = np.asarray(J0, dtype=np.float64)
+    J_final = np.asarray(simulation.J_final, dtype=np.float64)
+    if J_final.shape != (current_X.size, current_X.size):
+        raise RuntimeError("J_final a une dimension incompatible avec X_final.")
+    if not np.all(np.isfinite(J_final)):
+        raise RuntimeError("J_final contient des valeurs non finies.")
+    if not (
+        np.allclose(J_final, J_final.T, rtol=0.0, atol=1e-12)
+        and np.allclose(np.diag(J_final), 0.0, rtol=0.0, atol=1e-12)
+    ):
+        raise RuntimeError("J_final non symétrique ou diagonale non nulle.")
+    if not (
+        np.allclose(J0_array, J0_array.T, rtol=0.0, atol=1e-12)
+        and np.allclose(np.diag(J0_array), 0.0, rtol=0.0, atol=1e-12)
+    ):
+        raise RuntimeError("J0 non symétrique ou diagonale non nulle.")
+
+    # simulate_ogata_thinning limite le nombre d'itérations de proposition.
+    # Si le temps final reste inférieur à t_max, la trajectoire est tronquée.
+    if simulation.t_final < t_max - 1e-12:
+        raise RuntimeError(
+            f"Simulation interrompue avant t_max={t_max:g} : "
+            f"t_final={simulation.t_final:g}. Augmenter --max-events."
+        )
+
     return AdaptiveRecord(
         initial_state_idx=initial_state_idx,
         replicate_idx=replicate_idx,
         X_seq=np.stack(x_pre),
-        J0=np.asarray(J0, dtype=np.float64).copy(),
+        J0=J0_array.copy(),
         actions=np.stack(action_rows),
-        J_final=np.asarray(simulation.J_final, dtype=np.float64).copy(),
+        J_final=J_final.copy(),
         n_events=simulation.n_accepted,
         t_final=float(simulation.t_final),
     )
@@ -334,14 +362,6 @@ def numpy_matrix_to_upper_triangle(J: np.ndarray) -> np.ndarray:
     if J.ndim != 2 or J.shape[0] != J.shape[1]:
         raise ValueError("J doit être une matrice carrée.")
     return J[np.triu_indices(J.shape[0], k=1)].copy()
-
-
-def matrix_to_upper_triangle_torch(J: torch.Tensor) -> torch.Tensor:
-    if J.ndim < 2 or J.shape[-1] != J.shape[-2]:
-        raise ValueError("J doit avoir la forme (..., N, N).")
-    n = J.shape[-1]
-    indices = torch.triu_indices(n, n, offset=1, device=J.device)
-    return J[..., indices[0], indices[1]]
 
 
 class NKLSTM_X(nn.Module):
@@ -427,7 +447,8 @@ class NKLSTM_XJA(nn.Module):
             z, lengths.detach().cpu(), batch_first=True, enforce_sorted=False
         )
         _, final_state = self.lstm(packed, state)
-        predicted_j_final = self.head_j_final(final_state[0][-1])
+        residual_j_final = self.head_j_final(final_state[0][-1])
+        predicted_j_final = j0_triangle + residual_j_final
         return predicted_j_final, final_state
 
 
@@ -470,20 +491,40 @@ def collate_endpoint_batch(batch):
 def split_initial_states(
     n_initial_states: int,
     validation_fraction: float,
+    test_fraction: float,
     seed: int,
-) -> tuple[set[int], set[int]]:
-    if n_initial_states < 2:
-        raise ValueError("Il faut au moins deux états initiaux pour la validation indépendante.")
+) -> tuple[set[int], set[int], set[int]]:
+    """Partitionne les états initiaux en train/validation/test sans fuite."""
+    if n_initial_states < 3:
+        raise ValueError("Il faut au moins trois états initiaux pour train/validation/test.")
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("validation_fraction doit être comprise entre 0 et 1.")
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction doit être comprise entre 0 et 1.")
+    if validation_fraction + test_fraction >= 1.0:
+        raise ValueError("validation_fraction + test_fraction doit être < 1.")
+
     indices = np.arange(n_initial_states)
     rng = np.random.default_rng(seed)
     rng.shuffle(indices)
-    n_val = max(1, int(math.ceil(n_initial_states * validation_fraction)))
-    n_val = min(n_val, n_initial_states - 1)
-    val = set(int(i) for i in indices[:n_val])
-    train = set(int(i) for i in indices[n_val:])
-    return train, val
+
+    # floor + minimum 1 : avec 6 états et 0.2/0.2, on obtient 4/1/1.
+    n_val = max(1, int(math.floor(n_initial_states * validation_fraction)))
+    n_test = max(1, int(math.floor(n_initial_states * test_fraction)))
+    if n_val + n_test >= n_initial_states:
+        raise ValueError(
+            "Les fractions demandent trop d'états pour la validation et le test; "
+            "augmenter n_initial_states ou réduire les fractions."
+        )
+
+    val_indices = set(int(i) for i in indices[:n_val])
+    test_indices = set(int(i) for i in indices[n_val:n_val + n_test])
+    train_indices = set(int(i) for i in indices[n_val + n_test:])
+    if not train_indices or not val_indices or not test_indices:
+        raise RuntimeError("Partition train/validation/test vide.")
+    if train_indices & val_indices or train_indices & test_indices or val_indices & test_indices:
+        raise RuntimeError("Fuite entre les partitions d'états initiaux.")
+    return train_indices, val_indices, test_indices
 
 
 def select_records(records: list[AdaptiveRecord], indices: set[int]) -> list[AdaptiveRecord]:
@@ -502,12 +543,17 @@ class TrainingResult:
     mode: str
     n_train_trajectories: int
     n_validation_trajectories: int
+    n_test_trajectories: int
     n_train_initial_states: int
     n_validation_initial_states: int
+    n_test_initial_states: int
     best_epoch: int
     train_mse_at_best: float
-    validation_mse: float
-    validation_J0_baseline_mse: float
+    validation_mse_for_selection: float
+    test_mse: float
+    train_metrics: dict
+    validation_metrics: dict
+    test_metrics: dict
 
 
 def make_loader(records: list[AdaptiveRecord], batch_size: int, shuffle: bool, seed: int) -> DataLoader:
@@ -522,33 +568,64 @@ def make_loader(records: list[AdaptiveRecord], batch_size: int, shuffle: bool, s
     )
 
 
-def evaluate_mse_and_baseline(
+@torch.no_grad()
+def evaluate_adaptive_records(
     model: NKLSTM_XJA,
-    loader: DataLoader,
+    records: list[AdaptiveRecord],
+    batch_size: int,
     device: torch.device,
-) -> tuple[float, float]:
+) -> dict:
+    """MSE par trajectoire, avec séparation n_events=0 et n_events>0."""
+    if not records:
+        raise ValueError("Ensemble d'évaluation vide.")
+    loader = make_loader(records, batch_size, False, 0)
     model.eval()
-    squared_error = 0.0
-    baseline_error = 0.0
-    total_elements = 0
-    with torch.no_grad():
-        for x, j0, action, lengths, target in loader:
-            x, j0, action, target = (
-                x.to(device), j0.to(device), action.to(device), target.to(device)
-            )
-            prediction, _ = model(x, j0, action, lengths)
-            squared_error += torch.sum((prediction - target) ** 2).item()
-            baseline_error += torch.sum((j0 - target) ** 2).item()
-            total_elements += target.numel()
-    if total_elements == 0:
-        raise ValueError("Ensemble de validation vide.")
-    return squared_error / total_elements, baseline_error / total_elements
+    errors: list[float] = []
+    baseline_errors: list[float] = []
+
+    for x, j0, action, lengths, target in loader:
+        x, j0, action, target = (
+            x.to(device), j0.to(device), action.to(device), target.to(device)
+        )
+        prediction, _ = model(x, j0, action, lengths)
+        per_sample = torch.mean((prediction - target) ** 2, dim=1)
+        baseline = torch.mean((j0 - target) ** 2, dim=1)
+        errors.extend(per_sample.cpu().numpy().astype(float).tolist())
+        baseline_errors.extend(baseline.cpu().numpy().astype(float).tolist())
+
+    event_counts = np.asarray([record.n_events for record in records], dtype=np.int64)
+    errors_array = np.asarray(errors, dtype=np.float64)
+    baseline_array = np.asarray(baseline_errors, dtype=np.float64)
+    if errors_array.size != len(records) or baseline_array.size != len(records):
+        raise RuntimeError("Désalignement entre prédictions et trajectoires évaluées.")
+
+    zero_mask = event_counts == 0
+    nonzero_mask = event_counts > 0
+
+    def group_mean(values: np.ndarray, mask: np.ndarray):
+        return float(np.mean(values[mask])) if np.any(mask) else None
+
+    return {
+        "trajectory_endpoint_mse_mean": float(np.mean(errors_array)),
+        "trajectory_endpoint_mse_max": float(np.max(errors_array)),
+        "J0_baseline_mse_mean": float(np.mean(baseline_array)),
+        "zero_event_count": int(np.count_nonzero(zero_mask)),
+        "zero_event_mse_mean": group_mean(errors_array, zero_mask),
+        "zero_event_baseline_mse_mean": group_mean(baseline_array, zero_mask),
+        "nonzero_event_count": int(np.count_nonzero(nonzero_mask)),
+        "nonzero_event_mse_mean": group_mean(errors_array, nonzero_mask),
+        "nonzero_event_baseline_mse_mean": group_mean(baseline_array, nonzero_mask),
+        "mean_accepted_events": float(np.mean(event_counts)),
+        "zero_event_fraction": float(np.mean(zero_mask)),
+        "n_trajectories": int(len(records)),
+    }
 
 
 def train_mode_model(
     mode: TransportMode,
     train_records: list[AdaptiveRecord],
     validation_records: list[AdaptiveRecord],
+    test_records: list[AdaptiveRecord],
     n_sites: int,
     hidden: int,
     epochs: int,
@@ -560,6 +637,7 @@ def train_mode_model(
     device: torch.device,
     train_state_count: int,
     validation_state_count: int,
+    test_state_count: int,
 ) -> tuple[NKLSTM_XJA, TrainingResult]:
     torch.manual_seed(torch_seed)
     if torch.cuda.is_available():
@@ -567,23 +645,17 @@ def train_mode_model(
 
     model = NKLSTM_XJA(n_sites=n_sites, hidden=hidden).to(device)
     train_loader = make_loader(train_records, batch_size, True, torch_seed)
-    validation_loader = make_loader(validation_records, batch_size, False, torch_seed)
-
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
     criterion = nn.MSELoss()
     best_validation = float("inf")
-    best_train = float("inf")
-    best_baseline = float("inf")
     best_epoch = 0
     best_state = None
     no_improvement = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
-        total_squared_error = 0.0
-        total_elements = 0
         for x, j0, action, lengths, target in train_loader:
             x, j0, action, target = (
                 x.to(device), j0.to(device), action.to(device), target.to(device)
@@ -596,17 +668,14 @@ def train_mode_model(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            total_squared_error += torch.sum((prediction.detach() - target) ** 2).item()
-            total_elements += target.numel()
 
-        train_mse = total_squared_error / max(total_elements, 1)
-        val_mse, baseline_mse = evaluate_mse_and_baseline(
-            model, validation_loader, device
+        # La validation sert uniquement à sélectionner l'époque / early stopping.
+        validation_metrics = evaluate_adaptive_records(
+            model, validation_records, batch_size, device
         )
+        val_mse = float(validation_metrics["trajectory_endpoint_mse_mean"])
         if val_mse < best_validation:
             best_validation = val_mse
-            best_train = train_mse
-            best_baseline = baseline_mse
             best_epoch = epoch
             best_state = {
                 key: value.detach().cpu().clone()
@@ -623,16 +692,28 @@ def train_mode_model(
     model.load_state_dict(best_state)
     model.to(device)
 
+    # Réévaluation après restauration des poids retenus : pas de moyenne de
+    # pertes accumulées sur des poids différents au fil de l'époque.
+    train_metrics = evaluate_adaptive_records(model, train_records, batch_size, device)
+    validation_metrics = evaluate_adaptive_records(model, validation_records, batch_size, device)
+    # Le test est consulté une seule fois, après sélection du meilleur modèle.
+    test_metrics = evaluate_adaptive_records(model, test_records, batch_size, device)
+
     result = TrainingResult(
         mode=mode,
         n_train_trajectories=len(train_records),
         n_validation_trajectories=len(validation_records),
+        n_test_trajectories=len(test_records),
         n_train_initial_states=train_state_count,
         n_validation_initial_states=validation_state_count,
+        n_test_initial_states=test_state_count,
         best_epoch=best_epoch,
-        train_mse_at_best=best_train,
-        validation_mse=best_validation,
-        validation_J0_baseline_mse=best_baseline,
+        train_mse_at_best=float(train_metrics["trajectory_endpoint_mse_mean"]),
+        validation_mse_for_selection=float(validation_metrics["trajectory_endpoint_mse_mean"]),
+        test_mse=float(test_metrics["trajectory_endpoint_mse_mean"]),
+        train_metrics=train_metrics,
+        validation_metrics=validation_metrics,
+        test_metrics=test_metrics,
     )
     return model, result
 
@@ -702,56 +783,67 @@ def evaluate_trained_order_sensitivity(
     records: list[PathRecord],
     selected_indices: set[int],
     device: torch.device,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
+    """Compare l'écart prédit entre ordres à l'écart réel des extrémités J."""
     model.eval()
     selected = [r for r in records if r.initial_state_idx in selected_indices]
     grouped: dict[tuple[int, int, int], dict[tuple[int, int], PathRecord]] = {}
-    for r in selected:
-        grouped.setdefault((r.initial_state_idx, r.k, r.m), {})[r.order] = r
-    values: list[dict[str, float]] = []
-    for (state_idx, k, m), paths in grouped.items():
+    for record in selected:
+        grouped.setdefault(
+            (record.initial_state_idx, record.k, record.m), {}
+        )[record.order] = record
+
+    predicted_gaps: list[float] = []
+    true_gaps: list[float] = []
+    endpoint_prediction_errors: list[float] = []
+
+    for (_state_idx, k, m), paths in grouped.items():
         a, b = paths.get((k, m)), paths.get((m, k))
         if a is None or b is None:
-            raise RuntimeError("Chemin inverse absent pour le diagnostic XJA.")
+            raise RuntimeError("Chemin inverse absent pour le diagnostic de prédiction.")
+
         xa, ja, aa, la = _controlled_inputs(a, device)
         xb, jb, ab, lb = _controlled_inputs(b, device)
-        _, state_a = model(xa, ja, aa, la)
-        _, state_b = model(xb, jb, ab, lb)
-        values.append(state_distances(state_a, state_b))
-    return summarize_distances(values)
+        pred_a, _ = model(xa, ja, aa, la)
+        pred_b, _ = model(xb, jb, ab, lb)
 
+        true_a = torch.from_numpy(
+            numpy_matrix_to_upper_triangle(a.J_states[-1]).astype(np.float32)
+        )[None, :].to(device)
+        true_b = torch.from_numpy(
+            numpy_matrix_to_upper_triangle(b.J_states[-1]).astype(np.float32)
+        )[None, :].to(device)
 
-@torch.no_grad()
-def evaluate_adaptive_validation(
-    model: NKLSTM_XJA,
-    records: list[AdaptiveRecord],
-    batch_size: int,
-    device: torch.device,
-) -> dict[str, float]:
-    loader = make_loader(records, batch_size, False, 0)
-    model.eval()
-    errors: list[float] = []
-    baselines: list[float] = []
-    with torch.no_grad():
-        for x, j0, action, lengths, target in loader:
-            x, j0, action, target = (
-                x.to(device), j0.to(device), action.to(device), target.to(device)
-            )
-            prediction, _ = model(x, j0, action, lengths)
-            per_sample = torch.mean((prediction - target) ** 2, dim=1)
-            base_sample = torch.mean((j0 - target) ** 2, dim=1)
-            errors.extend(per_sample.cpu().numpy().tolist())
-            baselines.extend(base_sample.cpu().numpy().tolist())
+        predicted_gap = torch.linalg.vector_norm(pred_a - pred_b)
+        true_gap = torch.linalg.vector_norm(true_a - true_b)
+        error_a = torch.linalg.vector_norm(pred_a - true_a)
+        error_b = torch.linalg.vector_norm(pred_b - true_b)
 
-    event_counts = np.asarray([r.n_events for r in records], dtype=np.float64)
+        predicted_gaps.append(float(predicted_gap.item()))
+        true_gaps.append(float(true_gap.item()))
+        endpoint_prediction_errors.extend([float(error_a.item()), float(error_b.item())])
+
+    if not predicted_gaps:
+        raise ValueError("Aucune paire de chemins sélectionnée pour le diagnostic.")
+
+    predicted = np.asarray(predicted_gaps, dtype=np.float64)
+    true = np.asarray(true_gaps, dtype=np.float64)
+    absolute_gap_error = np.abs(predicted - true)
+    pearson_r: float | None = None
+    if predicted.size >= 2 and np.std(predicted) > 0.0 and np.std(true) > 0.0:
+        pearson_r = float(np.corrcoef(predicted, true)[0, 1])
+
     return {
-        "trajectory_endpoint_mse_mean": float(np.mean(errors)),
-        "trajectory_endpoint_mse_max": float(np.max(errors)),
-        "J0_baseline_mse_mean": float(np.mean(baselines)),
-        "n_validation_trajectories": float(len(records)),
-        "mean_accepted_events": float(np.mean(event_counts)),
-        "zero_event_fraction": float(np.mean(event_counts == 0.0)),
+        "n_pairs": float(predicted.size),
+        "mean_predicted_endpoint_gap_triangle_norm": float(np.mean(predicted)),
+        "mean_true_endpoint_gap_triangle_norm": float(np.mean(true)),
+        "mean_absolute_gap_error": float(np.mean(absolute_gap_error)),
+        "max_absolute_gap_error": float(np.max(absolute_gap_error)),
+        "mean_single_path_endpoint_prediction_error": float(np.mean(endpoint_prediction_errors)),
+        "pearson_r_predicted_vs_true_gap": pearson_r,
     }
+
+
 
 
 # ======================================================================
@@ -784,6 +876,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument("--split-seed", type=int, default=31415)
     parser.add_argument("--torch-seed", type=int, default=42)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--json-out", type=Path, default=None)
@@ -797,6 +891,12 @@ def run_experiment(args: argparse.Namespace) -> dict:
         raise ValueError("Hyperparamètres d'entraînement non valides.")
     if args.n_trajectories_per_state < 1 or args.max_events < 1:
         raise ValueError("n-trajectories-per-state et max-events doivent être >= 1.")
+    if not (0.0 < args.validation_fraction < 1.0):
+        raise ValueError("validation-fraction doit être dans ]0,1[.")
+    if not (0.0 < args.test_fraction < 1.0):
+        raise ValueError("test-fraction doit être dans ]0,1[.")
+    if args.validation_fraction + args.test_fraction >= 1.0:
+        raise ValueError("validation-fraction + test-fraction doit être < 1.")
     if not np.isfinite(args.t_max) or args.t_max < 0.0:
         raise ValueError("t-max doit être fini et >= 0.")
 
@@ -814,8 +914,8 @@ def run_experiment(args: argparse.Namespace) -> dict:
         nk_seed=args.nk_seed,
     )
     validate_config(cfg)
-    if cfg.n_initial_states < 2:
-        raise ValueError("n-initial-states doit être >= 2.")
+    if cfg.n_initial_states < 3:
+        raise ValueError("n-initial-states doit être >= 3 pour train/validation/test.")
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA demandé, mais aucun périphérique CUDA n'est disponible.")
@@ -855,23 +955,25 @@ def run_experiment(args: argparse.Namespace) -> dict:
             max_events=args.max_events,
         )
 
-    train_indices, validation_indices = split_initial_states(
+    train_indices, validation_indices, test_indices = split_initial_states(
         cfg.n_initial_states,
         args.validation_fraction,
-        seed=args.torch_seed,
+        args.test_fraction,
+        seed=args.split_seed,
     )
 
     trained_models: dict[str, NKLSTM_XJA] = {}
     training_results: dict[str, TrainingResult] = {}
-    adaptive_validation: dict[str, dict[str, float]] = {}
 
     for mode in ("integrable", "symmetric"):
         train_records = select_records(adaptive_records[mode], train_indices)
         val_records = select_records(adaptive_records[mode], validation_indices)
+        test_records = select_records(adaptive_records[mode], test_indices)
         model, train_result = train_mode_model(
             mode=mode,  # type: ignore[arg-type]
             train_records=train_records,
             validation_records=val_records,
+            test_records=test_records,
             n_sites=cfg.n_sites,
             hidden=args.hidden,
             epochs=args.epochs,
@@ -883,12 +985,10 @@ def run_experiment(args: argparse.Namespace) -> dict:
             device=device,
             train_state_count=len(train_indices),
             validation_state_count=len(validation_indices),
+            test_state_count=len(test_indices),
         )
         trained_models[mode] = model
         training_results[mode] = train_result
-        adaptive_validation[mode] = evaluate_adaptive_validation(
-            model, val_records, args.batch_size, device
-        )
 
     # --------------------------------------------------------------
     # C. Diagnostics d'ordre sur les états initiaux réservés à la validation
@@ -940,30 +1040,44 @@ def run_experiment(args: argparse.Namespace) -> dict:
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
             "validation_fraction": args.validation_fraction,
+            "test_fraction": args.test_fraction,
+            "split_seed": args.split_seed,
             "torch_seed": args.torch_seed,
             "device": str(device),
         },
         "split": {
             "train_initial_state_indices": sorted(train_indices),
             "validation_initial_state_indices": sorted(validation_indices),
+            "test_initial_state_indices": sorted(test_indices),
         },
         "controlled_two_step_endpoint_checks": square_checks,
         "adaptive_trajectory_event_statistics": event_stats,
         "training": {mode: asdict(value) for mode, value in training_results.items()},
-        "adaptive_validation": adaptive_validation,
+        "adaptive_evaluation": {
+            mode: {
+                "train": result.train_metrics,
+                "validation": result.validation_metrics,
+                "test": result.test_metrics,
+            }
+            for mode, result in training_results.items()
+        },
         "controlled_X_only_untrained_order_sensitivity": order_x,
         "controlled_X_J0_action_trained_order_sensitivity": order_xja,
         "interpretation_limits": [
             "Le carré à deux mutations est un contrôle déterministe; ses chemins ne sont pas sélectionnés par les taux NK.",
             "Les trajectoires adaptatives sont générées par simulate_ogata_thinning avec un paysage NK unique partagé.",
             "Les modèles adaptatifs reçoivent X_t et le site muté; J0 est fourni une seule fois et les J intermédiaires sont masqués.",
+            "La tête prédit un résidu ajouté à J0; cela correspond à la baseline sans évolution du transport.",
             "La cible est J_final : l'expérience évalue l'apprentissage de la composition séquentielle du transport sur des chemins adaptatifs.",
             "gamma=0 dans cette V1; la dissipation continue et l'information des temps d'attente ne sont pas modélisées par l'entrée LSTM.",
-            "La validation sépare les états initiaux complets; elle ne sépare pas les réalisations aléatoires d'un même état entre les partitions.",
-            "Les modèles intégrable et symétrique sont entraînés séparément; leurs coordonnées cachées ne sont pas directement comparables entre modèles.",
+            "Les partitions train/validation/test sont disjointes au niveau des états initiaux complets.",
+            "La validation sélectionne l'époque; le test final n'est évalué qu'après restauration du meilleur modèle.",
+            "Les erreurs sont rapportées séparément pour les trajectoires sans événement et celles avec au moins un événement.",
+            "Les modèles intégrable et symétrique sont entraînés séparément; les diagnostics d'ordre comparent leurs prédictions d'extrémité aux écarts vrais, pas leurs états cachés.",
             "Les transports peuvent générer des distributions de trajectoires différentes malgré les mêmes états initiaux, le même paysage et des graines de simulation appariées; les MSE des deux modes ne sont donc pas une comparaison appariée de difficulté.",
             "Le LSTM reçoit les événements acceptés (sites mutés), pas les propositions rejetées ni les taux complets; il prédit le transport de J le long d'une histoire réalisée, pas la règle de sélection stochastique.",
             "Une erreur prédictive faible ne prouve pas à elle seule une reconstruction générale de l'histoire ni une holonomie géométrique.",
+            "La métrique des écarts prédits utilise la norme euclidienne du triangle supérieur; elle diffère de la norme de Frobenius matricielle d'un facteur sqrt(2) pour des matrices symétriques à diagonale nulle.",
             "Le LSTM X-seul est non entraîné : sa distance cachée est un diagnostic de sensibilité à l'ordre, non une mémoire apprise.",
         ],
     }
@@ -980,8 +1094,9 @@ def run_experiment(args: argparse.Namespace) -> dict:
         f"mu={cfg.mu:g} | beta={cfg.beta:g} | theta_A={cfg.theta_A:g} | lambda={cfg.lam:g}"
     )
     print(
-        f"Validation par état initial : entraînement={len(train_indices)} | "
-        f"validation={len(validation_indices)}"
+        f"Partition par état initial : entraînement={len(train_indices)} | "
+        f"validation={len(validation_indices)} | test={len(test_indices)} "
+        f"(graine de partition={args.split_seed})"
     )
 
     print("\nA — CONTRÔLE GÉOMÉTRIQUE À DEUX MUTATIONS")
@@ -995,23 +1110,30 @@ def run_experiment(args: argparse.Namespace) -> dict:
     for mode in ("integrable", "symmetric"):
         tr = training_results[mode]
         print(f"\nB — TRANSPORT {mode.upper()} : TRAJECTOIRES ADAPTATIVES")
-        print(f"Trajectoires entraînement / validation : {tr.n_train_trajectories} / {tr.n_validation_trajectories}")
-        print(f"États initiaux entraînement / validation : {tr.n_train_initial_states} / {tr.n_validation_initial_states}")
-        print(f"Meilleure époque : {tr.best_epoch}")
-        print(f"MSE entraînement au meilleur modèle : {tr.train_mse_at_best:.6e}")
-        print(f"MSE validation : {tr.validation_mse:.6e}")
-        print(f"MSE baseline J_final = J0 : {tr.validation_J0_baseline_mse:.6e}")
+        print(f"Trajectoires train / validation / test : {tr.n_train_trajectories} / {tr.n_validation_trajectories} / {tr.n_test_trajectories}")
+        print(f"États initiaux train / validation / test : {tr.n_train_initial_states} / {tr.n_validation_initial_states} / {tr.n_test_initial_states}")
+        print(f"Meilleure époque (sélection validation) : {tr.best_epoch}")
+        print(f"MSE train réévaluée sur les poids retenus : {tr.train_mse_at_best:.6e}")
+        print(f"MSE validation (sélection) : {tr.validation_mse_for_selection:.6e}")
+        print(f"MSE test indépendant : {tr.test_mse:.6e}")
+        print(f"Baseline J_final = J0 — validation / test : {tr.validation_metrics['J0_baseline_mse_mean']:.6e} / {tr.test_metrics['J0_baseline_mse_mean']:.6e}")
+        print(f"MSE validation sans événement / avec événement : {tr.validation_metrics['zero_event_mse_mean']} / {tr.validation_metrics['nonzero_event_mse_mean']}")
+        print(f"MSE test sans événement / avec événement : {tr.test_metrics['zero_event_mse_mean']} / {tr.test_metrics['nonzero_event_mse_mean']}")
         print(f"Événements acceptés moyens : {event_stats[mode]['mean_accepted_events']:.3f}")
         print(f"Fraction de trajectoires sans événement : {event_stats[mode]['zero_event_fraction']:.3f}")
-        print("Validation :")
-        for key, value in adaptive_validation[mode].items():
-            print(f"  {key} : {value:.6e}")
-        print("Sensibilité de l'état récurrent sur les carrés de validation :")
+        print("Écart entre prédictions et écart réel sur les carrés de validation :")
         for key, value in order_xja[mode].items():
-            print(f"  {key} : {int(value) if key == 'n_pairs' else f'{value:.6e}'}")
+            if value is None:
+                rendered = "non défini (variance nulle ou échantillon insuffisant)"
+            elif key == "n_pairs":
+                rendered = str(int(value))
+            else:
+                rendered = f"{value:.6e}"
+            print(f"  {key} : {rendered}")
 
-    print("\nPrécaution : la comparaison des modèles cachés entre transports n'est pas une comparaison dans un repère commun.")
-    print("La prédiction de J_final doit être comparée à la baseline J_final = J0.")
+    print("\nPrécaution : le diagnostic d'ordre sur les carrés mesure une généralisation à deux flips; il ne remplace pas le score test des trajectoires adaptatives.")
+    print("La performance finale est estimée sur le bloc test, distinct de la validation.")
+    print("La baseline J_final = J0 et les sous-groupes n_events=0 / n_events>0 sont rapportés séparément.")
     print("=" * 78)
     return payload
 
