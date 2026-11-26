@@ -1,5 +1,5 @@
 # NK-LSTM-PATH
-Reconstruction de l'information historique et géométrie endogène dans les paysages adaptatifs de Kauffman
+## Reconstruction de l'information historique et géométrie endogène dans les paysages adaptatifs de Kauffman
 
 ## Modélisation multi-échelle des paysages NK, des trajectoires adaptatives, des structures de fibrés discrets et des représentations temporelles par réseaux LSTM.
 
