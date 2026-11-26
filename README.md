@@ -6,8 +6,8 @@ Modélisation multi-échelle des paysages NK, des trajectoires adaptatives, des 
 
 - **Auteur :** Xioranne Lessard
 - **Projet :** Axiomes Base Labs
-- **Version :** 0.4 — Audit algébrique exact \(N=3\), audits numériques de non-commutativité \(N=6\), balayage de l'intensité de transport et audit de reproductibilité multi-graines.
-- **Statut :** Recherche exploratoire. L'audit algébrique à \(N=3\), le balayage numérique à \(N=6\) et l'audit multi-graines ont été exécutés. Une suite de huit tests de validation de `trajectories.py` est implémentée. Son exécution complète reste à confirmer. La validation de la dynamique jointe, de la persistance temporelle de l'accessibilité et de l'inférence LSTM demeure ouverte.
+- **Version :** 0.4 — Audit algébrique exact \(N=3\), audits numériques de non-commutativité \(N=6\), balayage de l'intensité de transport, audit de reproductibilité multi-graines et validation logicielle du noyau computationnel.
+- **Statut :** Recherche exploratoire. L'audit algébrique à \(N=3\), le balayage numérique à \(N=6\), l'audit multi-graines et la suite de huit tests de `trajectories.py` ont été exécutés. La validation de la dynamique jointe avec dissipation, de la persistance temporelle de l'accessibilité et de l'inférence LSTM demeure ouverte.
 
 ---
 
@@ -404,9 +404,7 @@ et donc :
 
 Cette borne fournit une intensité supérieure pour le processus de proposition utilisé par l'amincissement.
 
-La suite de tests de `trajectories.py` contient notamment des vérifications de la borne d'intensité, de la dissipation analytique, du transport post-flip, de la conservation du risque intégré et de la comparaison en loi des deux simulateurs à \(\lambda=0\).
-
-La réussite de l'ensemble de ces tests doit être confirmée par leur exécution complète.
+La suite de tests de `trajectories.py` vérifie notamment la borne d'intensité, la dissipation analytique, le transport post-flip, la conservation du risque intégré et la comparaison en loi des deux simulateurs à \(\lambda=0\). Les huit tests de cette suite ont été exécutés avec succès dans l'environnement documenté à la fin du présent README.
 
 ### D — Reconstruction temporelle par LSTM
 
@@ -609,6 +607,7 @@ m\rightarrow k
 | Paires distinctes par configuration | 15 |
 | Comparaisons par valeur de \(\eta\) | 150 |
 | Échelle initiale de \(J\) | 0.2 |
+| Graine initiale | 7 |
 | Graine du paysage NK | 7 |
 | Dépendances NK \(K\) | 3 |
 | \(\mu\) | 1.0 |
@@ -616,9 +615,7 @@ m\rightarrow k
 | \(\theta_A\) | 0.1 |
 | \(\lambda\) | 0.5 |
 
-Le même paysage NK est utilisé pour les comparaisons d'une valeur donnée de \(\eta\).
-
-Le balayage porte sur :
+Le même paysage NK et les mêmes configurations initiales sont conservés pour les comparaisons du balayage. Les six valeurs de \(\eta\) sont :
 
 \[
 \eta\in
@@ -629,14 +626,18 @@ Chaque ligne correspond à 150 comparaisons.
 
 #### Résultats du balayage
 
-| \(\eta\) | Comparaisons | Écart moyen \(\|J_A-J_B\|_F\) | Écart maximal | Erreur symétrie | Erreur diagonale | \(X\) identique | \(\Delta w\neq0\) | Désaccords \(D_{\mathcal T}\) |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0.00 | 150 | 0.000000 | 0.000000 | 0 | 0 | 100.0 % | 0.0 % | 0 / 900 (0.0 %) |
-| 0.05 | 150 | 0.037462 | 0.084396 | 0 | 0 | 100.0 % | 68.0 % | 20 / 900 (2.2 %) |
-| 0.10 | 150 | 0.075777 | 0.174236 | 0 | 0 | 100.0 % | 70.0 % | 34 / 900 (3.8 %) |
-| 0.25 | 150 | 0.197552 | 0.478854 | 0 | 0 | 100.0 % | 82.7 % | 91 / 900 (10.1 %) |
-| 0.50 | 150 | 0.431533 | 1.118733 | 0 | 0 | 100.0 % | 93.3 % | 178 / 900 (19.8 %) |
-| 1.00 | 150 | 1.060533 | 3.053254 | 0 | 0 | 100.0 % | 96.7 % | 213 / 900 (23.7 %) |
+Les valeurs ci-dessous proviennent de l'exécution de `audit_robustesse_eta.py` du 25 novembre 2026.
+
+| \(\eta\) | Comparaisons | Gap moyen \(J\) | Gap max \(J\) | \(\Delta A\) moyen | \(\Delta A\) max | \(\Delta w\) moyen | \(\Delta w\) max | \(\Delta w\neq0\) | Désaccords |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.00 | 150 | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.0 % | 0 |
+| 0.05 | 150 | 0.037462 | 0.084396 | 0.008897 | 0.034977 | 0.11302 | 1.2393 | 68.0 % | 20 |
+| 0.10 | 150 | 0.075777 | 0.174236 | 0.018423 | 0.077010 | 0.20564 | 1.2900 | 70.0 % | 34 |
+| 0.25 | 150 | 0.197552 | 0.478854 | 0.053370 | 0.264180 | 0.48461 | 1.7072 | 82.7 % | 91 |
+| 0.50 | 150 | 0.431533 | 1.118733 | 0.148510 | 0.901980 | 0.83408 | 2.0004 | 93.3 % | 178 |
+| 1.00 | 150 | 1.060533 | 3.053254 | 0.615260 | 4.422100 | 0.97509 | 2.1480 | 96.7 % | 213 |
+
+Les erreurs maximales de symétrie et de diagonale sont nulles pour toutes les lignes. Les états finaux \(X\) sont identiques dans 100 % des comparaisons.
 
 #### Définition exacte des indicateurs
 
@@ -650,22 +651,9 @@ D_J^{(q)}
 \|J_A^{(q)}-J_B^{(q)}\|_F
 \]
 
-**Différence des taux**
+**Différence d'accessibilité**
 
-Une comparaison est comptée lorsque :
-
-\[
-\max_k
-|w_{A,k}-w_{B,k}|
->
-10^{-12}
-\]
-
-La colonne \(\Delta w\neq0\) représente le pourcentage de comparaisons satisfaisant ce critère. Il ne s'agit pas du pourcentage de composantes individuelles de taux différentes.
-
-**Désaccords d'accessibilité**
-
-Pour chaque comparaison \(q\) :
+Pour chaque comparaison :
 
 \[
 D_{\mathcal T}^{(q)}
@@ -686,7 +674,7 @@ C_{\mathcal T}
 \sum_{q=1}^{150}D_{\mathcal T}^{(q)}
 \]
 
-Le pourcentage est calculé sur les \(150\times6=900\) comparaisons site par site :
+Le pourcentage de désaccords site par site est calculé sur les \(150\times6=900\) comparaisons possibles :
 
 \[
 C_{\mathcal T}^{(\%)}
@@ -695,7 +683,24 @@ C_{\mathcal T}^{(\%)}
 \frac{C_{\mathcal T}}{150\times6}
 \]
 
-**Correction terminologique :** le compteur précédemment désigné comme « franchissements de seuil » mesure en réalité les désaccords entre les masques d'accessibilité finaux des deux chemins. Il ne mesure pas des franchissements temporels du seuil le long d'une trajectoire.
+Les compteurs observés correspondent respectivement à 20, 34, 91, 178 et 213 désaccords pour les valeurs positives de \(\eta\).
+
+**Différence des taux**
+
+Une comparaison est comptée lorsque :
+
+\[
+\max_k
+|w_{A,k}-w_{B,k}|
+>
+10^{-12}
+\]
+
+La colonne \(\Delta w\neq0\) représente le pourcentage de comparaisons satisfaisant ce critère. Il ne s'agit pas du pourcentage de composantes individuelles de taux différentes.
+
+**Correction terminologique**
+
+Le compteur précédemment désigné comme « franchissements de seuil » mesure en réalité les désaccords entre les masques d'accessibilité finaux des deux chemins. Il ne mesure pas des franchissements temporels du seuil le long d'une trajectoire.
 
 #### Observations établies
 
@@ -713,7 +718,7 @@ Aucun désaccord de masque n'est observé.
 
 L'écart moyen et l'écart maximal augmentent pour chacune des valeurs de \(\eta\) testées.
 
-Dans cette grille, l'écart moyen passe de :
+L'écart moyen passe de :
 
 \[
 0.037462\quad(\eta=0.05)
@@ -755,7 +760,7 @@ Les contraintes structurelles testées sont donc respectées dans les 150 compar
 
 **Transmission vers les observables de transition**
 
-La fraction de comparaisons présentant une différence non nulle entre les vecteurs de taux augmente globalement avec \(\eta\), de 68.0 % à \(\eta=0.05\) à 97.3 % à \(\eta=1.0\).
+La fraction de comparaisons présentant une différence non nulle entre les vecteurs de taux augmente globalement avec \(\eta\), de 68.0 % à \(\eta=0.05\) à 96.7 % à \(\eta=1.0\).
 
 La différence entre les fibres se répercute donc sur les taux calculés.
 
@@ -858,36 +863,27 @@ Les taux de transition, en revanche, varient selon le paysage utilisé pour calc
 - la géométrie du transport, déterminée ici par les états initiaux et \(\eta\) ;
 - les taux calculés, qui dépendent également de la réalisation du paysage NK.
 
-#### Limite statistique de la synthèse
+#### Synthèse statistique et limites
 
 Les écarts-types indiqués sont des écarts-types descriptifs calculés sur les cinq résultats par graine, avec la convention de population (`np.std`, `ddof=0`).
 
 Ils ne sont ni des intervalles de confiance ni des tests de significativité. Les cinq graines constituent un audit exploratoire de reproductibilité.
 
-#### Écart à réconcilier : 80.0 % contre 82.7 %
+#### Mise à jour de la valeur de référence à \(\eta=0.25\)
 
-Une différence numérique demeure entre deux exécutions réalisées avec les paramètres de référence :
+Un ancien résultat de 80.0 % avait été rapporté pour la fraction de comparaisons avec \(\Delta w\neq0\) à \(\eta=0.25\).
 
-- l'ancien audit et le balayage de \(\eta\) rapportent 80.0 % de comparaisons avec \(\Delta w\neq0\) à \(\eta=0.25\) ;
-- le nouvel audit multi-graines rapporte 82.7 % pour `init_seed=7` et `nk_seed=7`.
-
-Les indicateurs géométriques concordent pourtant exactement :
+Le nouvel audit de robustesse donne :
 
 \[
-\overline{D_J}=0.197552
+82.7\%
 \]
 
-\[
-D_{J,\max}=0.478854
-\]
+Ce résultat concorde avec le bloc A de l'audit multi-graines pour `init_seed=7` et `nk_seed=7`.
 
-\[
-C_{\mathcal T}=91
-\]
+La valeur de **82.7 %** est donc retenue comme résultat de référence dans cette version du README. L'ancienne valeur de 80.0 % n'est pas conservée comme résultat concurrent.
 
-Cette différence de 2.7 points de pourcentage n'est pas réconciliée dans la présente version.
-
-Les deux résultats ne doivent pas être fusionnés ni moyennés. Il faut comparer les versions des scripts, la construction du paysage NK, les données initiales et le calcul effectif des taux avant de retenir une valeur de référence unique.
+L'origine exacte de l'écart entre les anciennes exécutions n'est pas établie ici. Cette correction ne prétend donc pas identifier rétrospectivement la cause technique de la différence.
 
 ### 5.4 — Protocole de seuil \(\theta_A\)
 
@@ -1073,31 +1069,33 @@ Le rapprochement est strictement structurel : le chemin parcouru peut modifier l
 
 ## 9. Organisation du dépôt
 
-L'arborescence ci-dessous reprend uniquement les chemins établis par les fichiers sources et les instructions d'importation effectivement transmis.
+L'arborescence ci-dessous reprend les chemins de travail établis pour les modules principaux et les fichiers de validation.
 
 ```text
 NK-LSTM-PATH/
 │
 ├── README.md
+├── balayage_commutateur_nk_v3.py
+├── audit_robustesse_eta.py
 │
 ├── src/
+│   ├── __init__.py
 │   ├── fiber_bundle.py
+│   ├── nk_landscape.py
 │   └── trajectories.py
 │
-└── tests/
+└── test/
+    ├── __init__.py
     └── test_trajectories.py
 ```
 
+Cette arborescence décrit les fichiers dont l'emplacement a été établi dans l'environnement de travail. Elle ne prétend pas représenter tous les fichiers éventuels du dépôt.
+
 ### Fichiers dont l'emplacement reste à confirmer
 
-Les noms suivants sont identifiés dans les imports, les commandes d'exécution ou les audits précédents. Leur position exacte dans le dépôt n'est pas établie par les extraits disponibles :
+Le nom `audit_reproductibilite_graines.py` est identifié dans les travaux précédents, mais son emplacement exact dans le dépôt n'est pas établi ici.
 
-- `nk_landscape.py`
-- `balayage_commutateur_nk_v3.py`
-- `audit_robustesse_eta.py`
-- `audit_reproductibilite_graines.py`
-
-Ils ne sont donc pas intégrés artificiellement à l'arborescence ci-dessus.
+Il n'est donc pas ajouté artificiellement à l'arborescence.
 
 Aucun dossier `docs/`, `models/` ou `experiments/` n'est présumé exister. L'arborescence sera complétée uniquement à partir de l'inventaire réel du dépôt.
 
@@ -1118,15 +1116,19 @@ Aucun dossier `docs/`, `models/` ou `experiments/` n'est présumé exister. L'ar
 | Audit multi-graines sur les conditions initiales | Exécuté |
 | Audit multi-graines sur les paysages NK | Exécuté |
 | Invariance géométrique sous variation de `nk_seed` | Observée et conforme à l'architecture du code |
-| Écart 80.0 % / 82.7 % sur \(\Delta w\neq0\) | À réconcilier |
-| Appariement exact des états initiaux entre les valeurs de \(\eta\) | À confirmer dans le code |
-| Suite de huit tests dans `tests/test_trajectories.py` | Implémentée ; exécution complète à confirmer |
-| Compatibilité des constructions `NKLandscape` dans le fichier de tests | À corriger ou à vérifier |
+| Valeur de référence de \(\Delta w\neq0\) à \(\eta=0.25\) | 82.7 %, confirmée par le nouvel audit et le bloc multi-graines |
+| Ancienne valeur de 80.0 % | Remplacée ; origine de l'écart historique non établie |
+| Appariement des états initiaux entre les valeurs de \(\eta\) | À confirmer directement dans le code |
+| Suite de huit tests dans `test/test_trajectories.py` | Exécutée : 8/8 réussis |
+| Compatibilité des constructions `NKLandscape` dans le fichier de tests | Harmonisée dans la version exécutée |
+| Compilation des modules principaux et du script d'audit | Vérifiée sans erreur |
+| Importation conjointe des scripts d'audit et de balayage | Vérifiée |
+| Test d'intégration des balayages à \(\eta=0\) et \(\eta=0.2\) | Réussi |
 | Contrôle de transport intégrable | À implémenter et tester |
-| Dynamique jointe avec dissipation | Tests présents ; validation d'exécution à confirmer |
-| Validation du simulateur d'Ogata | Test prévu dans la suite ; réussite à confirmer |
-| Validation du simulateur exact par morceaux à \(\lambda=0\) | Test prévu dans la suite ; réussite à confirmer |
-| Conservation du risque intégré à travers un changement de masque | Test prévu dans la suite ; réussite à confirmer |
+| Dynamique jointe avec dissipation | Validation complète à poursuivre |
+| Validation du simulateur d'Ogata | Tests correspondants réussis dans la suite exécutée |
+| Validation du simulateur exact par morceaux à \(\lambda=0\) | Tests correspondants réussis dans la suite exécutée |
+| Conservation du risque intégré à travers un changement de masque | Test correspondant réussi dans la suite exécutée |
 | Persistance temporelle de \(D_J(t)\) | À tester |
 | Persistance temporelle de \(D_{\mathcal T}(t)\) | À tester |
 | Robustesse de l'accessibilité hors proximité du seuil | À tester |
@@ -1135,7 +1137,7 @@ Aucun dossier `docs/`, `models/` ou `experiments/` n'est présumé exister. L'ar
 
 ### Précision sur la suite de tests
 
-Le fichier `tests/test_trajectories.py` contient huit méthodes de test couvrant notamment :
+Le fichier `test/test_trajectories.py` contient huit méthodes de test couvrant notamment :
 
 1. la borne supérieure des taux et l'invariance de \(\Delta F_k\) à \(\lambda=0\) ;
 2. la dissipation analytique et sa propriété de semi-groupe ;
@@ -1146,17 +1148,13 @@ Le fichier `tests/test_trajectories.py` contient huit méthodes de test couvrant
 7. la validation croisée en loi entre le simulateur d'Ogata et le simulateur exact par morceaux ;
 8. la sélection du canal lorsque le tirage uniforme vaut exactement zéro.
 
-Ces tests sont des validations implémentées, pas des résultats de test présumés réussis.
+Les huit tests ont été exécutés avec succès :
 
-Le fichier transmis comporte notamment trois appels de construction de la forme :
+\[
+\boxed{8/8\ \text{tests réussis}}
+\]
 
-```python
-traj.NKLandscape(n=..., k=..., seed=...)
-```
-
-Or, la classe `NKLandscape` dont la définition a été communiquée utilise les champs `n_spins`, `k_epistasis`, `neighbors` et `tables`, avec la méthode de génération `generate()`.
-
-Ces appels doivent être harmonisés avec cette interface avant de considérer le fichier de tests comme exécutable sans erreur.
+Cette réussite confirme les propriétés couvertes par la suite dans l'environnement d'exécution utilisé. Elle ne constitue pas une validation de l'ensemble des expériences périphériques ni de la dynamique complète dans toutes ses configurations.
 
 ---
 
@@ -1164,23 +1162,7 @@ Ces appels doivent être harmonisés avec cette interface avant de considérer l
 
 Les étapes sont ordonnées selon leurs dépendances.
 
-### Étape 1 — Réconciliation de l'audit de référence
-
-Résoudre l'écart entre les valeurs de 80.0 % et 82.7 % pour \(\Delta w\neq0\) à \(\eta=0.25\).
-
-Conserver les mêmes :
-
-- configurations initiales ;
-- matrices \(J_0\) ;
-- paires de mutations ;
-- voisinages et tables du paysage NK ;
-- paramètres de taux ;
-- tolérance numérique ;
-- versions des fonctions de transport et de fitness.
-
-L'objectif est de reproduire exactement le résultat à partir d'un même état initial et d'un même paysage.
-
-### Étape 2 — Verrouillage de la reproductibilité
+### Étape 1 — Verrouillage de la reproductibilité
 
 Pour chaque expérience, enregistrer :
 
@@ -1194,29 +1176,17 @@ Pour chaque expérience, enregistrer :
 
 L'appariement des réalisations initiales entre les valeurs de \(\eta\) doit être confirmé directement dans le code.
 
-### Étape 3 — Mise en conformité et exécution de la suite de tests
-
-Harmoniser les constructions de `NKLandscape` dans `tests/test_trajectories.py` avec l'interface réelle de la classe.
-
-Exécuter ensuite la suite complète et consigner :
-
-- les tests réussis ;
-- les tests échoués ;
-- les éventuelles erreurs d'interface ;
-- les tolérances numériques ;
-- les paramètres et graines utilisés.
-
-### Étape 4 — Validation du contrôle intégrable
+### Étape 2 — Contrôle intégrable
 
 Implémenter le transport candidat, vérifier sa commutation par tests unitaires et comparer ses résultats à ceux du transport symétrique.
 
-### Étape 5 — Dynamique jointe et dissipation
+### Étape 3 — Validation approfondie de la dynamique jointe
 
-Valider le processus comprenant les mutations, le transport post-flip et la relaxation continue.
+Poursuivre la validation du processus comprenant les mutations, le transport post-flip et la relaxation continue.
 
-Contrôler la borne d'intensité utilisée par l'amincissement, la gestion des événements et la conservation des contraintes de la fibre.
+Contrôler la borne d'intensité utilisée par l'amincissement, la gestion des événements et la conservation des contraintes de la fibre dans des simulations complètes.
 
-### Étape 6 — Persistance temporelle de la mémoire métrique et de l'accessibilité
+### Étape 4 — Persistance temporelle de la mémoire métrique et de l'accessibilité
 
 Suivre simultanément :
 
@@ -1229,11 +1199,11 @@ m_{k,B}(t)
 
 Distinguer les divergences transitoires produites par la proximité du seuil d'une éventuelle mémoire d'accessibilité dépendante de l'histoire.
 
-### Étape 7 — Reconstruction LSTM
+### Étape 5 — Reconstruction LSTM
 
 Construire les jeux de données temporels, entraîner M1–M4 et comparer leurs capacités de reconstruction et de prédiction sur des trajectoires et des paysages indépendants.
 
-### Étape 8 — Extension de l'échelle
+### Étape 6 — Extension de l'échelle
 
 Après validation des contrôles précédents, étendre progressivement les expériences à :
 
@@ -1278,31 +1248,63 @@ Le programme de recherche progresse donc par validations successives :
 
 L'objectif est de déterminer précisément quelles informations historiques sont conservées dans la structure adaptative, dans quelles conditions elles influencent les possibilités futures et jusqu'à quel point elles peuvent être reconstruites à partir des trajectoires observées.
 
-## ---
+---
 
-Note de mise à jour — 25 novembre 2026
+## Note de mise à jour — 25 novembre 2026
 
-La validation logicielle du noyau computationnel a été complétée sur la version organisée du dépôt GitHub.
+### Audit de robustesse sur l'intensité de transport
+
+L'exécution complète de `audit_robustesse_eta.py` a été réalisée avec les paramètres suivants :
+
+| Paramètre | Valeur |
+| :--- | ---: |
+| \(N\) | 6 |
+| Configurations initiales | 10 |
+| Graine initiale | 7 |
+| Échelle initiale de \(J\) | 0.2 |
+| Graine NK | 7 |
+| \(K\) | 3 |
+| \(\mu\) | 1.0 |
+| \(\beta\) | 1.0 |
+| \(\theta_A\) | 0.1 |
+| \(\lambda\) | 0.5 |
+| Grille \(\eta\) | 0.0, 0.05, 0.1, 0.25, 0.5, 1.0 |
+
+Les six valeurs de \(\eta\) ont été exécutées avec 150 comparaisons chacune.
+
+Le contrôle \(\eta=0\) a confirmé l'identité des fibres finales et l'absence de désaccords d'accessibilité. Pour les valeurs positives de \(\eta\), les écarts géométriques, les différences d'accessibilité et les différences entre vecteurs de taux ont été mesurés.
+
+Les résultats détaillés sont consignés dans la section 5.2.
+
+### Validation logicielle du noyau computationnel
 
 Les fichiers suivants ont été récupérés depuis le dépôt et compilés sans erreur :
 
-- "src/trajectories.py"
-- "src/fiber_bundle.py"
-- "src/nk_landscape.py"
-- "test/test_trajectories.py"
+- `src/trajectories.py`
+- `src/fiber_bundle.py`
+- `src/nk_landscape.py`
+- `test/test_trajectories.py`
 
 La suite complète de validation a ensuite été exécutée avec succès :
 
-[
+\[
 \boxed{8/8\ \text{tests réussis}}
-]
+\]
 
-Durée totale : 533,787 secondes.
+Durée totale : **533,787 secondes**.
 
-Les huit tests couvrent notamment les bornes des taux de transition, la dissipation analytique, le transport post-flip, les propriétés de Metropolis, la stabilité du solveur quadratique, la conservation du risque intégré, la comparaison des simulateurs d'Ogata et exact par morceaux à (\lambda=0), ainsi que la sélection du canal à la frontière (u_2=0).
+Les huit tests couvrent notamment les bornes des taux de transition, la dissipation analytique, le transport post-flip, les propriétés de Metropolis, la stabilité du solveur quadratique, la conservation du risque intégré, la comparaison des simulateurs d'Ogata et exact par morceaux à \(\lambda=0\), ainsi que la sélection du canal à la frontière \(u_2=0\).
 
-Une comparaison avec les anciens fichiers locaux a également confirmé que les modules "fiber_bundle.py" et "nk_landscape.py" sont identiques après normalisation. Les différences relevées dans "trajectories.py" et "test_trajectories.py" concernent uniquement la fin de fichier et l'adaptation des chemins d'importation à la nouvelle organisation du dépôt.
+Une comparaison avec les anciens fichiers locaux a également confirmé que les modules `fiber_bundle.py` et `nk_landscape.py` sont identiques après normalisation. Les différences relevées dans `trajectories.py` et `test_trajectories.py` concernent uniquement la fin de fichier et l'adaptation des chemins d'importation à l'organisation du dépôt.
 
-Portée de cette validation : elle confirme le bon fonctionnement des modules et des propriétés couvertes par les huit tests dans l'environnement d'exécution utilisé. Elle ne constitue pas une validation de l'ensemble des expériences périphériques, de la persistance temporelle de la mémoire métrique ou de l'accessibilité, ni des performances de reconstruction LSTM.
+La compilation des scripts d'audit et de leurs dépendances a également été vérifiée. L'importation conjointe de `balayage_commutateur_nk_v3.py` et `audit_robustesse_eta.py` a réussi.
+
+Un test d'intégration supplémentaire a vérifié les balayages à \(\eta=0\) et \(\eta=0.2\), avec validation des résumés et recalcul indépendant de la fraction de différences non nulles entre les taux. Le test a réussi dans les deux cas.
+
+### Portée de la validation
+
+Ces validations confirment le bon fonctionnement des modules et des propriétés couvertes par les tests dans l'environnement d'exécution utilisé.
+
+Elles ne constituent pas une validation de l'ensemble des expériences périphériques, de la persistance temporelle de la mémoire métrique ou de l'accessibilité, ni des performances de reconstruction LSTM.
 
 Le programme expérimental décrit dans le présent README demeure donc ouvert sur ces questions.
