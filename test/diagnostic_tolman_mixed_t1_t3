@@ -1,0 +1,121 @@
+# Synthèse corrigée — Campagne V2 (NK-LSTM-GSA)
+
+## 1. Observations mesurées
+
+### A. Cohorte homogène en régime d'ensemble (J0 variable par état initial, T = 2)
+- **Périmètre retenu :** sur 23 exécutions symétriques uniques détectées (`runs/campagne_v2` et `runs/v2_*`, 3 doublons écartés), les 4 exécutions à `n_initial_states = 128` ont été exclues pour isoler une cohorte homogène de 19 exécutions (`n_initial_states = 512`, `eta = 0.25`, `transport_mode = symmetric`, `n_sites = 6`, `d_model = 64`, `gsa_layers = 2`, `beta_action = 1.0`, `lambda_geometry = 0.001`).
+- **Perte de validation (`best_val_loss`, moyenne sur les graines `s7`, `s17`, `s27`) :**
+  - `hybrid_concat (learned)` : 0.001746 (`s7` : 0.001803 ; `s17` : 0.001426 ; `s27` : 0.002008)
+  - `hybrid_concat (none)` : 0.001783 (`s7` : 0.001922 ; `s17` : 0.001584 ; `s27` : 0.001844)
+  - `hybrid_concat (fixed)` : 0.001822 (`s7` : 0.001858 ; `s17` : 0.001535 ; `s27` : 0.002074)
+  - `gsa_only (learned)` : 0.002398 (`s7` : 0.002231 ; `s17` : 0.002417 ; `s27` : 0.002547)
+  - `gsa_only (fixed)` : 0.002530 (`s7` : 0.002679 ; `s17` : 0.002438 ; `s27` : 0.002474)
+  - `hybrid_gated (learned)` : 0.002783 (`s7` uniquement)
+  - `lstm_only (none)` : 0.002847 (`s7` : 0.002594 ; `s17` : 0.003256 ; `s27` : 0.002690)
+- **Extraction des 192 coûts d'arêtes non orientées (`c_e = softplus(gsa.edge_costs.edge_logits) + 1e-4`, valeur initiale uniforme `ln(2) + 1e-4 = 0.693247`) :**
+  - `hybrid_concat (learned)` (`s17`, sélectionné par `best_val_loss = 0.001426` hors test) : min = 0.685554, moyenne = 0.693193, écart-type = 0.003428, max = 0.701439. Moyennes par site : S0 = 0.6930, S1 = 0.6933, S2 = 0.6935, S3 = 0.6933, S4 = 0.6928, S5 = 0.6932. Corrélations de Pearson inter-graines `(s7, s17, s27)` : `r(s7, s17) = 0.0667`, `r(s7, s27) = 0.0398`, `r(s17, s27) = 0.1302`.
+  - `gsa_only (learned)` (`s7`, `s17`, `s27`) :
+    - `s7` : min = 0.67711, moyenne = 0.69366, écart-type = 0.00604, max = 0.71019
+    - `s17` : min = 0.67718, moyenne = 0.69353, écart-type = 0.00671, max = 0.70952
+    - `s27` : min = 0.67869, moyenne = 0.69346, écart-type = 0.00682, max = 0.71820
+    - Corrélations de Pearson inter-graines `(s7, s17, s27)` : `r(s7, s17) = 0.0244`, `r(s7, s27) = -0.1318`, `r(s17, s27) = 0.0569` (moyenne = -0.0168).
+
+### B. Expérience de contrôle en paysage J0 fixé (régime trempé, T = 2)
+- **Protocole :** une seule matrice de couplage `J0` fixe gouverne l'ensemble des 512 états initiaux (`gsa_only`, `eta = 0.25`, graines `s7`, `s17`, `s27`).
+- **Résultats comparés :**
+  - `gsa_only_fixed` : `best_val_loss` moyen = 0.000141 | `Test Omega MSE` moyen = 0.000047 | cosinus moyen = 0.9956
+  - `gsa_only_learned` (`lambda_geometry = 1e-3`) : `best_val_loss` moyen = 0.000141 | `Test Omega MSE` moyen = 0.000047 | cosinus moyen = 0.9956
+    - `s7` : coûts dans [0.65578, 0.72850] (moyenne = 0.69335, écart-type = 0.01242)
+    - `s17` : coûts dans [0.65794, 0.72043] (moyenne = 0.69307, écart-type = 0.01093)
+    - `s27` : coûts dans [0.65766, 0.72200] (moyenne = 0.69325, écart-type = 0.00974)
+    - Corrélations inter-graines `edge_logits` : `r(s7, s17) = 0.1300`, `r(s7, s27) = 0.1269`, `r(s17, s27) = 0.1131` (moyenne = 0.1233)
+  - `gsa_only_learned` (`lambda_geometry = 1e-5`) : `best_val_loss` moyen = 0.000140 | `Test Omega MSE` moyen = 0.000046 | cosinus moyen = 0.9956
+    - `s7` : coûts dans [0.56595, 0.78000] (moyenne = 0.69030, écart-type = 0.03620)
+    - `s17` : coûts dans [0.58998, 0.79241] (moyenne = 0.68909, écart-type = 0.03605)
+    - `s27` : coûts dans [0.59537, 0.79191] (moyenne = 0.68989, écart-type = 0.03364)
+    - Corrélations inter-graines `edge_logits` : `r(s7, s17) = 0.2974`, `r(s7, s27) = 0.3469`, `r(s17, s27) = 0.3001` (moyenne = 0.3148)
+
+### C. Extension aux trajectoires longues (T = 3, L = 4) et diagnostics de Tolman (isochrone vs mixte T = 1 / T = 3) sur paysage J0 fixé
+- **Protocole :** même matrice `J0` fixe, 512 états initiaux (`25 600` paires : `10 240` permutations `(k, m, r)` vs `(r, m, k)` et `15 360` détours `(k, k, k)` vs `(m, k, m)`), avec contrôle d'échelle `gsa_only_fixed_scaled` (`beta_action = ln(2) + 1e-4 = 0.693247`).
+- **Résultats comparés (`s7`, `s17`, `s27`) :**
+  - `gsa_only_fixed` (`beta = 1.0`) : `best_val_loss` = 0.000176 | `Test MSE` global = 0.000093 (Perm : 0.000094 | Détours : 0.000092) | cosinus = 0.9986
+    - `s7` : `val` = 0.000177 | MSE (`all` = 0.000093, `perm` = 0.000093, `dét` = 0.000093)
+    - `s17` : `val` = 0.000179 | MSE (`all` = 0.000092, `perm` = 0.000091, `dét` = 0.000092)
+    - `s27` : `val` = 0.000173 | MSE (`all` = 0.000093, `perm` = 0.000098, `dét` = 0.000090)
+  - `gsa_only_fixed_scaled` (`beta = 0.693247`) : `best_val_loss` = 0.000183 | `Test MSE` global = 0.000097 (Perm : 0.000095 | Détours : 0.000097) | cosinus = 0.9985
+    - `s7` : `val` = 0.000180 | MSE (`all` = 0.000095, `perm` = 0.000091, `dét` = 0.000098)
+    - `s17` : `val` = 0.000181 | MSE (`all` = 0.000096, `perm` = 0.000096, `dét` = 0.000096)
+    - `s27` : `val` = 0.000186 | MSE (`all` = 0.000099, `perm` = 0.000099, `dét` = 0.000099)
+  - `gsa_only_learned` (`lambda_geometry = 1e-3`) : `best_val_loss` = 0.000182 | `Test MSE` global = 0.000095 (Perm : 0.000092 | Détours : 0.000097) | cosinus = 0.9985
+    - `s7` : `val` = 0.000188 | MSE (`all` = 0.000098, `perm` = 0.000092, `dét` = 0.000102) | coûts dans [0.66655, 0.72093] (`0.69334 ± 0.01045`)
+    - `s17` : `val` = 0.000173 | MSE (`all` = 0.000088, `perm` = 0.000086, `dét` = 0.000090) | coûts dans [0.66432, 0.71914] (`0.69337 ± 0.01011`)
+    - `s27` : `val` = 0.000186 | MSE (`all` = 0.000099, `perm` = 0.000099, `dét` = 0.000099) | coûts dans [0.67046, 0.71782] (`0.69317 ± 0.00851`)
+    - Corrélations inter-graines `edge_logits` : `r(s7, s17) = 0.2129`, `r(s7, s27) = 0.2459`, `r(s17, s27) = 0.0981` (moyenne = 0.1856)
+  - `gsa_only_learned` (`lambda_geometry = 1e-5`) : `best_val_loss` = 0.000176 | `Test MSE` global = 0.000092 (Perm : 0.000092 | Détours : 0.000093) | cosinus = 0.9986
+    - `s7` : `val` = 0.000180 | MSE (`all` = 0.000095, `perm` = 0.000093, `dét` = 0.000096) | coûts dans [0.53148, 0.82249] (`0.68430 ± 0.04974`)
+    - `s17` : `val` = 0.000167 | MSE (`all` = 0.000086, `perm` = 0.000084, `dét` = 0.000087) | coûts dans [0.53631, 0.77432] (`0.68735 ± 0.04767`)
+    - `s27` : `val` = 0.000180 | MSE (`all` = 0.000096, `perm` = 0.000099, `dét` = 0.000094) | coûts dans [0.55238, 0.79020] (`0.68420 ± 0.04441`)
+    - Corrélations inter-graines `edge_logits` : `r(s7, s17) = 0.5624`, `r(s7, s27) = 0.5893`, `r(s17, s27) = 0.4474` (moyenne = 0.5330)
+- **Diagnostic 1 — Détour de Tolman après entraînement isochrone `T = 3` uniquement (`diagnostic_tolman_t3.py`, 618 tâches de test, réf. uniforme : Top-1 = 20.0 %, Top-2 = 40.0 %, Rang = 3.00 / 5, Regret = 1.000) :**
+  - Sur l'holonomie isochrone `T = 3` (`(k, k, k)` vs `(m, k, m)`), la métrique apprise bat systématiquement le hasard uniforme :
+    - `seed_7` : Top-1 = 28.5 %, Top-2 = 50.3 %, Rang = 2.64 / 5, Spearman = +0.118, Regret = 0.739
+    - `seed_17` : Top-1 = 25.2 %, Top-2 = 45.8 %, Rang = 2.83 / 5, Spearman = +0.094, Regret = 0.865
+    - `seed_27` : Top-1 = 26.4 %, Top-2 = 43.2 %, Rang = 2.82 / 5, Spearman = +0.079, Regret = 0.834
+    - `ensemble_mean` : Top-1 = 26.9 %, Top-2 = 48.7 %, Rang = 2.71 / 5, Spearman = +0.115, Regret = 0.786 (-21.4 % de regret)
+  - Face à l'arête directe non amortie `(k,)`, la métrique isochrone ne bat pas le hasard (`ensemble_mean` : Top-1 = 18.0 %, Top-2 = 33.0 %, Rang = 3.25 / 5, Spearman = -0.048, Regret = 1.105 ; `seed_7` : Top-1 = 22.5 %, `seed_17` : Top-1 = 8.4 %, `seed_27` : Top-1 = 18.1 %) en raison de la contraction dissipative `(1 - eta)^3` propre aux triples retournements `(k, k, k)`.
+- **Diagnostic 2 — Détour de Tolman après entraînement mixte `(k,)` vs `(m, k, m)` et `(k, k, k)` vs `(m, k, m)` (`diagnostic_tolman_mixed_t1_t3.py`) :**
+  - Corrélations inter-graines `edge_logits` `(s7, s17, s27)` : `r(s7, s17) = 0.4963`, `r(s7, s27) = 0.4845`, `r(s17, s27) = 0.2514` (moyenne = 0.4107).
+  - **Résolution du contournement face à l'arête directe bloquée `(k,)` (618 tâches de test et 384 tâches sur les 64 sommets) :**
+    - `seed_7` : Test Top-1 = 30.9 %, Top-2 = 51.3 %, Rang = 2.61 / 5, Spearman = +0.199, Regret = 0.745 | 64 sommets : Top-1 = 28.6 %, Rang = 2.61 / 5, Spearman = +0.182
+    - `seed_17` : Test Top-1 = 22.3 %, Top-2 = 36.1 %, Rang = 3.12 / 5, Spearman = +0.040, Regret = 1.041 | 64 sommets : Top-1 = 20.3 %, Rang = 3.08 / 5, Spearman = +0.043
+    - `seed_27` : Test Top-1 = 28.6 %, Top-2 = 46.9 %, Rang = 2.84 / 5, Spearman = +0.095, Regret = 0.942 | 64 sommets : Top-1 = 27.6 %, Rang = 2.82 / 5, Spearman = +0.108
+    - `ensemble_mean` : Test **Top-1 = 34.0 %** (+16.0 pts vs entraînement `T = 3` seul), **Top-2 = 49.8 %**, **Rang = 2.71 / 5**, **Spearman = +0.166**, **Regret = 0.820** (-18.0 % de regret vs hasard) | 64 sommets complets : **Top-1 = 30.2 %**, **Rang = 2.74 / 5**, **Spearman = +0.164**
+  - **Préservation de la performance sur l'holonomie isochrone `(kkk vs mkm)` (618 tâches de test) :**
+    - `seed_7` : Top-1 = 27.3 %, Top-2 = 47.7 %, Rang = 2.69 / 5, Spearman = +0.081, Regret = 0.772
+    - `seed_17` : Top-1 = 29.0 %, Top-2 = 51.1 %, Rang = 2.67 / 5, Spearman = +0.063, Regret = 0.786
+    - `seed_27` : Top-1 = 19.7 %, Top-2 = 39.3 %, Rang = 2.97 / 5, Spearman = -0.042, Regret = 0.981
+    - `ensemble_mean` : **Top-1 = 27.2 %**, **Top-2 = 48.1 %**, **Rang = 2.71 / 5**, **Spearman = +0.035**, **Regret = 0.778** (-22.2 % de regret vs hasard)
+
+### D. Coûts d'arêtes conditionnés globaux c_theta(x, a | J0) en régime multi-J0 (paysages J0 variables)
+- **Protocole :** `lambda_geometry = 1e-5`, graines `s7`, `s17`, `s27` sur paysages `J0` aléatoires indépendants (`512` `J0` à `T = 2` ; `128` `J0` à `T = 3`).
+- **Régime multi-J0 à T = 2 (512 J0 distincts, 7 680 paires) :**
+  - `gsa_only_fixed` : `best_val_loss` = 0.007999 | `Test Omega MSE` = 0.003560 | `Test Term MSE` = 0.003776 | cosinus = 0.7176
+  - `gsa_only_fixed_scaled` : `best_val_loss` = 0.008026 | `Test Omega MSE` = 0.003559 | `Test Term MSE` = 0.003780 | cosinus = 0.7178
+  - `gsa_only_static_learned` : `best_val_loss` = 0.007994 | `Test Omega MSE` = 0.003547 | `Test Term MSE` = 0.003756 | cosinus = 0.7189 (corrélation inter-graines moyenne = 0.1835)
+  - `gsa_only_conditioned_j0` : `best_val_loss` = 0.007738 | `Test Omega MSE` = 0.003497 | `Test Term MSE` = 0.003560 | cosinus = 0.7267
+    - `s7` : `val` = 0.008976 | `test_omega_mse` = 0.003932 | coûts dans [0.2209, 3.8740] (`moy = 1.5052`, `std_intra_J0 = 0.5276`, `std_inter_J0 = 0.5289`)
+    - `s17` : `val` = 0.008345 | `test_omega_mse` = 0.003720 | coûts dans [0.2324, 3.1613] (`moy = 1.4113`, `std_intra_J0 = 0.4371`, `std_inter_J0 = 0.4307`)
+    - `s27` : `val` = 0.005894 | `test_omega_mse` = 0.002840 | coûts dans [0.2158, 3.6813] (`moy = 1.3408`, `std_intra_J0 = 0.4822`, `std_inter_J0 = 0.4768`)
+    - Corrélations inter-graines des coûts générés sur `J0` de test : `r(s7, s27) = +0.9033`, `r(s7, s17) = -0.8453`, `r(s17, s27) = -0.8227`.
+- **Régime multi-J0 à T = 3 (128 J0 distincts, 6 400 paires) :**
+  - `gsa_only_fixed` : `best_val_loss` = 0.063332 | `Test Omega MSE` = 0.037283 | `Test Term MSE` = 0.029332 | cosinus = 0.3912
+  - `gsa_only_fixed_scaled` : `best_val_loss` = 0.065335 | `Test Omega MSE` = 0.037663 | `Test Term MSE` = 0.030086 | cosinus = 0.3863
+  - `gsa_only_static_learned` : `best_val_loss` = 0.066070 | `Test Omega MSE` = 0.037407 | `Test Term MSE` = 0.029855 | cosinus = 0.3829
+  - `gsa_only_conditioned_j0` : `best_val_loss` = **0.057119** | `Test Omega MSE` = **0.034243** (**-8.2 %** vs `fixed`, **-9.1 %** vs `fixed_scaled`, gain sur 3/3 graines) | `Test Term MSE` = **0.026603** (**-9.3 %** vs `fixed`) | cosinus = **0.4386** (**+12.1 %** relatif)
+    - `s7` : `val` = 0.061007 | `test_omega_mse` = 0.035361 | coûts dans [0.0843, 2.1577] (`moy = 0.7468`, `std_intra_J0 = 0.2830`, `std_inter_J0 = 0.2875`)
+    - `s17` : `val` = 0.052961 | `test_omega_mse` = 0.031674 | coûts dans [0.0948, 2.7120] (`moy = 0.9420`, `std_intra_J0 = 0.3559`, `std_inter_J0 = 0.3640`)
+    - `s27` : `val` = 0.057390 | `test_omega_mse` = 0.035694 | coûts dans [0.1040, 2.2275] (`moy = 0.7023`, `std_intra_J0 = 0.2779`, `std_inter_J0 = 0.2470`)
+    - Corrélations inter-graines des coûts générés sur `J0` inédits : `r(s7, s17) = +0.5765`, `r(s7, s27) = +0.4391`, `r(s17, s27) = +0.5775` (moyenne = **+0.5310**).
+
+### E. Encodeur invariant local S_6 x Z_2 fondé sur (|h_k(x, J0)|, q_k(J0)) en régime multi-J0
+- **Protocole :** `InvariantFieldEdgeCosts` (337 paramètres partagés, entrée strictement invariante sous `S_6 x Z_2`), `lambda_geometry = 1e-5`, graines `s7`, `s17`, `s27`.
+- **Régime multi-J0 à T = 2 (512 J0 distincts, 7 680 paires) :**
+  - `best_val_loss` moy. = 0.008130 | `Test Omega MSE` = 0.003588 | `Test Term MSE` = 0.003848 | cosinus = 0.7135
+  - `s7` : `val` = 0.008416 | `test_omega_mse` = 0.003706 | coûts dans [0.6233, 0.7085] (`moy = 0.6588`, `std_intra_J0 = 0.0140`, `std_inter_J0 = 0.0144`)
+  - `s17` : `val` = 0.007894 | `test_omega_mse` = 0.003570 | coûts dans [0.1799, 0.9594] (`moy = 0.7135`, `std_intra_J0 = 0.1122`, `std_inter_J0 = 0.1324`)
+  - `s27` : `val` = 0.008079 | `test_omega_mse` = 0.003487 | coûts dans [0.1049, 0.8398] (`moy = 0.6117`, `std_intra_J0 = 0.1096`, `std_inter_J0 = 0.1306`)
+  - Corrélations inter-graines sur `J0` de test : `r(s17, s27) = +0.9988`, `r(s7, s17) = -0.6718`, `r(s7, s27) = -0.6635`.
+- **Régime multi-J0 à T = 3 (128 J0 distincts, 6 400 paires) :**
+  - `best_val_loss` moy. = 0.064818 | `Test Omega MSE` = 0.038020 | `Test Term MSE` = 0.030587 | cosinus = 0.3747
+  - `s7` : `val` = 0.066947 | `test_omega_mse` = 0.037748 | coûts dans [0.1236, 0.5900] (`moy = 0.4236`, `std_intra_J0 = 0.0808`, `std_inter_J0 = 0.0885`)
+  - `s17` : `val` = 0.061412 | `test_omega_mse` = 0.036864 | coûts dans [0.4696, 1.0042] (`moy = 0.5330`, `std_intra_J0 = 0.0534`, `std_inter_J0 = 0.0539`)
+  - `s27` : `val` = 0.066095 | `test_omega_mse` = 0.039446 | coûts dans [0.1226, 0.7015] (`moy = 0.5608`, `std_intra_J0 = 0.1018`, `std_inter_J0 = 0.1080`)
+  - Corrélations inter-graines sur `J0` de test : `r(s7, s27) = +0.9781`, `r(s7, s17) = -0.8022`, `r(s17, s27) = -0.9012`.
+
+## 2. Interprétation mécanistique
+- **Rectification du diagnostic géométrique :** l'ancien diagnostic fondé sur le Gramien de `gsa.x_proj.weight` mesurait la colinéarité de la projection linéaire d'entrée et non les distances géodésiques sur `{0,1}^6`.
+- **Rôle de l'invariance statistique :** lorsque chaque état initial tire une matrice `J0` aléatoire indépendante, l'ensemble d'entraînement est statistiquement invariant par permutation des 6 sites et retournement des spins ; une table de coûts statique `c_theta(x, a)` indépendante de `J0` converge donc vers la métrique uniforme de Hamming (`~ ln(2)`).
+- **Amplification de la convergence métrique avec T et compensation dissipative (Tolman mixte) :** en paysage `J0` fixé avec `lambda_geometry = 1e-5`, allonger les trajectoires de `T = 2` à `T = 3` fait passer la corrélation inter-graines des 192 coûts de `0.3148` à `0.5330` et réduit la MSE de test de `5.2 %` par rapport au témoin à échelle neutralisée `fixed_scaled` (`0.000097 -> 0.000092`). Sur le test de détour de Tolman, un entraînement purement isochrone (`T = 3`) ne compense pas l'amortissement dissipatif `(1 - eta)^3` face au saut direct `(k,)` (`Top-1 = 18.0 %`), mais un entraînement mixte `(k,)` vs `(m, k, m)` et `(k, k, k)` vs `(m, k, m)` lève cette limitation : la carte apprise atteint **Top-1 = 34.0 %** (+16.0 pts, regret réduit de 18.0 % sur les états de test et **30.2 %** sur les 64 sommets complets) tout en conservant **27.2 %** (regret -22.2 %) sur l'holonomie isochrone.
+- **Supériorité du conditionnement global `c_theta(x, a | J0)` sur le champ purement local `(|h_k|, q_k)` :**
+  1. L'encodeur invariant local (`InvariantFieldEdgeCosts`) établit que les graines convergent vers la même loi physique à un signe près (`|r| = 0.9988` à `T = 2` et `0.9781` à `T = 3`) : l'inversion de signe provient d'une symétrie de jauge interne entre le biais d'attention `-beta_action * S_obs` et la matrice de valeurs `W_V`, et non d'une brisure de symétrie `Z_2`.
+  2. La non-commutativité `Omega` sur `T >= 2` dépend des couplages croisés entre sites voisins de `J0` (évolution dynamique de `J_t` en cours de trajectoire), et pas uniquement du champ local statique `|h_k(x, J0)|`. C'est pourquoi l'encodeur conditionné global `ConditionedJ0EdgeCosts` surpasse à la fois la métrique fixe (`-8.2 %` sur `Omega MSE`, `-9.3 %` sur `Term MSE` à `T = 3`) et l'encodeur purement local (`0.034243` vs `0.038020`).
