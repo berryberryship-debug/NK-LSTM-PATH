@@ -73,7 +73,7 @@ def pas_fib(
     I: np.ndarray,
     B: np.ndarray,
     D_F: float
-):
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Mise à jour séquentielle F-I.
 
@@ -103,7 +103,7 @@ def trajectoire(
     L: int,
     D_F: float,
     temps: tuple
-):
+) -> dict:
     """Génère une trajectoire et conserve les états aux temps demandés."""
     if not temps:
         raise ValueError("La liste des temps ne peut pas être vide.")
@@ -350,7 +350,7 @@ def substitut_permutation(
     I: np.ndarray,
     B: np.ndarray,
     seed: int
-):
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Applique une même permutation spatiale aux trois champs.
 
@@ -442,7 +442,7 @@ def substitut_fourier(
     B: np.ndarray,
     seed: int,
     mode: str = "quantile"
-):
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Applique une phase commune à F et I.
 
@@ -551,7 +551,7 @@ def stats_apparie(
 def verif_substitution_fourier(
     L: int = 21,
     seed: int = 42
-):
+) -> None:
     """
     Vérifie numériquement les invariants Fourier sur des champs
     réels de test indépendants d'une trajectoire.
@@ -643,7 +643,7 @@ def verif_substitution_fourier(
 # Validation du Jacobien conditionnel
 # ---------------------------------------------------------------------
 
-def verif_jacobien():
+def verif_jacobien() -> None:
     """
     Compare le Jacobien analytique conditionnel à B fixé
     avec une approximation par différences finies centrées.
