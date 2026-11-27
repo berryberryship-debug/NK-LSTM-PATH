@@ -20,7 +20,7 @@
     - `s27` : min = 0.67869, moyenne = 0.69346, écart-type = 0.00682, max = 0.71820
     - Corrélations de Pearson inter-graines `(s7, s17, s27)` : `r(s7, s17) = 0.0244`, `r(s7, s27) = -0.1318`, `r(s17, s27) = 0.0569`.
 
-### B. Expérience de contrôle en paysage J0 fixé (régime trempé)
+### B. Expérience de contrôle en paysage J0 fixé (régime trempé, T = 2)
 - **Protocole :** une seule matrice de couplage `J0` fixe gouverne l'ensemble des 512 états initiaux (`gsa_only`, `eta = 0.25`, graines `s7`, `s17`, `s27`).
 - **Résultats comparés :**
   - `gsa_only_fixed` : `best_val_loss` moyen = 0.000141 | `Test Omega MSE` moyen = 0.000047 | cosinus moyen = 0.9956
@@ -35,11 +35,25 @@
     - `s27` : coûts dans [0.59537, 0.79191] (moyenne = 0.68989, écart-type = 0.03364)
     - Corrélations inter-graines `edge_logits` : `r(s7, s17) = 0.2974`, `r(s7, s27) = 0.3469`, `r(s17, s27) = 0.3001` (moyenne = 0.3148)
 
+### C. Extension aux trajectoires longues (T = 3, L = 4) sur paysage J0 fixé
+- **Protocole :** même matrice `J0` fixe, 512 états initiaux (`25 600` paires : `10 240` permutations `(k, m, r)` vs `(r, m, k)` et `15 360` détours `(k, k, k)` vs `(m, k, m)`), avec contrôle d'échelle `gsa_only_fixed_scaled` (`beta_action = ln(2) + 1e-4 = 0.693247`).
+- **Résultats comparés (`s7`, `s17`, `s27`) :**
+  - `gsa_only_fixed` (`beta = 1.0`) : `best_val_loss` = 0.000176 | `Test MSE` global = 0.000093 (Perm : 0.000094 | Détours : 0.000092) | cosinus = 0.9986
+  - `gsa_only_fixed_scaled` (`beta = 0.693247`) : `best_val_loss` = 0.000183 | `Test MSE` global = 0.000097 (Perm : 0.000095 | Détours : 0.000097) | cosinus = 0.9985
+  - `gsa_only_learned` (`lambda_geometry = 1e-3`) : `best_val_loss` = 0.000182 | `Test MSE` global = 0.000095 (Perm : 0.000092 | Détours : 0.000097) | cosinus = 0.9985
+    - Écart-type des coûts : `s7` = 0.01045, `s17` = 0.01011, `s27` = 0.00851
+    - Corrélations inter-graines `edge_logits` : `r(s7, s17) = 0.2129`, `r(s7, s27) = 0.2459`, `r(s17, s27) = 0.0981` (moyenne = 0.1856)
+  - `gsa_only_learned` (`lambda_geometry = 1e-5`) : `best_val_loss` = 0.000176 | `Test MSE` global = 0.000092 (Perm : 0.000092 | Détours : 0.000093) | cosinus = 0.9986
+    - `s7` : `val` = 0.000180 | MSE = 0.000095 (Perm : 0.000093, Dét : 0.000096) | coûts dans [0.53148, 0.82249] (`0.68430 ± 0.04974`)
+    - `s17` : `val` = 0.000167 | MSE = 0.000086 (Perm : 0.000084, Dét : 0.000087) | coûts dans [0.53631, 0.77432] (`0.68735 ± 0.04767`)
+    - `s27` : `val` = 0.000180 | MSE = 0.000096 (Perm : 0.000099, Dét : 0.000094) | coûts dans [0.55238, 0.79020] (`0.68420 ± 0.04441`)
+    - Corrélations inter-graines `edge_logits` : `r(s7, s17) = 0.5624`, `r(s7, s27) = 0.5893`, `r(s17, s27) = 0.4474` (moyenne = 0.5330)
+
 ## 2. Interprétation mécanistique
 - **Rectification du diagnostic géométrique :** l'ancien diagnostic fondé sur le Gramien de `gsa.x_proj.weight` reflétait la colinéarité de la projection linéaire d'entrée et non les distances géodésiques sur l'hypercube `{0,1}^6`.
 - **Rôle de l'invariance statistique :** lorsque chaque état initial tire une matrice `J0` aléatoire indépendante, l'ensemble d'entraînement est statistiquement invariant par permutation des 6 sites et retournement des spins ; une table de coûts statique `c_theta(x, a)` indépendante de `J0` converge donc vers la métrique uniforme de Hamming (`~ ln(2)`).
-- **Émergence d'une topographie reproductible :** lorsque la symétrie est brisée par un paysage `J0` fixe et que le rappel L2 est abaissé (`lambda_geometry = 1e-5`), les 192 coûts d'arêtes se différencient (`± 18 %`) et deviennent positivement corrélés entre graines (`r moyen = 0.3148`), bien que la précision prédictive à longueur `T = 2` soit déjà saturée par la métrique fixe (`Test Omega MSE = 0.000047`).
+- **Amplification de la convergence métrique avec T :** en paysage `J0` fixé avec `lambda_geometry = 1e-5`, allonger les trajectoires de `T = 2` à `T = 3` fait passer la corrélation inter-graines des 192 coûts de `0.3148` à `0.5330` et réduit la MSE de test de `5.2 %` par rapport au témoin à échelle neutralisée `fixed_scaled` (`0.000097 -> 0.000092`), bien que `fixed` brut (`beta = 1.0`, `0.000093`) reste très proche grâce au couplage fort du biais temporel.
 
 ## 3. Hypothèses pour l'étape suivante
-1. **Trajectoires longues (`T >= 3`) sur paysage `J0` fixé :** tester si les coûts d'arêtes appris `c_theta(x, a)` améliorent directement l'erreur prédictive par rapport à `fixed` lorsque plusieurs chemins distincts relient les mêmes états extrêmes avec des actions cumulées différentes.
-2. **Coûts conditionnés `c_theta(x, a | J0)` en régime multi-`J0` :** remplacer la table statique `UndirectedPositiveEdgeCosts` par un champ de coûts dépendant explicitement de `J0` afin de conserver la différenciation topographique lorsque `J0` varie d'un échantillon à l'autre.
+1. **Test du détour géodésique (Tolman) sur T = 3 :** vérifier si les 192 coûts appris (`r moyen = 0.5330`) sélectionnent effectivement le contournement `(m, k, m)` de plus faible résistance physique lors du blocage de l'arête directe `k`, ou tester `T = 4` pour observer si l'écart prédictif face à `fixed` brut se creuse.
+2. **Coûts conditionnés `c_theta(x, a | J0)` en régime multi-`J0` :** remplacer la table statique `UndirectedPositiveEdgeCosts` par un champ de coûts dépendant explicitement de `J0` afin de transposer cette reproductibilité géométrique au régime d'ensemble.
