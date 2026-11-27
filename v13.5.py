@@ -2,52 +2,22 @@
 V13.5 — Rapport de participation spatiale (PR) des modes singuliers
 du Jacobien tangentiel conditionnel J_{FI|B}.
 
-Cadre méthodologique
---------------------
-1. Jacobien :
-   J_{FI|B} = d(F_{t+1}, I_{t+1}) / d(F_t, I_t), avec B_t fixé.
+Le Jacobien est calculé avec B_t fixé pendant la différentiation.
+Il ne s'agit pas du Jacobien de l'application hybride complète F-I-B.
 
-2. Contrôle Fourier :
-   - multiplicateur unimodulaire |phi(k)| = 1 ;
-   - symétrie hermitienne à la précision flottante ;
-   - phase commune appliquée à F et I ;
-   - conservation analytique des spectres individuels,
-     du spectre croisé complexe et des normes ;
-   - reconstruction de B par conservation exacte de sa densité
-     en mode quantile.
+Conditions comparées :
+  - dyn      : état issu de la trajectoire F-I-B ;
+  - fourier  : phase commune appliquée à F et I, puis reconstruction de B ;
+  - perm     : permutation spatiale commune de F, I et B.
 
-3. Hiérarchie des contrôles :
-   Dynamique -> Substitut Fourier -> Permutation.
+Les contrôles Fourier conservent analytiquement les modules spectraux
+individuels de F et I, leur spectre croisé complexe, leurs normes et
+leurs moyennes (phase DC fixée à 1), sous réserve des erreurs flottantes.
 
-4. Analyse spectrale :
-   - SVD dense de référence ;
-   - SVD creuse partielle à titre exploratoire ;
-   - repli dense en cas d'échec de la résolution creuse.
+Le contrôle permutation conserve les valeurs et associations ponctuelles
+des champs, mais réarrange leur disposition par rapport au Laplacien.
 
-5. Statistiques :
-   - différences appariées par graine ;
-   - bootstrap percentile descriptif ;
-   - d_z descriptif.
-
-Périmètre d'interprétation
---------------------------
-Le contraste dynamique - Fourier mesure une différence de participation
-spatiale entre la dynamique et un contrôle conservant les invariants
-spectraux de F et I.
-
-Il ne permet pas, à lui seul, d'attribuer cette différence exclusivement
-à des corrélations d'ordre supérieur : la reconstruction de B et son
-couplage au Jacobien contribuent également au contraste.
-
-Le Jacobien étudié est conditionnel à B fixé. Il ne représente pas
-le Jacobien classique de l'application hybride complète F-I-B.
-
-Usage
------
-python v13_5_holographie_PR.py --verif
-python v13_5_holographie_PR.py --L 21 --seeds 10
-python v13_5_holographie_PR.py --L 21 --seeds 10 --sparse
-python v13_5_holographie_PR.py --L 21 --seeds 10 --B-mode theta
+Les statistiques sont calculées sur les différences appariées entre graines.
 """
 
 import argparse
@@ -78,6 +48,10 @@ BOOTSTRAP_SEED = 7
 FOURIER_SEED_OFFSET = 2000
 PERMUTATION_SEED_OFFSET = 1000
 
+KAPPA_SMIN_THRESHOLD = 1e-12
+VERIFY_TOL = 1e-10
+JACOBIAN_VERIFY_TOL = 1e-6
+
 
 # ---------------------------------------------------------------------
 # Modèle dynamique
@@ -101,11 +75,11 @@ def pas_fib(
     D_F: float
 ):
     """
-    Mise à jour séquentielle du système F-I-B.
+    Mise à jour séquentielle F-I.
 
     F_{t+1} est calculé en premier.
     I_{t+1} dépend ensuite de F_{t+1}.
-    B_{t+1} est actualisé dans trajectoire().
+    B est maintenu fixe dans cette fonction.
     """
     Q = 2.0 * B - 1.0
 
@@ -138,22 +112,15 @@ def trajectoire(
 
     I = rng.uniform(-0.2, 0.2, (L, L))
     F = np.zeros((L, L), dtype=np.float64)
-
     B = rng.integers(0, 2, (L, L)).astype(np.float64)
 
     temps_demandes = set(temps)
     t_max = max(temps)
-
     out = {}
 
     for t in range(t_max + 1):
-
         if t in temps_demandes:
-            out[t] = (
-                F.copy(),
-                I.copy(),
-                B.copy()
-            )
+            out[t] = (F.copy(), I.copy(), B.copy())
 
         F, I = pas_fib(F, I, B, D_F)
 
@@ -170,31 +137,24 @@ def trajectoire(
 
 def matrice_laplacienne(L: int) -> sp.csr_matrix:
     """Construit le Laplacien périodique 2D sous forme creuse CSR."""
+    if L < 2:
+        raise ValueError("L doit être supérieur ou égal à 2.")
+
     N = L * L
     idx = np.arange(N).reshape(L, L)
 
     rows = []
     cols = []
 
-    for shift in (
-        (1, 0),
-        (-1, 0),
-        (0, 1),
-        (0, -1)
-    ):
+    for shift in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         rows.append(idx.ravel())
-        cols.append(
-            np.roll(idx, shift, axis=(0, 1)).ravel()
-        )
+        cols.append(np.roll(idx, shift, axis=(0, 1)).ravel())
 
     r = np.concatenate(rows)
     c = np.concatenate(cols)
 
     Lp = sp.coo_matrix(
-        (
-            np.ones(len(r), dtype=np.float64),
-            (r, c)
-        ),
+        (np.ones(len(r), dtype=np.float64), (r, c)),
         shape=(N, N)
     ).tocsr()
 
@@ -219,23 +179,12 @@ def jacobien_conditionnel_B(
     Lp: sp.csr_matrix
 ) -> sp.csr_matrix:
     """
-    Jacobien tangentiel conditionnel :
-
-        J_{FI|B} = d(F_{t+1}, I_{t+1}) / d(F_t, I_t)
-
-    B_t est maintenu fixé pendant la différentiation.
-
-    Ce Jacobien décrit la branche locale du système correspondant
-    à une configuration donnée de B_t. Il ne représente pas le
-    Jacobien classique de l'application hybride complète F-I-B.
+    Jacobien J_{FI|B} = d(F_{t+1}, I_{t+1})/d(F_t, I_t),
+    avec B_t maintenu fixe pendant la différentiation.
     """
     N = F.size
 
-    Id = sp.identity(
-        N,
-        format="csr",
-        dtype=np.float64
-    )
+    Id = sp.identity(N, format="csr", dtype=np.float64)
 
     a = (
         I
@@ -254,22 +203,12 @@ def jacobien_conditionnel_B(
         - GAMMA * (I ** 3)
     )
 
-    # Dérivée de tanh(x) :
-    # sech²(x) = 1 - tanh²(x).
-    # Cette écriture évite les débordements éventuels de cosh(x).
-
     sa_values = 1.0 - np.tanh(a) ** 2
     sb_values = 1.0 - np.tanh(b) ** 2
 
-    sa = sp.diags(
-        sa_values.ravel(),
-        format="csr"
-    )
-
-    sb = sp.diags(
-        sb_values.ravel(),
-        format="csr"
-    )
+    sa = sp.diags(sa_values.ravel(), format="csr")
+    sb = sp.diags(sb_values.ravel(), format="csr")
+    dI2 = sp.diags((I ** 2).ravel(), format="csr")
 
     dFF = (
         (1.0 - ALPHA) * Id
@@ -278,28 +217,18 @@ def jacobien_conditionnel_B(
 
     dFI = ALPHA * sa
 
+    # Chaîne F_t -> F_{t+1} -> I_{t+1}.
     dIF = BETA * (sb @ dFF)
 
     dII = (
         (1.0 - BETA) * Id
-        + BETA * (
-            sb @ (
-                dFI
-                + D_I * Lp
-                - 3.0 * GAMMA
-                * sp.diags(
-                    (I ** 2).ravel(),
-                    format="csr"
-                )
-            )
+        + BETA * sb @ (
+            dFI + D_I * Lp - 3.0 * GAMMA * dI2
         )
     )
 
     return sp.bmat(
-        [
-            [dFF, dFI],
-            [dIF, dII]
-        ],
+        [[dFF, dFI], [dIF, dII]],
         format="csr"
     )
 
@@ -310,12 +239,10 @@ def jacobien_conditionnel_B(
 
 def pr(w: np.ndarray) -> float:
     """
-    Participation ratio :
+    PR(w) = (sum_i w_i)^2 / sum_i(w_i^2).
 
-        PR(w) = (sum_i w_i)^2 / sum_i(w_i^2)
-
-    La mesure est comprise entre 1 et le nombre de sites,
-    pour des poids non négatifs non tous nuls.
+    Pour des poids non négatifs non tous nuls, PR est compris
+    entre 1 et le nombre de composantes spatiales.
     """
     s1 = float(np.sum(w))
     s2 = float(np.sum(w ** 2))
@@ -333,13 +260,8 @@ def mesures_PR(
     use_sparse: bool = False
 ) -> dict:
     """
-    Mesure le PR spatial des modes singuliers dominants et contractés.
-
-    Pour chaque vecteur singulier droit v, le poids spatial au site i est :
-
-        w_i = v_F,i² + v_I,i²
-
-    Le PR est ensuite normalisé par N, le nombre de sites.
+    Mesure le PR spatial des vecteurs singuliers droits dominants
+    et associés aux plus petites valeurs singulières.
     """
     dim = 2 * N
 
@@ -355,41 +277,32 @@ def mesures_PR(
     def decomposition_dense():
         _, s, Vt = la.svd(
             J.toarray(),
-            full_matrices=False
+            full_matrices=False,
+            check_finite=True
         )
 
         Vt_top = Vt[:n_modes]
         Vt_bot = Vt[::-1][:n_modes]
 
-        return (
-            Vt_top,
-            Vt_bot,
-            float(s[0]),
-            float(s[-1])
-        )
+        return Vt_top, Vt_bot, float(s[0]), float(s[-1])
 
-    # Référence dense ou cas où la SVD partielle n'est pas applicable.
-    if (
-        not use_sparse
-        or dim <= 2 * n_modes + 2
-    ):
+    # Dense de référence ou dimension trop petite pour svds.
+    if not use_sparse or dim <= 2 * n_modes + 2:
         Vt_top, Vt_bot, s_max, s_min = decomposition_dense()
 
     else:
         try:
-            # Modes dominants : plus grandes valeurs singulières.
+            # Plus grandes valeurs singulières.
             _, s_hi, Vt_hi = spla.svds(
                 J,
                 k=n_modes,
                 which="LM"
             )
-
             idx_hi = np.argsort(s_hi)[::-1]
-
             Vt_top = Vt_hi[idx_hi]
             s_max = float(s_hi[idx_hi[0]])
 
-            # Modes contractés : plus petites valeurs singulières.
+            # Plus petites valeurs singulières.
             _, s_lo, Vt_lo = spla.svds(
                 J,
                 k=n_modes,
@@ -397,31 +310,18 @@ def mesures_PR(
                 tol=1e-5,
                 maxiter=dim * 10
             )
-
             idx_lo = np.argsort(s_lo)
-
             Vt_bot = Vt_lo[idx_lo]
             s_min = float(s_lo[idx_lo[0]])
 
-        except (
-            spla.ArpackNoConvergence,
-            spla.ArpackError
-        ):
-            # Repli dense : résultat de référence si le calcul
-            # creux partiel ne converge pas.
+        except (spla.ArpackNoConvergence, spla.ArpackError):
+            # Repli dense uniquement pour les exceptions ARPACK interceptées.
             Vt_top, Vt_bot, s_max, s_min = decomposition_dense()
 
-    hi_pr = [
-        pr(poids_spatial(v))
-        for v in Vt_top
-    ]
+    hi_pr = [pr(poids_spatial(v)) for v in Vt_top]
+    lo_pr = [pr(poids_spatial(v)) for v in Vt_bot]
 
-    lo_pr = [
-        pr(poids_spatial(v))
-        for v in Vt_bot
-    ]
-
-    if s_min > 1e-12:
+    if s_min > KAPPA_SMIN_THRESHOLD:
         kappa = s_max / s_min
     else:
         kappa = np.inf
@@ -454,12 +354,11 @@ def substitut_permutation(
     """
     Applique une même permutation spatiale aux trois champs.
 
-    Cette opération conserve les valeurs des champs et leurs
-    associations locales entre F, I et B, mais détruit leur
-    organisation spatiale sur le réseau.
+    Les valeurs et associations ponctuelles F-I-B sont conservées.
+    La disposition sur le réseau est réarrangée, ce qui modifie
+    les relations de voisinage relativement au Laplacien périodique.
     """
     rng = np.random.default_rng(seed)
-
     p = rng.permutation(F.size)
 
     return tuple(
@@ -477,34 +376,20 @@ def multiplicateur_hermitien(
     seed: int
 ) -> np.ndarray:
     """
-    Construit un multiplicateur de phase tel que :
+    Construit phi avec |phi(k)|=1 et phi(-k)=conj(phi(k)).
 
-        |phi(k)| = 1
-
-        phi(-k) = conj(phi(k))
-
-    La symétrie est satisfaite à la précision flottante.
-
-    Le coefficient DC est fixé à 1 afin de préserver la composante
-    moyenne des champs.
+    La phase DC est fixée à 1 afin de préserver les moyennes.
     """
     rng = np.random.default_rng(seed)
-
     w = rng.standard_normal((L, L))
 
     W = np.fft.fft2(w)
     mag = np.abs(W)
 
-    phi = np.ones_like(
-        W,
-        dtype=np.complex128
-    )
-
+    phi = np.ones_like(W, dtype=np.complex128)
     mask = mag >= 1e-15
-
     phi[mask] = W[mask] / mag[mask]
 
-    # Composante continue : phase nulle.
     phi[0, 0] = 1.0 + 0.0j
 
     return phi
@@ -516,47 +401,32 @@ def multiplicateur_hermitien(
 
 def reconstruire_B_quantile(
     S: np.ndarray,
-    densite_cible: float
+    n_actifs: int
 ) -> np.ndarray:
     """
-    Reconstruit un champ binaire ayant exactement le même nombre
-    de sites actifs que la densité cible.
+    Reconstruit B avec exactement n_actifs sites actifs.
 
-    Le tri stable garantit un résultat déterministe en présence
-    de valeurs ex æquo.
+    Les valeurs les plus élevées de S sont sélectionnées.
+    Le tri stable rend la sélection déterministe en cas d'égalité.
     """
     N = S.size
 
-    n_actifs = int(
-        round(densite_cible * N)
-    )
+    if not isinstance(n_actifs, (int, np.integer)):
+        raise TypeError("n_actifs doit être un entier.")
 
-    n_actifs = max(
-        0,
-        min(N, n_actifs)
-    )
+    if not 0 <= n_actifs <= N:
+        raise ValueError("n_actifs doit être compris entre 0 et N.")
 
-    B_flat = np.zeros(
-        N,
-        dtype=np.float64
-    )
+    B_flat = np.zeros(N, dtype=np.float64)
 
     if n_actifs == 0:
         return B_flat.reshape(S.shape)
 
     if n_actifs == N:
-        return np.ones(
-            S.shape,
-            dtype=np.float64
-        )
+        return np.ones(S.shape, dtype=np.float64)
 
-    ordre = np.argsort(
-        S.ravel(),
-        kind="stable"
-    )
-
+    ordre = np.argsort(S.ravel(), kind="stable")
     indices_actifs = ordre[-n_actifs:]
-
     B_flat[indices_actifs] = 1.0
 
     return B_flat.reshape(S.shape)
@@ -574,58 +444,43 @@ def substitut_fourier(
     mode: str = "quantile"
 ):
     """
-    Applique une phase commune aux spectres de F et I.
+    Applique une phase commune à F et I.
 
-    Conservation analytique :
-        |F_hat_sur| = |F_hat|
-        |I_hat_sur| = |I_hat|
-        F_hat_sur * conj(I_hat_sur)
-            = F_hat * conj(I_hat)
-
-    B est ensuite reconstruit :
-        - mode quantile : densité exactement conservée ;
-        - mode theta : seuil fixe appliqué au champ transformé.
+    Le mode quantile conserve exactement le nombre de sites actifs de B.
+    Le mode theta applique le seuil fixe SEUIL ; la densité peut varier.
     """
-    L = F.shape[0]
+    if F.shape != I.shape or F.shape != B.shape:
+        raise ValueError("F, I et B doivent avoir la même forme.")
 
-    phi = multiplicateur_hermitien(
-        L,
-        seed
-    )
+    if F.ndim != 2 or F.shape[0] != F.shape[1]:
+        raise ValueError("Les champs doivent être des matrices carrées.")
+
+    L = F.shape[0]
+    phi = multiplicateur_hermitien(L, seed)
 
     F_hat = np.fft.fft2(F)
     I_hat = np.fft.fft2(I)
 
-    F_hat_sur = F_hat * phi
-    I_hat_sur = I_hat * phi
+    Fs_complex = np.fft.ifft2(F_hat * phi)
+    Is_complex = np.fft.ifft2(I_hat * phi)
 
-    # IFFT complexe conservée temporairement pour mesurer
-    # le résidu imaginaire avant extraction de la partie réelle.
-    Fs_complex = np.fft.ifft2(F_hat_sur)
-    Is_complex = np.fft.ifft2(I_hat_sur)
-
+    # Les résidus imaginaires sont contrôlés séparément par --verif.
     Fs = Fs_complex.real
     Is = Is_complex.real
 
     S_sur = Fs + 0.5 * Is
 
     if mode == "theta":
-
-        Bs = (
-            S_sur - SEUIL > 0.0
-        ).astype(np.float64)
+        Bs = (S_sur - SEUIL > 0.0).astype(np.float64)
 
     elif mode == "quantile":
-
         Bs = reconstruire_B_quantile(
             S_sur,
-            float(B.mean())
+            int(np.count_nonzero(B))
         )
 
     else:
-        raise ValueError(
-            f"Mode B inconnu : {mode}"
-        )
+        raise ValueError(f"Mode B inconnu : {mode}")
 
     return Fs, Is, Bs
 
@@ -640,19 +495,12 @@ def stats_apparie(
     seed: int = BOOTSTRAP_SEED
 ) -> dict:
     """
-    Bootstrap percentile descriptif sur les différences appariées
-    entre graines.
+    Bootstrap percentile sur les différences appariées entre graines.
 
-    Les unités statistiques sont les graines, et non les sites
-    individuels du réseau.
+    Les unités statistiques sont les graines, pas les sites du réseau.
     """
-    x = np.asarray(
-        diff,
-        dtype=np.float64
-    )
-
+    x = np.asarray(diff, dtype=np.float64)
     x = x[np.isfinite(x)]
-
     n = len(x)
 
     if n < 2:
@@ -667,24 +515,13 @@ def stats_apparie(
         }
 
     if n_boot < 1:
-        raise ValueError(
-            "n_boot doit être supérieur ou égal à 1."
-        )
+        raise ValueError("n_boot doit être supérieur ou égal à 1.")
 
     rng = np.random.default_rng(seed)
-
-    idx = rng.integers(
-        0,
-        n,
-        size=(n_boot, n)
-    )
-
+    idx = rng.integers(0, n, size=(n_boot, n))
     boot_means = x[idx].mean(axis=1)
 
-    lo, hi = np.quantile(
-        boot_means,
-        [0.025, 0.975]
-    )
+    lo, hi = np.quantile(boot_means, [0.025, 0.975])
 
     sd = float(x.std(ddof=1))
     mean = float(x.mean())
@@ -708,7 +545,7 @@ def stats_apparie(
 
 
 # ---------------------------------------------------------------------
-# Diagnostics Fourier
+# Diagnostics Fourier avec critères de réussite
 # ---------------------------------------------------------------------
 
 def verif_substitution_fourier(
@@ -716,163 +553,89 @@ def verif_substitution_fourier(
     seed: int = 42
 ):
     """
-    Vérifie :
-      1. l'unimodularité de phi ;
-      2. sa symétrie hermitienne ;
-      3. le résidu imaginaire des IFFT ;
-      4. les spectres individuels ;
-      5. le spectre croisé complexe ;
-      6. les normes spatiales.
+    Vérifie numériquement les invariants Fourier sur des champs
+    réels de test indépendants d'une trajectoire.
     """
     print("=== Validation numérique du contrôle Fourier ===")
 
-    phi = multiplicateur_hermitien(
-        L,
-        seed
-    )
+    phi = multiplicateur_hermitien(L, seed)
 
-    # 1. Unimodularité.
-    ecart_unimod = np.max(
-        np.abs(np.abs(phi) - 1.0)
-    )
+    ecart_unimod = float(np.max(np.abs(np.abs(phi) - 1.0)))
 
-    print(
-        "Écart max à l'unimodularité ||phi| - 1|       : "
-        f"{ecart_unimod:.2e}"
-    )
+    idx0 = np.arange(L)[:, None]
+    idx1 = np.arange(L)[None, :]
+    phi_neg = phi[(-idx0) % L, (-idx1) % L]
+    err_herm = float(np.max(np.abs(phi_neg - np.conj(phi))))
 
-    # 2. Symétrie hermitienne.
-    idx = (
-        np.arange(L)[:, None],
-        np.arange(L)[None, :]
-    )
-
-    idx_neg = (
-        (-idx[0]) % L,
-        (-idx[1]) % L
-    )
-
-    phi_neg = phi[idx_neg]
-
-    err_herm = np.max(
-        np.abs(phi_neg - np.conj(phi))
-    )
-
-    print(
-        "Écart max symétrie hermitienne                : "
-        f"{err_herm:.2e}"
-    )
-
-    # 3. Champs tests réels.
     rng = np.random.default_rng(seed)
-
     F = rng.standard_normal((L, L))
     I = rng.standard_normal((L, L))
 
     F_hat = np.fft.fft2(F)
     I_hat = np.fft.fft2(I)
-
     cross_orig = F_hat * np.conj(I_hat)
 
-    # 4. Transformation.
-    Fs_hat = F_hat * phi
-    Is_hat = I_hat * phi
+    Fs_complex = np.fft.ifft2(F_hat * phi)
+    Is_complex = np.fft.ifft2(I_hat * phi)
 
-    Fs_complex = np.fft.ifft2(Fs_hat)
-    Is_complex = np.fft.ifft2(Is_hat)
-
-    err_imag_F = np.max(
-        np.abs(Fs_complex.imag)
-    )
-
-    err_imag_I = np.max(
-        np.abs(Is_complex.imag)
-    )
+    err_imag_F = float(np.max(np.abs(Fs_complex.imag)))
+    err_imag_I = float(np.max(np.abs(Is_complex.imag)))
 
     Fs = Fs_complex.real
     Is = Is_complex.real
 
-    print(
-        "Résidu imaginaire IFFT(F)                    : "
-        f"{err_imag_F:.2e}"
-    )
+    Fs_hat_recon = np.fft.fft2(Fs)
+    Is_hat_recon = np.fft.fft2(Is)
 
-    print(
-        "Résidu imaginaire IFFT(I)                    : "
-        f"{err_imag_I:.2e}"
-    )
+    cross_sur = Fs_hat_recon * np.conj(Is_hat_recon)
 
-    # 5. Recalcul des spectres après reconstruction réelle.
-    Fs_hat_reconstruit = np.fft.fft2(Fs)
-    Is_hat_reconstruit = np.fft.fft2(Is)
+    err_mod_F = float(np.max(np.abs(np.abs(Fs_hat_recon) - np.abs(F_hat))))
+    err_mod_I = float(np.max(np.abs(np.abs(Is_hat_recon) - np.abs(I_hat))))
+    err_cross = float(np.max(np.abs(cross_sur - cross_orig)))
 
-    cross_sur = (
-        Fs_hat_reconstruit
-        * np.conj(Is_hat_reconstruit)
-    )
+    err_norm_F = float(abs(np.linalg.norm(Fs) - np.linalg.norm(F)))
+    err_norm_I = float(abs(np.linalg.norm(Is) - np.linalg.norm(I)))
 
-    err_mod_F = np.max(
-        np.abs(
-            np.abs(Fs_hat_reconstruit)
-            - np.abs(F_hat)
+    err_mean_F = float(abs(Fs.mean() - F.mean()))
+    err_mean_I = float(abs(Is.mean() - I.mean()))
+
+    diagnostics = {
+        "unimodularite": ecart_unimod,
+        "symetrie_hermitienne": err_herm,
+        "residu_imaginaire_F": err_imag_F,
+        "residu_imaginaire_I": err_imag_I,
+        "modules_spectraux_F": err_mod_F,
+        "modules_spectraux_I": err_mod_I,
+        "spectre_croise_complexe": err_cross,
+        "norme_F": err_norm_F,
+        "norme_I": err_norm_I,
+        "moyenne_F": err_mean_F,
+        "moyenne_I": err_mean_I
+    }
+
+    for name, value in diagnostics.items():
+        print(f"{name:<32}: {value:.3e}")
+
+    failed = {
+        name: value
+        for name, value in diagnostics.items()
+        if value > VERIFY_TOL
+    }
+
+    if failed:
+        details = ", ".join(
+            f"{name}={value:.3e}"
+            for name, value in failed.items()
         )
-    )
-
-    err_mod_I = np.max(
-        np.abs(
-            np.abs(Is_hat_reconstruit)
-            - np.abs(I_hat)
+        raise RuntimeError(
+            "Échec du contrôle Fourier (tolérance "
+            f"{VERIFY_TOL:.1e}) : {details}"
         )
-    )
 
-    err_cross = np.max(
-        np.abs(cross_sur - cross_orig)
-    )
-
+    print("Résultat : contrôles Fourier réussis sur les champs de test.")
     print(
-        "Conservation |F_hat|                         : "
-        f"{err_mod_F:.2e}"
-    )
-
-    print(
-        "Conservation |I_hat|                         : "
-        f"{err_mod_I:.2e}"
-    )
-
-    print(
-        "Conservation spectre croisé complexe         : "
-        f"{err_cross:.2e}"
-    )
-
-    # 6. Conservation des normes spatiales.
-    norm_F_orig = np.linalg.norm(F)
-    norm_F_sur = np.linalg.norm(Fs)
-
-    norm_I_orig = np.linalg.norm(I)
-    norm_I_sur = np.linalg.norm(Is)
-
-    err_norm_F = abs(
-        norm_F_sur - norm_F_orig
-    )
-
-    err_norm_I = abs(
-        norm_I_sur - norm_I_orig
-    )
-
-    print(
-        "Conservation norme spatiale F                : "
-        f"{err_norm_F:.2e}"
-    )
-
-    print(
-        "Conservation norme spatiale I                : "
-        f"{err_norm_I:.2e}"
-    )
-
-    print(
-        "\nCes écarts sont des diagnostics numériques ; "
-        "ils ne remplacent pas la vérification des résultats "
-        "sur les trajectoires réelles."
+        "Note : ces diagnostics ne remplacent pas la vérification "
+        "des résultats d'une campagne sur trajectoires."
     )
 
 
@@ -887,47 +650,22 @@ def verif_jacobien():
     """
     L = 7
     N = L * L
-
     rng = np.random.default_rng(42)
 
-    F = rng.uniform(
-        -0.5,
-        0.5,
-        (L, L)
-    )
-
-    I = rng.uniform(
-        -0.5,
-        0.5,
-        (L, L)
-    )
-
-    B = (
-        F + 0.5 * I > SEUIL
-    ).astype(np.float64)
+    F = rng.uniform(-0.5, 0.5, (L, L))
+    I = rng.uniform(-0.5, 0.5, (L, L))
+    B = (F + 0.5 * I > SEUIL).astype(np.float64)
 
     Lp = matrice_laplacienne(L)
 
-    print(
-        "\n=== Validation du Jacobien conditionnel "
-        "J_{FI|B} ==="
-    )
-
-    print(
-        "Comparaison analytique / différences finies centrées"
-    )
+    print("\n=== Validation du Jacobien conditionnel J_{FI|B} ===")
+    print("Comparaison analytique / différences finies centrées")
 
     for D_F in (0.0, 0.1, 0.4):
-
-        Jf = np.zeros(
-            (2 * N, 2 * N),
-            dtype=np.float64
-        )
-
+        Jf = np.zeros((2 * N, 2 * N), dtype=np.float64)
         eps = 1e-7
 
         for c in range(2 * N):
-
             dF = np.zeros(N)
             dI = np.zeros(N)
 
@@ -950,57 +688,44 @@ def verif_jacobien():
                 D_F
             )
 
-            Jf[:, c] = (
-                np.concatenate([
-                    (Fp - Fm).ravel(),
-                    (Ip - Im).ravel()
-                ])
-                / (2.0 * eps)
-            )
+            Jf[:, c] = np.concatenate([
+                (Fp - Fm).ravel(),
+                (Ip - Im).ravel()
+            ]) / (2.0 * eps)
 
         Ja = jacobien_conditionnel_B(
-            F,
-            I,
-            B,
-            D_F,
-            Lp
+            F, I, B, D_F, Lp
         ).toarray()
 
-        denominateur = np.linalg.norm(
-            Jf,
-            ord="fro"
-        )
-
+        denominateur = np.linalg.norm(Jf, ord="fro")
         if denominateur <= 0.0:
-            raise RuntimeError(
-                "Norme du Jacobien numérique nulle."
-            )
+            raise RuntimeError("Norme du Jacobien numérique nulle.")
 
-        err = (
-            np.linalg.norm(
-                Ja - Jf,
-                ord="fro"
-            )
-            / denominateur
+        err = float(
+            np.linalg.norm(Ja - Jf, ord="fro") / denominateur
         )
 
         print(
-            f"D_F = {D_F:<4} | "
-            f"Erreur relative Frobenius = {err:.3e}"
+            f"D_F = {D_F:<4} | erreur relative Frobenius = {err:.3e}"
         )
+
+        if not np.isfinite(err) or err > JACOBIAN_VERIFY_TOL:
+            raise RuntimeError(
+                "Échec de la vérification du Jacobien pour "
+                f"D_F={D_F} : erreur={err:.3e}, "
+                f"tolérance={JACOBIAN_VERIFY_TOL:.1e}"
+            )
+
+    print("Résultat : vérification du Jacobien réussie.")
 
 
 # ---------------------------------------------------------------------
-# Fonctions auxiliaires pour les statistiques
+# Fonctions auxiliaires
 # ---------------------------------------------------------------------
 
 def moyenne_finie(rows, key):
     """Moyenne des valeurs finies d'une colonne."""
-    values = np.asarray(
-        [r[key] for r in rows],
-        dtype=np.float64
-    )
-
+    values = np.asarray([r[key] for r in rows], dtype=np.float64)
     values = values[np.isfinite(values)]
 
     if len(values) == 0:
@@ -1012,74 +737,58 @@ def moyenne_finie(rows, key):
 def selectionner(lignes, temps, cas):
     """Sélectionne les lignes et les ordonne par graine."""
     return sorted(
-        [
-            r for r in lignes
-            if r["t"] == temps and r["cas"] == cas
-        ],
+        [r for r in lignes if r["t"] == temps and r["cas"] == cas],
         key=lambda r: r["seed"]
     )
 
 
 def valeurs_colonne(rows, key):
-    return np.asarray(
-        [r[key] for r in rows],
-        dtype=np.float64
-    )
+    return np.asarray([r[key] for r in rows], dtype=np.float64)
 
-
-# ---------------------------------------------------------------------
-# Validation des arguments
-# ---------------------------------------------------------------------
 
 def parser_temps(texte: str) -> tuple:
     try:
-        temps = tuple(
-            int(t.strip())
-            for t in texte.split(",")
-        )
+        temps = tuple(int(t.strip()) for t in texte.split(","))
     except ValueError as exc:
         raise ValueError(
-            "Format invalide pour --times. "
-            "Exemple : 5,100,500"
+            "Format invalide pour --times. Exemple : 5,100,500"
         ) from exc
 
     if not temps:
-        raise ValueError(
-            "Au moins un instant doit être fourni."
-        )
+        raise ValueError("Au moins un instant doit être fourni.")
 
     if any(t < 0 for t in temps):
-        raise ValueError(
-            "Les instants doivent être positifs ou nuls."
-        )
+        raise ValueError("Les instants doivent être positifs ou nuls.")
 
     if len(set(temps)) != len(temps):
-        raise ValueError(
-            "Les instants ne doivent pas être dupliqués."
-        )
+        raise ValueError("Les instants ne doivent pas être dupliqués.")
 
     return tuple(sorted(temps))
 
 
 def valider_arguments(args):
     if args.L < 2:
-        raise ValueError(
-            "L doit être supérieur ou égal à 2."
-        )
+        raise ValueError("L doit être supérieur ou égal à 2.")
 
     if args.seeds < 1:
-        raise ValueError(
-            "seeds doit être supérieur ou égal à 1."
-        )
+        raise ValueError("seeds doit être supérieur ou égal à 1.")
 
     if not np.isfinite(args.D_F):
-        raise ValueError(
-            "D_F doit être une valeur finie."
-        )
+        raise ValueError("D_F doit être une valeur finie.")
 
-    temps = parser_temps(args.times)
+    if args.n_boot < 1:
+        raise ValueError("n_boot doit être supérieur ou égal à 1.")
 
-    return temps
+    return parser_temps(args.times)
+
+
+def format_stat(q):
+    return (
+        f"{q['moy']:+.4f} "
+        f"[{q['lo']:+.4f}, {q['hi']:+.4f}] "
+        f"{q['dz']:+.2f} "
+        f"{q['pos']}/{q['n']}"
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1087,7 +796,6 @@ def valider_arguments(args):
 # ---------------------------------------------------------------------
 
 def main():
-
     parser = argparse.ArgumentParser(
         description=(
             "Mesure du PR spatial des modes singuliers "
@@ -1098,62 +806,31 @@ def main():
     parser.add_argument(
         "--verif",
         action="store_true",
-        help=(
-            "Vérifie le multiplicateur Fourier, "
-            "les invariants spectraux et le Jacobien."
-        )
+        help="Vérifie le contrôle Fourier et le Jacobien conditionnel."
     )
-
-    parser.add_argument(
-        "--L",
-        type=int,
-        default=21,
-        help="Taille linéaire du réseau."
-    )
-
-    parser.add_argument(
-        "--seeds",
-        type=int,
-        default=10,
-        help="Nombre de graines indépendantes."
-    )
-
-    parser.add_argument(
-        "--times",
-        default="5,100,500",
-        help="Instants de mesure séparés par des virgules."
-    )
-
-    parser.add_argument(
-        "--D_F",
-        type=float,
-        default=0.1,
-        help="Coefficient de diffusion de F."
-    )
-
+    parser.add_argument("--L", type=int, default=21)
+    parser.add_argument("--seeds", type=int, default=10)
+    parser.add_argument("--times", default="5,100,500")
+    parser.add_argument("--D_F", type=float, default=0.1)
     parser.add_argument(
         "--B-mode",
         choices=["quantile", "theta"],
-        default="quantile",
-        help=(
-            "Reconstruction de B : densité conservée "
-            "par quantile ou seuil fixe theta."
-        )
+        default="quantile"
     )
-
     parser.add_argument(
         "--sparse",
         action="store_true",
-        help=(
-            "Active la SVD partielle creuse exploratoire. "
-            "La convergence n'est pas garantie."
-        )
+        help="Active la SVD partielle creuse exploratoire."
     )
-
+    parser.add_argument(
+        "--n-boot",
+        type=int,
+        default=N_BOOT,
+        help="Nombre de réplications bootstrap."
+    )
     parser.add_argument(
         "--out",
-        default="results/v13_5_pr.csv",
-        help="Chemin du fichier CSV de sortie."
+        default="results/v13_5_pr.csv"
     )
 
     args = parser.parse_args()
@@ -1164,49 +841,30 @@ def main():
         parser.error(str(exc))
 
     if args.verif:
-
-        verif_substitution_fourier(
-            L=args.L
-        )
-
+        verif_substitution_fourier(L=args.L)
         verif_jacobien()
-
         return
 
     L = args.L
     N = L * L
-
     Lp = matrice_laplacienne(L)
 
     dossier = os.path.dirname(args.out)
-
     if dossier:
-        os.makedirs(
-            dossier,
-            exist_ok=True
-        )
+        os.makedirs(dossier, exist_ok=True)
 
     mode_svd = (
-        "Partielle creuse LM/SM"
+        "Partielle creuse LM/SM (exploratoire)"
         if args.sparse
         else "Dense de référence"
     )
 
     print(
-        f"L={L} (N={N}) | "
-        f"Graines={args.seeds} | "
-        f"D_F={args.D_F} | "
-        f"Mode B={args.B_mode} | "
-        f"SVD={mode_svd}"
+        f"L={L} (N={N}) | graines={args.seeds} | "
+        f"D_F={args.D_F} | B-mode={args.B_mode} | SVD={mode_svd}"
     )
-
-    print(
-        f"Temps mesurés : {temps}"
-    )
-
-    print(
-        "Jacobien : J_{FI|B}, avec B fixé pendant la différentiation."
-    )
+    print(f"Temps mesurés : {temps}")
+    print("Jacobien : J_{FI|B}, avec B fixé pendant la différentiation.")
 
     mesures = [
         "PR_top1",
@@ -1218,12 +876,7 @@ def main():
 
     lignes = []
 
-    # -------------------------------------------------------------
-    # Boucle expérimentale
-    # -------------------------------------------------------------
-
     for s in range(args.seeds):
-
         traj = trajectoire(
             seed=s,
             L=L,
@@ -1232,16 +885,10 @@ def main():
         )
 
         for t in temps:
-
             F, I, B = traj[t]
 
             cas = {
-                "dyn": (
-                    F,
-                    I,
-                    B
-                ),
-
+                "dyn": (F, I, B),
                 "fourier": substitut_fourier(
                     F,
                     I,
@@ -1249,7 +896,6 @@ def main():
                     FOURIER_SEED_OFFSET + s,
                     mode=args.B_mode
                 ),
-
                 "perm": substitut_permutation(
                     F,
                     I,
@@ -1259,13 +905,8 @@ def main():
             }
 
             for nom, (Fx, Ix, Bx) in cas.items():
-
                 J = jacobien_conditionnel_B(
-                    Fx,
-                    Ix,
-                    Bx,
-                    args.D_F,
-                    Lp
+                    Fx, Ix, Bx, args.D_F, Lp
                 )
 
                 m = mesures_PR(
@@ -1280,82 +921,31 @@ def main():
                     "t": t,
                     "cas": nom,
                     "densB": float(Bx.mean()),
-                    "lapF": float(
-                        np.linalg.norm(lap(Fx))
-                    )
+                    "lapF": float(np.linalg.norm(lap(Fx)))
                 })
 
                 lignes.append(m)
 
         print(
-            f"  [Progression] Graine "
-            f"{s + 1}/{args.seeds} calculée",
+            f"  [Progression] Graine {s + 1}/{args.seeds} calculée",
             flush=True
         )
 
-    # -------------------------------------------------------------
-    # Export CSV
-    # -------------------------------------------------------------
+    colonnes = ["seed", "t", "cas", "densB", "lapF"] + mesures
 
-    colonnes = [
-        "seed",
-        "t",
-        "cas",
-        "densB",
-        "lapF"
-    ] + mesures
-
-    with open(
-        args.out,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=colonnes
-        )
-
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=colonnes)
         writer.writeheader()
         writer.writerows(lignes)
 
-    # -------------------------------------------------------------
-    # Synthèse comparative
-    # -------------------------------------------------------------
-
     for t in temps:
+        d = selectionner(lignes, t, "dyn")
+        fo = selectionner(lignes, t, "fourier")
+        pe = selectionner(lignes, t, "perm")
 
-        d = selectionner(
-            lignes,
-            t,
-            "dyn"
-        )
-
-        fo = selectionner(
-            lignes,
-            t,
-            "fourier"
-        )
-
-        pe = selectionner(
-            lignes,
-            t,
-            "perm"
-        )
-
-        print(
-            "\n"
-            + "=" * 88
-        )
-
-        print(
-            f"INSTANT t = {t}"
-        )
-
-        print(
-            "=" * 88
-        )
+        print("\n" + "=" * 104)
+        print(f"INSTANT t = {t}")
+        print("=" * 104)
 
         print(
             "Densité B moyenne : "
@@ -1363,7 +953,6 @@ def main():
             f"fourier {moyenne_finie(fo, 'densB'):.6f} | "
             f"perm {moyenne_finie(pe, 'densB'):.6f}"
         )
-
         print(
             "||Lap F|| moyenne : "
             f"dyn {moyenne_finie(d, 'lapF'):.6f} | "
@@ -1371,101 +960,55 @@ def main():
             f"perm {moyenne_finie(pe, 'lapF'):.6f}"
         )
 
-        print("-" * 112)
-
+        print("-" * 104)
         print(
-            f"{'Mesure':<14} | "
-            f"{'Dyn moy.':<10} | "
+            f"{'Mesure':<14} | {'Dyn moy.':<10} | "
             f"{'Dyn-Fourier : moy. [IC95] dz +/n':<43} | "
             f"{'Dyn-Perm : moy. [IC95] dz +/n':<39}"
         )
-
-        print("-" * 112)
+        print("-" * 104)
 
         for k in mesures:
-
-            vals_dyn = valeurs_colonne(
-                d,
-                k
-            )
-
-            vals_fourier = valeurs_colonne(
-                fo,
-                k
-            )
-
-            vals_perm = valeurs_colonne(
-                pe,
-                k
-            )
-
-            diff_fourier = (
-                vals_dyn - vals_fourier
-            )
-
-            diff_perm = (
-                vals_dyn - vals_perm
-            )
+            vals_dyn = valeurs_colonne(d, k)
+            vals_fourier = valeurs_colonne(fo, k)
+            vals_perm = valeurs_colonne(pe, k)
 
             s1 = stats_apparie(
-                diff_fourier
+                vals_dyn - vals_fourier,
+                n_boot=args.n_boot,
+                seed=BOOTSTRAP_SEED
             )
-
             s2 = stats_apparie(
-                diff_perm
+                vals_dyn - vals_perm,
+                n_boot=args.n_boot,
+                seed=BOOTSTRAP_SEED + 1
             )
 
-            dyn_mean = moyenne_finie(
-                d,
-                k
-            )
-
-            def format_stat(q):
-
-                return (
-                    f"{q['moy']:+.4f} "
-                    f"[{q['lo']:+.4f}, {q['hi']:+.4f}] "
-                    f"{q['dz']:+.2f} "
-                    f"{q['pos']}/{q['n']}"
-                )
+            dyn_mean = moyenne_finie(d, k)
 
             print(
-                f"{k:<14} | "
-                f"{dyn_mean:<10.4f} | "
-                f"{format_stat(s1):<43} | "
-                f"{format_stat(s2):<39}"
+                f"{k:<14} | {dyn_mean:<10.4f} | "
+                f"{format_stat(s1):<43} | {format_stat(s2):<39}"
             )
 
-    # -------------------------------------------------------------
-    # Fin
-    # -------------------------------------------------------------
-
+    print(f"\nDonnées détaillées enregistrées dans : {args.out}")
+    print("\nRappel d'interprétation :")
     print(
-        "\nDonnées détaillées enregistrées dans : "
-        f"{args.out}"
+        "  - Dyn - Fourier : contraste avec modules spectraux "
+        "individuels et spectre croisé complexe de F et I conservés."
     )
-
     print(
-        "\nRappel d'interprétation :"
+        "  - Dyn - Permutation : contraste avec réarrangement spatial "
+        "commun des champs."
     )
-
-    print(
-        "  - Dyn - Fourier : contraste avec invariants spectraux "
-        "de F et I conservés."
-    )
-
-    print(
-        "  - Dyn - Permutation : contraste avec destruction "
-        "de l'organisation spatiale."
-    )
-
     print(
         "  - Les différences bootstrap sont calculées sur les graines, "
         "pas sur les sites."
     )
-
+    print("  - Le Jacobien est conditionnel à B fixé.")
     print(
-        "  - Le Jacobien est conditionnel à B fixé."
+        "  - Le seuil de conditionnement sur s_min est "
+        f"{KAPPA_SMIN_THRESHOLD:.1e}."
     )
 
 
